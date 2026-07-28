@@ -14,10 +14,14 @@ base64 = "0.22"
 bincode = "1"
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
+# The simulation engine, not just a test harness: every resolver and
+# executor simulation runs in-process.
+litesvm = "0.11.0"
 prometheus = { version = "0.13", default-features = false }
 solana-account = "3"
 solana-account-decoder = "3"
 solana-client = "3"
+solana-compute-budget-interface = "3"
 solana-commitment-config = "3"
 solana-pubsub-client = "3"
 solana-rpc-client-api = "3"
@@ -31,5 +35,4 @@ yellowstone-grpc-client = { git = "https://github.com/rpcpool/yellowstone-grpc",
 yellowstone-grpc-proto = { git = "https://github.com/rpcpool/yellowstone-grpc", rev = "b39a415a219e842143f97440a0d0ef04207152c2" }
 
 [dev-dependencies]
-litesvm = "0.11.0"
 sha2 = "0.10"

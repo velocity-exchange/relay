@@ -28,7 +28,25 @@ pub fn spawn_ws_feed(
     target_programs: Vec<Pubkey>,
     feed: FeedSender,
 ) -> JoinHandle<()> {
-    tokio::spawn(run(ws_url, relay_program, target_programs, feed))
+    spawn_ws_feed_with_programs(ws_url, relay_program, target_programs, Vec::new(), feed)
+}
+
+/// `watch_programs` streams every account owned by those programs, which
+/// is what keeps local simulation off the network.
+pub fn spawn_ws_feed_with_programs(
+    ws_url: String,
+    relay_program: Pubkey,
+    target_programs: Vec<Pubkey>,
+    watch_programs: Vec<Pubkey>,
+    feed: FeedSender,
+) -> JoinHandle<()> {
+    tokio::spawn(run(
+        ws_url,
+        relay_program,
+        target_programs,
+        watch_programs,
+        feed,
+    ))
 }
 
 /// Derive a websocket url from an RPC url the way the Solana CLI does.
@@ -43,6 +61,7 @@ async fn run(
     ws_url: String,
     relay_program: Pubkey,
     target_programs: Vec<Pubkey>,
+    watch_programs: Vec<Pubkey>,
     feed: FeedSender,
 ) {
     let mut backoff = Duration::from_secs(1);
@@ -52,6 +71,7 @@ async fn run(
             &ws_url,
             relay_program,
             &target_programs,
+            &watch_programs,
             &feed,
             &mut interest,
         )
@@ -81,6 +101,7 @@ async fn session(
     ws_url: &str,
     relay_program: Pubkey,
     target_programs: &[Pubkey],
+    watch_programs: &[Pubkey],
     feed: &FeedSender,
     interest: &mut tokio::sync::watch::Receiver<std::collections::HashSet<Pubkey>>,
 ) -> SessionEnd {
@@ -165,6 +186,38 @@ async fn session(
             })
             .boxed()
     }));
+    // Whole-program subscriptions: everything these programs own, so a
+    // local simulation finds its accounts already cached.
+    for program in watch_programs {
+        match client
+            .program_subscribe(
+                program,
+                Some(RpcProgramAccountsConfig {
+                    account_config: account_config.clone(),
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            Ok((stream, unsub)) => {
+                streams.push(
+                    stream
+                        .map(|response| AccountUpdate {
+                            pubkey: response
+                                .value
+                                .pubkey
+                                .parse()
+                                .unwrap_or_else(|_| Pubkey::default()),
+                            account: response.value.account.decode(),
+                            slot: response.context.slot,
+                        })
+                        .boxed(),
+                );
+                unsubs.push(unsub);
+            }
+            Err(err) => return SessionEnd::Failed(format!("program_subscribe {program}: {err}")),
+        }
+    }
     debug!(subscriptions = streams.len(), "ws session subscribed");
 
     let mut merged = futures_util::stream::select_all(streams);

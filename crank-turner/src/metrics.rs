@@ -82,6 +82,29 @@ pub static UPDATE_SOURCE: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("metric registers")
 });
 
+/// Simulations by where they ran: `local` (in-process SVM) or `error`.
+pub static SIMULATIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec_with_registry!(
+        "relay_simulations_total",
+        "Simulations by execution site",
+        &["site"],
+        REGISTRY
+    )
+    .expect("metric registers")
+});
+
+/// Transactions by how they were assembled: `packed`, `single`, or
+/// `split` (a pack that failed to simulate and was sent one by one).
+pub static PACKS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec_with_registry!(
+        "relay_packs_total",
+        "Crank transactions by packing outcome",
+        &["kind"],
+        REGISTRY
+    )
+    .expect("metric registers")
+});
+
 pub static WATCHES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec_with_registry!(
         "relay_watches",

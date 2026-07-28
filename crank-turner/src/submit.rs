@@ -65,6 +65,8 @@ pub struct SubmitterConfig {
     pub max_resends: u32,
     /// Rolling window length for per-program profitability.
     pub profit_window: usize,
+    /// How often to sample recent prioritization fees.
+    pub fee_refresh: Duration,
 }
 
 impl Default for SubmitterConfig {
@@ -74,6 +76,7 @@ impl Default for SubmitterConfig {
             confirm_interval: Duration::from_secs(2),
             max_resends: 3,
             profit_window: 20,
+            fee_refresh: Duration::from_secs(5),
         }
     }
 }
@@ -91,6 +94,8 @@ pub struct SubmitterHandle {
     pub outbox: mpsc::UnboundedSender<PendingTx>,
     pub blockhash: watch::Receiver<Option<BlockhashInfo>>,
     pub profit: watch::Receiver<ProfitSnapshot>,
+    /// Recently observed prioritization fee, micro-lamports per CU.
+    pub priority_fee: watch::Receiver<u64>,
 }
 
 impl SubmitterHandle {
@@ -103,6 +108,11 @@ impl SubmitterHandle {
     pub fn profit_for(&self, program: &Pubkey) -> i64 {
         self.profit.borrow().get(program).copied().unwrap_or(0)
     }
+
+    /// Latest observed priority fee, micro-lamports per compute unit.
+    pub fn priority_fee(&self) -> u64 {
+        *self.priority_fee.borrow()
+    }
 }
 
 struct Tracked {
@@ -111,18 +121,24 @@ struct Tracked {
 }
 
 /// Spawn the submitter: a blockhash refresher, and a send/confirm loop.
-pub fn spawn<S: ChainSource + 'static>(
+pub fn spawn<S: ChainSource + ?Sized + 'static>(
     source: std::sync::Arc<S>,
     config: SubmitterConfig,
 ) -> SubmitterHandle {
     let (outbox, inbox) = mpsc::unbounded_channel();
     let (blockhash_tx, blockhash_rx) = watch::channel(None);
     let (profit_tx, profit_rx) = watch::channel(ProfitSnapshot::new());
+    let (fee_tx, fee_rx) = watch::channel(0);
 
     tokio::spawn(refresh_blockhash(
         std::sync::Arc::clone(&source),
         config.blockhash_refresh,
         blockhash_tx,
+    ));
+    tokio::spawn(refresh_priority_fee(
+        std::sync::Arc::clone(&source),
+        config.fee_refresh,
+        fee_tx,
     ));
     tokio::spawn(run(source, config, inbox, profit_tx));
 
@@ -130,10 +146,29 @@ pub fn spawn<S: ChainSource + 'static>(
         outbox,
         blockhash: blockhash_rx,
         profit: profit_rx,
+        priority_fee: fee_rx,
     }
 }
 
-async fn refresh_blockhash<S: ChainSource>(
+async fn refresh_priority_fee<S: ChainSource + ?Sized>(
+    source: std::sync::Arc<S>,
+    every: Duration,
+    tx: watch::Sender<u64>,
+) {
+    let mut interval = tokio::time::interval(every);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        match source.recent_priority_fee(&[]).await {
+            Ok(fee) => {
+                let _ = tx.send(fee);
+            }
+            Err(err) => debug!(error = %format!("{err:#}"), "priority fee sample failed"),
+        }
+    }
+}
+
+async fn refresh_blockhash<S: ChainSource + ?Sized>(
     source: std::sync::Arc<S>,
     every: Duration,
     tx: watch::Sender<Option<BlockhashInfo>>,
@@ -151,7 +186,7 @@ async fn refresh_blockhash<S: ChainSource>(
     }
 }
 
-async fn run<S: ChainSource>(
+async fn run<S: ChainSource + ?Sized>(
     source: std::sync::Arc<S>,
     config: SubmitterConfig,
     mut inbox: mpsc::UnboundedReceiver<PendingTx>,
@@ -188,7 +223,7 @@ async fn run<S: ChainSource>(
 
 /// One confirmation pass: settle what landed, resend what is still valid,
 /// expire what is not.
-async fn sweep<S: ChainSource>(
+async fn sweep<S: ChainSource + ?Sized>(
     source: &S,
     config: &SubmitterConfig,
     tracked: &mut HashMap<Signature, Tracked>,

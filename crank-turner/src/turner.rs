@@ -18,6 +18,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use relay_spec as spec;
+use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_sdk::account::Account;
 use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
@@ -118,6 +119,33 @@ pub struct TurnerConfig {
     /// allows some loss). Only applies when a submitter is attached, since
     /// that is what observes outcomes.
     pub min_program_profit: i64,
+    /// Pack up to this many cranks into one transaction. Each crank costs
+    /// its own guard pair and account set, but they share the 5000-lamport
+    /// signature fee — the saving that makes packing worth the complexity
+    /// once cranks are small and frequent. 1 disables packing.
+    pub max_cranks_per_tx: usize,
+    /// Ceiling on the priority fee in micro-lamports per compute unit.
+    pub max_priority_fee: u64,
+}
+
+/// Simulation probe budget: the per-transaction ceiling, so the probe is
+/// never the thing that fails.
+const MAX_COMPUTE_UNITS: u32 = 1_400_000;
+
+/// Solana's packet limit.
+const MAX_TRANSACTION_BYTES: usize = 1232;
+
+/// The condition an outcome belongs to.
+fn outcome_key(outcome: &Outcome) -> CondKey {
+    match outcome {
+        Outcome::Skipped(key, _) | Outcome::NoWork(key) => *key,
+        Outcome::Sent { condition, .. } | Outcome::Failed { condition, .. } => *condition,
+    }
+}
+
+/// Headroom over the simulated cost, for state that moved since.
+fn compute_limit(units_consumed: u64) -> u32 {
+    ((units_consumed as f64 * 1.2) as u64).clamp(1_000, MAX_COMPUTE_UNITS as u64) as u32
 }
 
 /// System program id (the all-zero address), required by
@@ -139,6 +167,8 @@ impl Default for TurnerConfig {
             filter: WatchFilter::default(),
             concurrency: 8,
             min_program_profit: i64::MIN,
+            max_cranks_per_tx: 3,
+            max_priority_fee: 1_000_000,
         }
     }
 }
@@ -402,6 +432,7 @@ impl<S: ChainSource> Turner<S> {
         // Explicit loops: the closure forms would need `&mut running`
         // alongside the `&self` the in-flight futures hold.
         let mut updates: Vec<(CondKey, StateUpdate)> = Vec::new();
+        let mut prepared: Vec<Prepared> = Vec::new();
         {
             let mut running = FuturesUnordered::new();
             let mut queued = due.into_iter();
@@ -413,14 +444,23 @@ impl<S: ChainSource> Turner<S> {
             }
             // Refill as each finishes, so the pipeline stays full rather
             // than draining in lockstep batches.
-            while let Some((outcome, key, update)) = running.next().await {
+            while let Some(result) = running.next().await {
                 if let Some(next) = queued.next() {
                     running.push(self.crank(next, &clock));
                 }
-                updates.push((key, update));
-                outcomes.push(outcome);
+                match result {
+                    CrankResult::Ready(ready) => prepared.push(*ready),
+                    CrankResult::Done(outcome, update) => {
+                        updates.push((outcome_key(&outcome), update));
+                        outcomes.push(outcome);
+                    }
+                }
             }
         }
+        // Verified cranks share transactions where they fit: each carries
+        // its own guards and accounts, but they split one signature fee.
+        self.submit_packs(prepared, &mut outcomes, &mut updates)
+            .await;
         metrics::IN_FLIGHT.with_label_values(&["cranks"]).set(0);
         metrics::TICK_SECONDS
             .with_label_values(&["execute"])
@@ -532,13 +572,13 @@ impl<S: ChainSource> Turner<S> {
     /// Takes `&self`: everything it learns comes back as a [`StateUpdate`]
     /// for the caller to apply, which is what lets a whole tick's worth of
     /// cranks run concurrently without a lock between them.
-    async fn crank(&self, due: Due, clock: &ClockSnapshot) -> (Outcome, CondKey, StateUpdate) {
+    async fn crank(&self, due: Due, clock: &ClockSnapshot) -> CrankResult {
         let key = due.key;
         let program = metrics::program_label(&due.program);
         match self.try_crank(&due, clock).await {
-            Ok((outcome, update)) => {
+            Ok(CrankResult::Ready(prepared)) => CrankResult::Ready(prepared),
+            Ok(CrankResult::Done(outcome, update)) => {
                 let label = match &outcome {
-                    Outcome::Sent { .. } => "sent",
                     Outcome::NoWork(_) => "no_work",
                     Outcome::Failed { stage, .. } => {
                         metrics::FAILURES
@@ -546,10 +586,10 @@ impl<S: ChainSource> Turner<S> {
                             .inc();
                         "failed"
                     }
-                    Outcome::Skipped(..) => "skipped",
+                    _ => "skipped",
                 };
                 metrics::CRANKS.with_label_values(&[label, &program]).inc();
-                (outcome, key, update)
+                CrankResult::Done(outcome, update)
             }
             Err(err) => {
                 metrics::CRANKS
@@ -558,20 +598,19 @@ impl<S: ChainSource> Turner<S> {
                 metrics::FAILURES
                     .with_label_values(&["build", &program])
                     .inc();
-                (
+                CrankResult::Done(
                     Outcome::Failed {
                         condition: key,
                         stage: Stage::Send,
                         error: format!("{err:#}"),
                     },
-                    key,
                     StateUpdate::Failed,
                 )
             }
         }
     }
 
-    async fn try_crank(&self, due: &Due, clock: &ClockSnapshot) -> Result<(Outcome, StateUpdate)> {
+    async fn try_crank(&self, due: &Due, clock: &ClockSnapshot) -> Result<CrankResult> {
         let key = due.key;
         let condition = &due.condition;
 
@@ -598,7 +637,7 @@ impl<S: ChainSource> Turner<S> {
                 .await?
         };
         if let Some(err) = sim.err {
-            return Ok((
+            return Ok(CrankResult::Done(
                 Outcome::Failed {
                     condition: key,
                     stage: Stage::ResolveSim,
@@ -611,7 +650,7 @@ impl<S: ChainSource> Turner<S> {
         let pointer = spec::ResponsePointerV0::read(sim.return_data.as_deref().unwrap_or_default())
             .map_err(|e| anyhow::anyhow!("resolver return data: {e:?}"))?;
         if !pointer.has_work() {
-            return Ok((
+            return Ok(CrankResult::Done(
                 Outcome::NoWork(key),
                 StateUpdate::NoWork {
                     last_seen: due.watched_now.clone(),
@@ -649,12 +688,14 @@ impl<S: ChainSource> Turner<S> {
         };
         let ixs = self.guarded(executor_ix, condition.min_payment);
 
-        // Simulate, then submit. With guards on, a successful simulation
-        // is also the payment check.
-        let (tx, last_valid_block_height) = self.signed_tx(&ixs).await?;
-        let sim = self.source.simulate_transaction(&tx, &[]).await?;
+        // Simulate with a generous budget to learn the real cost, then let
+        // the packing phase re-sign with a tight limit — the fee is charged
+        // on the limit you request, not the units you burn.
+        let probe = self.with_compute_budget(ixs.clone(), MAX_COMPUTE_UNITS, 0);
+        let (probe_tx, _) = self.signed_tx(&probe).await?;
+        let sim = self.source.simulate_transaction(&probe_tx, &[]).await?;
         if let Some(err) = sim.err {
-            return Ok((
+            return Ok(CrankResult::Done(
                 Outcome::Failed {
                     condition: key,
                     stage: Stage::ExecuteSim,
@@ -663,23 +704,169 @@ impl<S: ChainSource> Turner<S> {
                 StateUpdate::Failed,
             ));
         }
-        let signature = self
-            .submit(
-                tx,
-                due.program,
-                condition.min_payment,
-                last_valid_block_height,
-            )
-            .await?;
         let _ = clock;
-        Ok((
-            Outcome::Sent {
-                condition: key,
-                signature,
-                min_payment: condition.min_payment,
-            },
-            StateUpdate::Sent,
-        ))
+        Ok(CrankResult::Ready(Box::new(Prepared {
+            key,
+            program: due.program,
+            min_payment: condition.min_payment,
+            units: sim.units_consumed,
+            ixs,
+        })))
+    }
+
+    /// Group verified cranks into transactions and submit them.
+    ///
+    /// Every crank here already passed simulation on its own, so a pack
+    /// that fails to simulate is a packing artifact (too many accounts,
+    /// conflicting state) rather than a bad crank — fall back to sending
+    /// its members individually rather than dropping work. That fallback
+    /// is affordable precisely because simulation is local.
+    ///
+    /// Guard triples stay contiguous, which is what makes sharing one
+    /// guard account across a pack safe: each `begin_guard` re-arms before
+    /// its own executor, and its own `assert_paid` consumes it.
+    async fn submit_packs(
+        &self,
+        prepared: Vec<Prepared>,
+        outcomes: &mut Vec<Outcome>,
+        updates: &mut Vec<(CondKey, StateUpdate)>,
+    ) {
+        for pack in self.pack(prepared).await {
+            let units = compute_limit(pack.iter().map(|p| p.units).sum());
+            let ixs = self.with_compute_budget(
+                pack.iter().flat_map(|p| p.ixs.iter().cloned()).collect(),
+                units,
+                self.priority_fee(),
+            );
+            let built = match self.signed_tx(&ixs).await {
+                Ok((tx, expiry)) => {
+                    let ok = pack.len() == 1
+                        || self
+                            .source
+                            .simulate_transaction(&tx, &[])
+                            .await
+                            .map(|sim| sim.err.is_none())
+                            .unwrap_or(false);
+                    ok.then_some((tx, expiry))
+                }
+                Err(_) => None,
+            };
+            match built {
+                Some((tx, expiry)) => self.finish_pack(&pack, tx, expiry, outcomes, updates).await,
+                None => {
+                    metrics::PACKS.with_label_values(&["split"]).inc();
+                    for single in &pack {
+                        let ixs = self.with_compute_budget(
+                            single.ixs.clone(),
+                            compute_limit(single.units),
+                            self.priority_fee(),
+                        );
+                        match self.signed_tx(&ixs).await {
+                            Ok((tx, expiry)) => {
+                                self.finish_pack(
+                                    std::slice::from_ref(single),
+                                    tx,
+                                    expiry,
+                                    outcomes,
+                                    updates,
+                                )
+                                .await
+                            }
+                            Err(err) => {
+                                outcomes.push(Outcome::Failed {
+                                    condition: single.key,
+                                    stage: Stage::Send,
+                                    error: format!("{err:#}"),
+                                });
+                                updates.push((single.key, StateUpdate::Failed));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Submit one built transaction and record an outcome per member.
+    async fn finish_pack(
+        &self,
+        pack: &[Prepared],
+        tx: Transaction,
+        expiry: u64,
+        outcomes: &mut Vec<Outcome>,
+        updates: &mut Vec<(CondKey, StateUpdate)>,
+    ) {
+        let program = pack[0].program;
+        let payment: u64 = pack.iter().map(|p| p.min_payment).sum();
+        match self.submit(tx, program, payment, expiry).await {
+            Ok(signature) => {
+                metrics::PACKS
+                    .with_label_values(&[if pack.len() > 1 { "packed" } else { "single" }])
+                    .inc();
+                pack.iter().for_each(|p| {
+                    metrics::CRANKS
+                        .with_label_values(&["sent", &metrics::program_label(&p.program)])
+                        .inc();
+                    outcomes.push(Outcome::Sent {
+                        condition: p.key,
+                        signature,
+                        min_payment: p.min_payment,
+                    });
+                    updates.push((p.key, StateUpdate::Sent));
+                });
+            }
+            Err(err) => pack.iter().for_each(|p| {
+                outcomes.push(Outcome::Failed {
+                    condition: p.key,
+                    stage: Stage::Send,
+                    error: format!("{err:#}"),
+                });
+                updates.push((p.key, StateUpdate::Failed));
+            }),
+        }
+    }
+
+    /// Split verified cranks into transaction-sized groups: bounded by
+    /// `max_cranks_per_tx` and by the packet limit, measured by actually
+    /// serializing rather than estimating.
+    async fn pack(&self, prepared: Vec<Prepared>) -> Vec<Vec<Prepared>> {
+        let max = self.config.max_cranks_per_tx.max(1);
+        let mut packs: Vec<Vec<Prepared>> = Vec::new();
+        let mut current: Vec<Prepared> = Vec::new();
+        for crank in prepared {
+            if current.len() >= max {
+                packs.push(std::mem::take(&mut current));
+            }
+            current.push(crank);
+            if current.len() > 1 && !self.fits(&current).await {
+                // Over the limit with the newest member: close the pack
+                // without it and start the next one with it.
+                let overflow = current.pop().expect("just pushed");
+                packs.push(std::mem::take(&mut current));
+                current.push(overflow);
+            }
+        }
+        if !current.is_empty() {
+            packs.push(current);
+        }
+        packs
+    }
+
+    /// Exact size check: build and serialize, no estimating. Signed with
+    /// the worst-case compute-budget values so the measurement bounds the
+    /// real transaction.
+    async fn fits(&self, pack: &[Prepared]) -> bool {
+        let ixs = self.with_compute_budget(
+            pack.iter().flat_map(|p| p.ixs.iter().cloned()).collect(),
+            MAX_COMPUTE_UNITS,
+            u64::MAX,
+        );
+        match self.signed_tx(&ixs).await {
+            Ok((tx, _)) => bincode::serialize(&tx)
+                .map(|bytes| bytes.len() <= MAX_TRANSACTION_BYTES)
+                .unwrap_or(false),
+            Err(_) => false,
+        }
     }
 
     /// Hand a signed transaction to the submitter, or send it inline when
@@ -751,6 +938,35 @@ impl<S: ChainSource> Turner<S> {
         .0
     }
 
+    /// Prepend compute-budget instructions: an explicit unit limit (fees
+    /// are billed on the *requested* limit, so the default 200k×ixs is
+    /// both wasteful and, for a multi-crank transaction, too small) and a
+    /// priority fee.
+    fn with_compute_budget(
+        &self,
+        ixs: Vec<Instruction>,
+        units: u32,
+        price: u64,
+    ) -> Vec<Instruction> {
+        [
+            ComputeBudgetInstruction::set_compute_unit_limit(units),
+            ComputeBudgetInstruction::set_compute_unit_price(price),
+        ]
+        .into_iter()
+        .chain(ixs)
+        .collect()
+    }
+
+    /// Priority fee the submitter observed, clamped to the configured
+    /// ceiling. Zero when no submitter is attached.
+    fn priority_fee(&self) -> u64 {
+        self.submitter
+            .as_ref()
+            .map(|s| s.priority_fee())
+            .unwrap_or(0)
+            .min(self.config.max_priority_fee)
+    }
+
     /// Sign against the shared blockhash the submitter keeps refreshed,
     /// falling back to a direct fetch when running without one. Returns
     /// the block height past which the transaction can no longer land.
@@ -792,6 +1008,26 @@ fn require_keeper_placeholder(resolved: &spec::ResolvedCrankV0) -> Result<()> {
         .any(|a| a.address == spec::KEEPER_PLACEHOLDER)
         .then_some(())
         .context("resolver output names no keeper placeholder")
+}
+
+/// A crank that resolved to real work and passed its own simulation,
+/// waiting to be packed into a transaction.
+struct Prepared {
+    key: CondKey,
+    program: Pubkey,
+    min_payment: u64,
+    /// Compute units this crank alone consumed in simulation.
+    units: u64,
+    /// `[begin_guard, executor, assert_paid]`, without compute budget.
+    ixs: Vec<Instruction>,
+}
+
+/// What the concurrent phase produced for one condition.
+enum CrankResult {
+    /// Verified and ready to submit.
+    Ready(Box<Prepared>),
+    /// Finished without submitting (no work, or a failure).
+    Done(Outcome, StateUpdate),
 }
 
 /// A condition whose wake came due, carried into the concurrent phase.

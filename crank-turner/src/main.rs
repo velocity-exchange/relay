@@ -3,9 +3,10 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use relay_crank_turner::{
-    derive_ws_url, feed_channel, metrics, spawn_grpc_feed, spawn_submitter, spawn_ws_feed,
-    CachedSource, CachedSourceConfig, ChainSource, GrpcFeedConfig, Outcome, RpcSource,
-    SubmitterConfig, Turner, TurnerConfig, WatchFilter,
+    derive_ws_url, feed_channel, grpc::spawn_grpc_feed_with_programs, metrics, spawn_submitter,
+    ws::spawn_ws_feed_with_programs, CachedSource, CachedSourceConfig, ChainSource, GrpcFeedConfig,
+    LocalSimConfig, LocalSimSource, Outcome, RpcSource, SubmitterConfig, Turner, TurnerConfig,
+    WatchFilter,
 };
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
@@ -99,6 +100,21 @@ struct Args {
     /// Port for /metrics and /health.
     #[arg(long, env = "RELAY_METRICS_PORT", default_value_t = 9899)]
     metrics_port: u16,
+    /// Cache every account owned by these programs. Point this at the
+    /// protocol you crank so local simulation almost never has to fetch.
+    /// Repeatable / comma-separated.
+    #[arg(long, env = "RELAY_WATCH_PROGRAMS", value_delimiter = ',')]
+    watch_program: Vec<Pubkey>,
+    /// Send simulations to the RPC provider instead of running them in an
+    /// in-process SVM. Slower and metered; useful to cross-check.
+    #[arg(long, env = "RELAY_REMOTE_SIM", default_value_t = false)]
+    remote_sim: bool,
+    /// Pack up to this many cranks into one transaction (1 = never pack).
+    #[arg(long, env = "RELAY_MAX_CRANKS_PER_TX", default_value_t = 3)]
+    max_cranks_per_tx: usize,
+    /// Ceiling on the priority fee, micro-lamports per compute unit.
+    #[arg(long, env = "RELAY_MAX_PRIORITY_FEE", default_value_t = 1_000_000)]
+    max_priority_fee: u64,
 }
 
 #[tokio::main]
@@ -133,6 +149,8 @@ async fn main() -> Result<()> {
         guard_nonce: args.guard_nonce,
         concurrency: args.concurrency,
         min_program_profit: args.min_program_profit.unwrap_or(i64::MIN),
+        max_cranks_per_tx: args.max_cranks_per_tx.max(1),
+        max_priority_fee: args.max_priority_fee,
         filter: filter.clone(),
         ..TurnerConfig::default()
     };
@@ -147,7 +165,7 @@ async fn main() -> Result<()> {
 
     match args.transport {
         Transport::Rpc => {
-            let source = std::sync::Arc::new(rpc);
+            let source = with_local_sim(rpc, &args);
             let submitter =
                 spawn_submitter(std::sync::Arc::clone(&source), SubmitterConfig::default());
             run(
@@ -162,15 +180,18 @@ async fn main() -> Result<()> {
                 .clone()
                 .unwrap_or_else(|| derive_ws_url(&args.rpc_url));
             let (sender, receiver) = feed_channel();
-            spawn_ws_feed(
+            spawn_ws_feed_with_programs(
                 ws_url.clone(),
                 args.program_id,
                 filter.server_side_programs(),
+                args.watch_program.clone(),
                 sender,
             );
-            info!(%ws_url, "websocket subscriptions enabled");
-            let source =
-                std::sync::Arc::new(CachedSource::new(rpc, receiver, cached_config(&args)));
+            info!(%ws_url, watched = args.watch_program.len(), "websocket subscriptions enabled");
+            let source = with_local_sim(
+                CachedSource::new(rpc, receiver, cached_config(&args)),
+                &args,
+            );
             let submitter =
                 spawn_submitter(std::sync::Arc::clone(&source), SubmitterConfig::default());
             run(
@@ -185,18 +206,21 @@ async fn main() -> Result<()> {
                 .clone()
                 .context("--grpc-endpoint is required for the grpc transport")?;
             let (sender, receiver) = feed_channel();
-            spawn_grpc_feed(
+            spawn_grpc_feed_with_programs(
                 GrpcFeedConfig {
                     endpoint: endpoint.clone(),
                     x_token: args.grpc_x_token.clone(),
                 },
                 args.program_id,
                 filter.server_side_programs(),
+                args.watch_program.clone(),
                 sender,
             );
-            info!(%endpoint, "yellowstone gRPC subscriptions enabled");
-            let source =
-                std::sync::Arc::new(CachedSource::new(rpc, receiver, cached_config(&args)));
+            info!(%endpoint, watched = args.watch_program.len(), "yellowstone gRPC subscriptions enabled");
+            let source = with_local_sim(
+                CachedSource::new(rpc, receiver, cached_config(&args)),
+                &args,
+            );
             let submitter =
                 spawn_submitter(std::sync::Arc::clone(&source), SubmitterConfig::default());
             run(
@@ -212,6 +236,24 @@ fn cached_config(args: &Args) -> CachedSourceConfig {
     CachedSourceConfig {
         relay_program: args.program_id,
         repoll_every: args.repoll_every,
+        watch_programs: args.watch_program.clone(),
+    }
+}
+
+/// Wrap a source in the local simulator unless the operator opted out.
+fn with_local_sim<S: ChainSource + 'static>(
+    source: S,
+    args: &Args,
+) -> std::sync::Arc<dyn ChainSource> {
+    if args.remote_sim {
+        std::sync::Arc::new(source)
+    } else {
+        std::sync::Arc::new(LocalSimSource::new(
+            source,
+            LocalSimConfig {
+                pool_size: args.concurrency.max(1),
+            },
+        ))
     }
 }
 

@@ -4,10 +4,16 @@
 //! the cache only exists so account/clock reads ride the push feed instead
 //! of polling.
 //!
-//! Interest is learned lazily: any pubkey a caller asks for is added to the
-//! published interest set, which backends subscribe to. Watch-registry
-//! accounts arrive via the backend's program-owner subscription after a
-//! one-time warm start through the inner source.
+//! Interest is learned two ways. Any pubkey a caller asks for is added to
+//! the published interest set, which backends subscribe to individually.
+//! On top of that, `watch_programs` streams **every** account owned by the
+//! named programs — the setting that makes local simulation cheap: a
+//! turner cranking its own protocol names that protocol's program id and
+//! then almost never pays an RPC fetch to simulate, because every account
+//! a crank touches is already resident.
+//!
+//! Watch-registry accounts arrive via the backend's program-owner
+//! subscription after a one-time warm start through the inner source.
 //!
 //! Insurance against silently-dropped subscriptions (the tuktuk dual
 //! ws+poll pattern): every `repoll_every` reads of a given account the cache
@@ -36,6 +42,10 @@ pub struct CachedSourceConfig {
     /// Refetch a cached account through the inner source every N reads of
     /// it (0 = never). Cheap insurance against a dead subscription.
     pub repoll_every: u64,
+    /// Cache every account owned by these programs, not just the ones
+    /// explicitly asked for. Point this at the protocol you crank and
+    /// local simulation stops needing the network.
+    pub watch_programs: Vec<Pubkey>,
 }
 
 impl Default for CachedSourceConfig {
@@ -43,6 +53,7 @@ impl Default for CachedSourceConfig {
         Self {
             relay_program: crate::turner::TurnerConfig::default().relay_program,
             repoll_every: 32,
+            watch_programs: Vec::new(),
         }
     }
 }
@@ -135,6 +146,14 @@ impl<Inner: ChainSource> CachedSource<Inner> {
         }
     }
 
+    /// Accounts owned by a watched program are streamed wholesale, so
+    /// they are never a cache miss even on first read.
+    fn is_watched_program(config: &CachedSourceConfig, account: &Option<Account>) -> bool {
+        account
+            .as_ref()
+            .is_some_and(|account| config.watch_programs.contains(&account.owner))
+    }
+
     /// A cached entry is served unless it has never been seen, or its repoll
     /// counter came due.
     fn is_miss(entry: Option<&mut CachedAccount>, repoll_every: u64) -> bool {
@@ -155,7 +174,16 @@ impl<Inner: ChainSource> ChainSource for CachedSource<Inner> {
             Self::ensure_interest(state, config, pubkeys);
             pubkeys
                 .iter()
-                .filter(|pk| Self::is_miss(state.accounts.get_mut(pk), config.repoll_every))
+                .filter(|pk| {
+                    let watched = Self::is_watched_program(
+                        config,
+                        &state.accounts.get(pk).and_then(|e| e.account.clone()),
+                    );
+                    let miss = Self::is_miss(state.accounts.get_mut(pk), config.repoll_every);
+                    // A program-streamed account is authoritative: the feed
+                    // carries every write to it, so never refetch.
+                    miss && !watched
+                })
                 .copied()
                 .collect()
         });
@@ -276,6 +304,10 @@ impl<Inner: ChainSource> ChainSource for CachedSource<Inner> {
         signatures: &[Signature],
     ) -> Result<Vec<Option<crate::source::SignatureOutcome>>> {
         self.inner.signature_statuses(signatures).await
+    }
+
+    async fn recent_priority_fee(&self, accounts: &[Pubkey]) -> Result<u64> {
+        self.inner.recent_priority_fee(accounts).await
     }
 
     async fn simulate_transaction(

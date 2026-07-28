@@ -38,6 +38,7 @@ pub mod cached;
 pub mod feed;
 pub mod filter;
 pub mod grpc;
+pub mod local_sim;
 pub mod metrics;
 pub mod source;
 pub mod submit;
@@ -48,6 +49,7 @@ pub use cached::{CachedSource, CachedSourceConfig};
 pub use feed::{feed_channel, AccountUpdate, FeedReceiver, FeedSender};
 pub use filter::{RefreshSummary, RejectReason, WatchFilter};
 pub use grpc::{spawn_grpc_feed, GrpcFeedConfig};
+pub use local_sim::{LocalSimConfig, LocalSimSource};
 pub use source::{
     BlockhashInfo, ChainSource, ClockSnapshot, RpcSource, SignatureOutcome, SimOutcome,
 };

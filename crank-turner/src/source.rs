@@ -52,6 +52,8 @@ pub struct SimOutcome {
     pub err: Option<String>,
     pub logs: Vec<String>,
     pub return_data: Option<Vec<u8>>,
+    /// Compute units the simulation burned, for sizing the CU limit.
+    pub units_consumed: u64,
     /// Post-execution state of the accounts the caller asked for, in the
     /// order requested. This is how a resolver's staged payload gets read
     /// without ever landing a transaction.
@@ -96,6 +98,11 @@ pub trait ChainSource: Send + Sync {
     ) -> Result<SimOutcome>;
 
     async fn send_transaction(&self, tx: &Transaction) -> Result<Signature>;
+
+    /// A recent prioritization fee (micro-lamports per CU) for
+    /// transactions touching `accounts`. Providers differ wildly here, so
+    /// treat it as a hint and clamp it.
+    async fn recent_priority_fee(&self, accounts: &[Pubkey]) -> Result<u64>;
 }
 
 /// Sharing a source between the turner and the submitter is the norm, so
@@ -136,6 +143,9 @@ impl<T: ChainSource + ?Sized> ChainSource for std::sync::Arc<T> {
     }
     async fn send_transaction(&self, tx: &Transaction) -> Result<Signature> {
         (**self).send_transaction(tx).await
+    }
+    async fn recent_priority_fee(&self, accounts: &[Pubkey]) -> Result<u64> {
+        (**self).recent_priority_fee(accounts).await
     }
 }
 
@@ -330,6 +340,7 @@ impl ChainSource for RpcSource {
             err: value.err.map(|e| e.to_string()),
             logs: value.logs.unwrap_or_default(),
             return_data,
+            units_consumed: value.units_consumed.unwrap_or_default(),
             accounts: value
                 .accounts
                 .unwrap_or_default()
@@ -337,6 +348,27 @@ impl ChainSource for RpcSource {
                 .map(|maybe| maybe.and_then(decode_ui_account))
                 .collect(),
         })
+    }
+
+    async fn recent_priority_fee(&self, accounts: &[Pubkey]) -> Result<u64> {
+        let fees = self
+            .client
+            .get_recent_prioritization_fees(accounts)
+            .await
+            .context("get_recent_prioritization_fees")?;
+        // Median over the recent window: the max is one outlier slot, the
+        // mean chases it.
+        let mut recent: Vec<u64> = fees
+            .iter()
+            .rev()
+            .take(20)
+            .map(|fee| fee.prioritization_fee)
+            .collect();
+        if recent.is_empty() {
+            return Ok(0);
+        }
+        recent.sort_unstable();
+        Ok(recent[recent.len() / 2])
     }
 
     async fn send_transaction(&self, tx: &Transaction) -> Result<Signature> {

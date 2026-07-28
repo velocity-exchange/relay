@@ -3533,6 +3533,7 @@ dependencies = [
  "solana-account-decoder",
  "solana-client",
  "solana-commitment-config",
+ "solana-compute-budget-interface",
  "solana-pubsub-client",
  "solana-rpc-client-api",
  "solana-sdk",

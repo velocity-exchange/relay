@@ -45,7 +45,25 @@ pub fn spawn_grpc_feed(
     target_programs: Vec<Pubkey>,
     feed: FeedSender,
 ) -> JoinHandle<()> {
-    tokio::spawn(run(config, relay_program, target_programs, feed))
+    spawn_grpc_feed_with_programs(config, relay_program, target_programs, Vec::new(), feed)
+}
+
+/// `watch_programs` streams every account owned by those programs, which
+/// is what keeps local simulation off the network.
+pub fn spawn_grpc_feed_with_programs(
+    config: GrpcFeedConfig,
+    relay_program: Pubkey,
+    target_programs: Vec<Pubkey>,
+    watch_programs: Vec<Pubkey>,
+    feed: FeedSender,
+) -> JoinHandle<()> {
+    tokio::spawn(run(
+        config,
+        relay_program,
+        target_programs,
+        watch_programs,
+        feed,
+    ))
 }
 
 /// Watch-registry filters: the relay program as owner, `WatchV0` size, and
@@ -74,6 +92,7 @@ fn watch_filters(target_program: Option<&Pubkey>) -> Vec<SubscribeRequestFilterA
 fn build_request(
     relay_program: &Pubkey,
     target_programs: &[Pubkey],
+    watch_programs: &[Pubkey],
     interest: &HashSet<Pubkey>,
 ) -> SubscribeRequest {
     let watch_entries: Vec<(String, SubscribeRequestFilterAccounts)> = if target_programs.is_empty()
@@ -116,6 +135,17 @@ fn build_request(
                 ..Default::default()
             },
         )])
+        // Everything owned by the watched programs, so local simulation
+        // finds its accounts already cached.
+        .chain(watch_programs.iter().enumerate().map(|(i, program)| {
+            (
+                format!("owned-{i}"),
+                SubscribeRequestFilterAccounts {
+                    owner: vec![program.to_string()],
+                    ..Default::default()
+                },
+            )
+        }))
         .collect();
     SubscribeRequest {
         accounts,
@@ -128,6 +158,7 @@ async fn run(
     config: GrpcFeedConfig,
     relay_program: Pubkey,
     target_programs: Vec<Pubkey>,
+    watch_programs: Vec<Pubkey>,
     feed: FeedSender,
 ) {
     let mut backoff = Duration::from_secs(1);
@@ -157,6 +188,7 @@ async fn run(
         let request = build_request(
             &relay_program,
             &target_programs,
+            &watch_programs,
             &interest.borrow_and_update(),
         );
         let (mut sink, mut stream) = match client.subscribe_with_request(Some(request)).await {
@@ -224,6 +256,7 @@ async fn run(
                         let request = build_request(
                             &relay_program,
                             &target_programs,
+                            &watch_programs,
                             &interest.borrow_and_update(),
                         );
                         if let Err(err) = sink.send(request).await {

@@ -180,6 +180,7 @@ impl ChainSource for LiteSvmSource {
                     err: None,
                     logs: info.meta.logs,
                     return_data: Some(info.meta.return_data.data),
+                    units_consumed: info.meta.compute_units_consumed,
                     accounts,
                 }
             }
@@ -187,6 +188,7 @@ impl ChainSource for LiteSvmSource {
                 err: Some(format!("{:?}", failed.err)),
                 logs: failed.meta.logs,
                 return_data: Some(failed.meta.return_data.data),
+                units_consumed: failed.meta.compute_units_consumed,
                 accounts: Vec::new(),
             },
         })
@@ -201,6 +203,63 @@ impl ChainSource for LiteSvmSource {
         };
         self.sent.lock().unwrap().insert(signature);
         Ok(signature)
+    }
+
+    async fn recent_priority_fee(&self, _accounts: &[Pubkey]) -> Result<u64> {
+        Ok(1_234)
+    }
+}
+
+/// Wraps a source and refuses to simulate, so a test can prove the local
+/// simulator never falls through to the provider.
+#[derive(Clone)]
+struct NoRemoteSimSource {
+    inner: LiteSvmSource,
+    fetches: Arc<Mutex<usize>>,
+}
+
+#[async_trait]
+impl ChainSource for NoRemoteSimSource {
+    async fn get_multiple_accounts(&self, pubkeys: &[Pubkey]) -> Result<Vec<Option<Account>>> {
+        *self.fetches.lock().unwrap() += 1;
+        self.inner.get_multiple_accounts(pubkeys).await
+    }
+    async fn get_watch_accounts(
+        &self,
+        program: &Pubkey,
+        target_programs: &[Pubkey],
+    ) -> Result<Vec<(Pubkey, Account)>> {
+        self.inner
+            .get_watch_accounts(program, target_programs)
+            .await
+    }
+    async fn clock(&self) -> Result<ClockSnapshot> {
+        self.inner.clock().await
+    }
+    async fn latest_blockhash(&self) -> Result<BlockhashInfo> {
+        self.inner.latest_blockhash().await
+    }
+    async fn block_height(&self) -> Result<u64> {
+        self.inner.block_height().await
+    }
+    async fn signature_statuses(
+        &self,
+        signatures: &[Signature],
+    ) -> Result<Vec<Option<SignatureOutcome>>> {
+        self.inner.signature_statuses(signatures).await
+    }
+    async fn recent_priority_fee(&self, accounts: &[Pubkey]) -> Result<u64> {
+        self.inner.recent_priority_fee(accounts).await
+    }
+    async fn simulate_transaction(
+        &self,
+        _tx: &Transaction,
+        _return_accounts: &[Pubkey],
+    ) -> Result<SimOutcome> {
+        panic!("simulation must not reach the provider");
+    }
+    async fn send_transaction(&self, tx: &Transaction) -> Result<Signature> {
+        self.inner.send_transaction(tx).await
     }
 }
 
@@ -766,6 +825,7 @@ async fn cached_source_serves_feed_updates_and_publishes_interest() {
         CachedSourceConfig {
             relay_program: relay_id(),
             repoll_every: 0, // never fall back: prove the cache is doing the work
+            watch_programs: Vec::new(),
         },
     );
 
@@ -831,6 +891,7 @@ async fn turner_cranks_through_cached_source() {
             // No live backend in this test, so repoll every read keeps the
             // cache honest against the inner source.
             repoll_every: 1,
+            watch_programs: Vec::new(),
         },
     );
     let mut turner = Turner::new(cached, Keypair::new(), TurnerConfig::default());
@@ -1178,6 +1239,9 @@ impl ChainSource for SlowSource {
     async fn send_transaction(&self, tx: &Transaction) -> Result<Signature> {
         self.inner.send_transaction(tx).await
     }
+    async fn recent_priority_fee(&self, accounts: &[Pubkey]) -> Result<u64> {
+        self.inner.recent_priority_fee(accounts).await
+    }
 }
 
 /// Conditions are cranked concurrently, not one after another. Every crank
@@ -1345,4 +1409,212 @@ async fn metrics_record_crank_outcomes() {
             .any(|line| line.starts_with("relay_cranks_total") && !line.ends_with(" 0")),
         "no crank recorded in:\n{encoded}"
     );
+}
+
+// --- local simulation ---
+
+/// The whole crank loop — resolver simulation *and* executor simulation —
+/// runs in-process. The underlying source panics if asked to simulate, so
+/// this fails loudly if anything falls through to the provider.
+#[tokio::test]
+async fn all_simulation_happens_locally() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    let t0 = h.t0;
+    h.add_entry(t0 + 100);
+
+    let guarded = NoRemoteSimSource {
+        inner: LiteSvmSource::new(&h.svm, &h.watch_keys),
+        fetches: Arc::new(Mutex::new(0)),
+    };
+    let local = relay_crank_turner::LocalSimSource::new(
+        guarded,
+        relay_crank_turner::LocalSimConfig { pool_size: 2 },
+    );
+    let mut turner = Turner::new(local, Keypair::new(), TurnerConfig::default());
+    {
+        let mut svm = h.svm.lock().unwrap();
+        svm.airdrop(&turner.keeper_pubkey(), 1_000_000_000).unwrap();
+    }
+    assert_eq!(turner.refresh_watches().await.unwrap().admitted, 1);
+
+    h.warp(t0 + 200, 2);
+    let outcomes = turner.tick().await.unwrap();
+    assert_eq!(sent(&outcomes).len(), 1, "{outcomes:?}");
+    assert_eq!(h.entry_count(), 0, "the crank actually landed on chain");
+
+    let encoded = relay_crank_turner::metrics::encode();
+    assert!(
+        encoded.contains("relay_simulations_total"),
+        "local simulations should be counted"
+    );
+}
+
+/// A no-work resolve is entirely local: nothing is sent, and the provider
+/// is never asked to simulate. This is what makes loose wake hints and
+/// frequent `EverySlots` fallbacks affordable.
+#[tokio::test]
+async fn no_work_resolves_cost_nothing_remote() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    let t0 = h.t0;
+    h.add_entry(t0 + 100);
+    h.cancel_entry(1); // stale-early hint: resolver will report no work
+
+    let guarded = NoRemoteSimSource {
+        inner: LiteSvmSource::new(&h.svm, &h.watch_keys),
+        fetches: Arc::new(Mutex::new(0)),
+    };
+    let local = relay_crank_turner::LocalSimSource::new(guarded, Default::default());
+    let mut turner = Turner::new(local, Keypair::new(), TurnerConfig::default());
+    {
+        let mut svm = h.svm.lock().unwrap();
+        svm.airdrop(&turner.keeper_pubkey(), 1_000_000_000).unwrap();
+    }
+    turner.refresh_watches().await.unwrap();
+
+    h.warp(t0 + 200, 2);
+    let outcomes = turner.tick().await.unwrap();
+    assert!(sent(&outcomes).is_empty(), "{outcomes:?}");
+    assert!(
+        outcomes
+            .iter()
+            .any(|o| matches!(o, Outcome::NoWork((_, _, 0)))),
+        "{outcomes:?}"
+    );
+}
+
+/// Accounts owned by a watched program are served from the cache without
+/// ever refetching, which is what keeps local simulation off the network.
+#[tokio::test]
+async fn watched_program_accounts_are_never_refetched() {
+    let h = setup(PAYMENT, 100, TurnerConfig::default());
+    let counted = NoRemoteSimSource {
+        inner: LiteSvmSource::new(&h.svm, &h.watch_keys),
+        fetches: Arc::new(Mutex::new(0)),
+    };
+    let fetches = Arc::clone(&counted.fetches);
+    let (_sender, receiver) = feed_channel();
+    let cached = CachedSource::new(
+        counted,
+        receiver,
+        CachedSourceConfig {
+            relay_program: relay_id(),
+            // Would otherwise refetch on every read.
+            repoll_every: 1,
+            watch_programs: vec![demo_id()],
+        },
+    );
+
+    // First read populates the cache.
+    cached.get_multiple_accounts(&[h.book]).await.unwrap();
+    let after_first = *fetches.lock().unwrap();
+
+    // The book is owned by a watched program, so subsequent reads are
+    // served from cache despite repoll_every = 1.
+    for _ in 0..5 {
+        let served = cached.get_multiple_accounts(&[h.book]).await.unwrap();
+        assert!(served[0].is_some());
+    }
+    assert_eq!(
+        *fetches.lock().unwrap(),
+        after_first,
+        "watched-program accounts must not be refetched"
+    );
+}
+
+// --- transaction packing ---
+
+/// Independent cranks ride one transaction, sharing its signature fee.
+/// Each keeps its own guard pair, and the guard account is safe to reuse
+/// within a transaction because every triple re-arms before its executor.
+#[tokio::test]
+async fn cranks_pack_into_one_transaction() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    let t0 = h.t0;
+    h.add_entry(t0 + 100);
+    let extra: Vec<Pubkey> = (0..2)
+        .map(|_| {
+            let book = h.add_book(PAYMENT, 100);
+            h.add_entry_to(book, t0 + 100);
+            book
+        })
+        .collect();
+
+    let mut turner = Turner::new(
+        LiteSvmSource::new(&h.svm, &h.watch_keys),
+        Keypair::new(),
+        TurnerConfig {
+            max_cranks_per_tx: 3,
+            ..TurnerConfig::default()
+        },
+    );
+    {
+        let mut svm = h.svm.lock().unwrap();
+        svm.airdrop(&turner.keeper_pubkey(), 10_000_000_000)
+            .unwrap();
+    }
+    assert_eq!(turner.refresh_watches().await.unwrap().admitted, 3);
+
+    h.warp(t0 + 200, 2);
+    let outcomes = turner.tick().await.unwrap();
+    let sent_outcomes = sent(&outcomes);
+    assert_eq!(sent_outcomes.len(), 3, "{outcomes:?}");
+
+    // All three sweeps landed under one signature.
+    let signatures: std::collections::HashSet<String> = sent_outcomes
+        .iter()
+        .filter_map(|o| match o {
+            Outcome::Sent { signature, .. } => Some(signature.to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(signatures.len(), 1, "expected one packed transaction");
+    assert_eq!(h.entry_count(), 0);
+    extra.iter().for_each(|book| {
+        let data = h.svm.lock().unwrap().get_account(book).unwrap().data;
+        let count = u32::from_le_bytes(
+            data[ENTRY_COUNT_OFFSET..ENTRY_COUNT_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(count, 0, "every packed crank did its work");
+    });
+}
+
+/// `max_cranks_per_tx: 1` disables packing: one transaction each.
+#[tokio::test]
+async fn packing_can_be_disabled() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    let t0 = h.t0;
+    h.add_entry(t0 + 100);
+    (0..2).for_each(|_| {
+        let book = h.add_book(PAYMENT, 100);
+        h.add_entry_to(book, t0 + 100);
+    });
+
+    let mut turner = Turner::new(
+        LiteSvmSource::new(&h.svm, &h.watch_keys),
+        Keypair::new(),
+        TurnerConfig {
+            max_cranks_per_tx: 1,
+            ..TurnerConfig::default()
+        },
+    );
+    {
+        let mut svm = h.svm.lock().unwrap();
+        svm.airdrop(&turner.keeper_pubkey(), 10_000_000_000)
+            .unwrap();
+    }
+    turner.refresh_watches().await.unwrap();
+
+    h.warp(t0 + 200, 2);
+    let outcomes = turner.tick().await.unwrap();
+    let signatures: std::collections::HashSet<String> = sent(&outcomes)
+        .iter()
+        .filter_map(|o| match o {
+            Outcome::Sent { signature, .. } => Some(signature.to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sent(&outcomes).len(), 3, "{outcomes:?}");
+    assert_eq!(signatures.len(), 3, "one transaction per crank");
 }
