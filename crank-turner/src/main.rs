@@ -76,10 +76,18 @@ struct Args {
     /// Re-scan the watch registry every N ticks.
     #[arg(long, env = "RELAY_REFRESH_TICKS", default_value_t = 30)]
     refresh_ticks: u64,
-    /// Refetch a subscription-cached account through RPC every N reads
-    /// (0 = never) — insurance against a silently dead subscription.
-    #[arg(long, env = "RELAY_REPOLL_EVERY", default_value_t = 32)]
-    repoll_every: u64,
+    /// Milliseconds an account with no live subscription may be served
+    /// from cache before it is refetched. These are the accounts a
+    /// simulation could be wrong about, so keep it short.
+    #[arg(long, env = "RELAY_MAX_AGE_UNCOVERED_MS", default_value_t = 400)]
+    max_age_uncovered_ms: u64,
+    /// Seconds before even a subscription-covered account is revalidated.
+    #[arg(long, env = "RELAY_MAX_AGE_COVERED_S", default_value_t = 30)]
+    max_age_covered_s: u64,
+    /// Seconds of total feed silence after which subscriptions are
+    /// disbelieved and everything falls back to refetching.
+    #[arg(long, env = "RELAY_FEED_SILENCE_S", default_value_t = 10)]
+    feed_silence_s: u64,
     /// Submit executors bare instead of bracketing them with relay's
     /// payment guards. Cheaper, but nothing catches a payment that shrinks
     /// between simulating and landing.
@@ -235,7 +243,9 @@ async fn main() -> Result<()> {
 fn cached_config(args: &Args) -> CachedSourceConfig {
     CachedSourceConfig {
         relay_program: args.program_id,
-        repoll_every: args.repoll_every,
+        max_age_uncovered: std::time::Duration::from_millis(args.max_age_uncovered_ms),
+        max_age_covered: std::time::Duration::from_secs(args.max_age_covered_s),
+        feed_silence_timeout: std::time::Duration::from_secs(args.feed_silence_s),
         watch_programs: args.watch_program.clone(),
     }
 }

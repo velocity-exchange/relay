@@ -15,13 +15,34 @@
 //! Watch-registry accounts arrive via the backend's program-owner
 //! subscription after a one-time warm start through the inner source.
 //!
-//! Insurance against silently-dropped subscriptions (the tuktuk dual
-//! ws+poll pattern): every `repoll_every` reads of a given account the cache
-//! treats it as a miss and refetches through the inner source. Set to 0 to
-//! disable.
+//! ## Freshness
+//!
+//! A cache in front of a simulator is a correctness problem, not just a
+//! performance one: serving a stale account makes the simulation decide
+//! about a world that no longer exists. The rule here turns on one
+//! distinction — *why* an account has been quiet:
+//!
+//! - **Covered** (the backend holds a live subscription for it, or for its
+//!   owner program): silence means nothing changed, so the cached value is
+//!   authoritative and free to serve.
+//! - **Uncovered** (nobody is listening; it only ever arrived via a fetch):
+//!   silence means nothing, so the value may be served for at most
+//!   `max_age_uncovered` before it must be revalidated.
+//!
+//! That is why backends publish [`Coverage`] rather than the cache
+//! inferring it from traffic. Two backstops sit under it:
+//!
+//! - **Heartbeat.** The clock sysvar is always in the interest set and
+//!   changes every slot, so it is a liveness probe for the feed itself. If
+//!   no update of any kind arrives for `feed_silence_timeout`, the feed is
+//!   dead (not the chain quiet), coverage is disbelieved, and everything
+//!   falls back to age-bounded revalidation.
+//! - **Ceiling.** Even covered accounts are revalidated after
+//!   `max_age_covered`, in case a subscription is live but lying.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -33,15 +54,24 @@ use solana_sdk::sysvar;
 use solana_sdk::transaction::Transaction;
 
 use crate::feed::FeedReceiver;
+use crate::metrics;
 use crate::source::{ChainSource, ClockSnapshot, SimOutcome};
 
 #[derive(Debug, Clone)]
 pub struct CachedSourceConfig {
     /// The relay program whose watch accounts the backend streams.
     pub relay_program: Pubkey,
-    /// Refetch a cached account through the inner source every N reads of
-    /// it (0 = never). Cheap insurance against a dead subscription.
-    pub repoll_every: u64,
+    /// How long an account with no live subscription may be served from
+    /// cache before it must be refetched. Keep this short: these are
+    /// exactly the accounts a simulation could be wrong about. Zero means
+    /// always revalidate.
+    pub max_age_uncovered: Duration,
+    /// Ceiling for accounts that *are* covered by a live subscription —
+    /// pure paranoia, in case a subscription is live but not delivering.
+    pub max_age_covered: Duration,
+    /// No feed update of any kind for this long means the feed is dead
+    /// (the clock alone updates every slot), so coverage is disbelieved.
+    pub feed_silence_timeout: Duration,
     /// Cache every account owned by these programs, not just the ones
     /// explicitly asked for. Point this at the protocol you crank and
     /// local simulation stops needing the network.
@@ -52,7 +82,11 @@ impl Default for CachedSourceConfig {
     fn default() -> Self {
         Self {
             relay_program: crate::turner::TurnerConfig::default().relay_program,
-            repoll_every: 32,
+            // About one slot: an uncovered account is never more than a
+            // block behind what a simulation sees.
+            max_age_uncovered: Duration::from_millis(400),
+            max_age_covered: Duration::from_secs(30),
+            feed_silence_timeout: Duration::from_secs(10),
             watch_programs: Vec::new(),
         }
     }
@@ -62,7 +96,9 @@ impl Default for CachedSourceConfig {
 struct CachedAccount {
     slot: u64,
     account: Option<Account>,
-    reads: u64,
+    /// When this value was last confirmed current, by a feed update or a
+    /// fetch.
+    observed: Instant,
 }
 
 struct CacheState {
@@ -73,6 +109,8 @@ struct CacheState {
     watch_keys: HashSet<Pubkey>,
     interested: HashSet<Pubkey>,
     warm: bool,
+    /// Last update of any kind — the feed's heartbeat.
+    last_feed_update: Option<Instant>,
 }
 
 pub struct CachedSource<Inner> {
@@ -92,6 +130,7 @@ impl<Inner: ChainSource> CachedSource<Inner> {
                 watch_keys: HashSet::new(),
                 interested: HashSet::new(),
                 warm: false,
+                last_feed_update: None,
             }),
         };
         // The clock rides the feed like any other account.
@@ -118,17 +157,20 @@ impl<Inner: ChainSource> CachedSource<Inner> {
             let is_watch = update.account.as_ref().is_some_and(|acc| {
                 acc.owner == config.relay_program && acc.data.len() == relay_spec::WATCH_V0_LEN
             });
+            let now = Instant::now();
+            state.last_feed_update = Some(now);
             let entry = state
                 .accounts
                 .entry(update.pubkey)
                 .or_insert_with(|| CachedAccount {
                     slot: 0,
                     account: None,
-                    reads: 0,
+                    observed: now,
                 });
             if update.slot >= entry.slot {
                 entry.slot = update.slot;
                 entry.account = update.account;
+                entry.observed = now;
             }
             if is_watch {
                 state.watch_keys.insert(update.pubkey);
@@ -146,70 +188,94 @@ impl<Inner: ChainSource> CachedSource<Inner> {
         }
     }
 
-    /// Accounts owned by a watched program are streamed wholesale, so
-    /// they are never a cache miss even on first read.
-    fn is_watched_program(config: &CachedSourceConfig, account: &Option<Account>) -> bool {
-        account
-            .as_ref()
-            .is_some_and(|account| config.watch_programs.contains(&account.owner))
+    /// Is the feed itself alive? The clock sysvar updates every slot, so
+    /// silence here means the subscription is dead rather than the chain
+    /// being quiet.
+    fn feed_healthy(state: &CacheState, config: &CachedSourceConfig, now: Instant) -> bool {
+        state
+            .last_feed_update
+            .is_some_and(|last| now.duration_since(last) < config.feed_silence_timeout)
     }
 
-    /// A cached entry is served unless it has never been seen, or its repoll
-    /// counter came due.
-    fn is_miss(entry: Option<&mut CachedAccount>, repoll_every: u64) -> bool {
-        match entry {
-            None => true,
-            Some(entry) => {
-                entry.reads += 1;
-                repoll_every != 0 && entry.reads.is_multiple_of(repoll_every)
-            }
-        }
+    /// Must this account be refetched before it is safe to use?
+    ///
+    /// The whole freshness policy lives here: never seen ⇒ yes; covered by
+    /// a live subscription on a healthy feed ⇒ only past the paranoia
+    /// ceiling; otherwise ⇒ past the (short) uncovered age.
+    fn needs_revalidation(
+        state: &CacheState,
+        config: &CachedSourceConfig,
+        coverage: &crate::feed::Coverage,
+        healthy: bool,
+        pubkey: &Pubkey,
+        now: Instant,
+    ) -> bool {
+        let Some(entry) = state.accounts.get(pubkey) else {
+            return true;
+        };
+        let owner = entry.account.as_ref().map(|account| account.owner);
+        let covered = healthy && coverage.covers(pubkey, owner.as_ref());
+        let max_age = if covered {
+            config.max_age_covered
+        } else {
+            config.max_age_uncovered
+        };
+        metrics::CACHE_READS
+            .with_label_values(&[if covered { "covered" } else { "uncovered" }])
+            .inc();
+        now.duration_since(entry.observed) >= max_age
     }
 }
 
 #[async_trait]
 impl<Inner: ChainSource> ChainSource for CachedSource<Inner> {
     async fn get_multiple_accounts(&self, pubkeys: &[Pubkey]) -> Result<Vec<Option<Account>>> {
+        let now = Instant::now();
         let misses: Vec<Pubkey> = self.with_state(|state, config| {
             Self::ensure_interest(state, config, pubkeys);
+            let coverage = state.feed.coverage.borrow().clone();
+            let healthy = Self::feed_healthy(state, config, now);
+            metrics::FEED_HEALTHY
+                .with_label_values(&["accounts"])
+                .set(healthy as i64);
             pubkeys
                 .iter()
-                .filter(|pk| {
-                    let watched = Self::is_watched_program(
-                        config,
-                        &state.accounts.get(pk).and_then(|e| e.account.clone()),
-                    );
-                    let miss = Self::is_miss(state.accounts.get_mut(pk), config.repoll_every);
-                    // A program-streamed account is authoritative: the feed
-                    // carries every write to it, so never refetch.
-                    miss && !watched
-                })
+                .filter(|pk| Self::needs_revalidation(state, config, &coverage, healthy, pk, now))
                 .copied()
                 .collect()
         });
 
         // Which reads the subscription served vs which fell through to
         // RPC: a subscription that has silently died shows up here first.
-        crate::metrics::UPDATE_SOURCE
+        metrics::UPDATE_SOURCE
             .with_label_values(&["subscription"])
             .inc_by((pubkeys.len() - misses.len()) as u64);
-        crate::metrics::UPDATE_SOURCE
+        metrics::UPDATE_SOURCE
             .with_label_values(&["repoll"])
             .inc_by(misses.len() as u64);
 
         if !misses.is_empty() {
             let fetched = self.inner.get_multiple_accounts(&misses).await?;
+            let fetched_at = Instant::now();
             self.with_state(|state, _| {
                 misses.iter().zip(fetched).for_each(|(pk, account)| {
-                    let entry = state.accounts.entry(*pk).or_insert_with(|| CachedAccount {
-                        slot: 0,
-                        account: None,
-                        reads: 0,
-                    });
-                    // Slot 0: any real feed update (even one racing in the
-                    // queue) outranks an RPC snapshot of unknown slot.
-                    if entry.slot == 0 {
-                        entry.account = account;
+                    match state.accounts.get_mut(pk) {
+                        // A fetch confirms the value is current as of now,
+                        // whatever its slot: that is what resets the age.
+                        Some(entry) => {
+                            entry.account = account;
+                            entry.observed = fetched_at;
+                        }
+                        None => {
+                            state.accounts.insert(
+                                *pk,
+                                CachedAccount {
+                                    slot: 0,
+                                    account,
+                                    observed: fetched_at,
+                                },
+                            );
+                        }
                     }
                 });
             });
@@ -234,13 +300,14 @@ impl<Inner: ChainSource> ChainSource for CachedSource<Inner> {
                 .inner
                 .get_watch_accounts(program, target_programs)
                 .await?;
+            let fetched_at = Instant::now();
             self.with_state(|state, _| {
                 accounts.into_iter().for_each(|(pk, account)| {
                     state.watch_keys.insert(pk);
                     state.accounts.entry(pk).or_insert_with(|| CachedAccount {
                         slot: 0,
                         account: Some(account),
-                        reads: 0,
+                        observed: fetched_at,
                     });
                 });
                 state.warm = true;

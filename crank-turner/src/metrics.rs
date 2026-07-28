@@ -105,6 +105,32 @@ pub static PACKS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("metric registers")
 });
 
+/// Cache reads by whether a live subscription covers the account. A
+/// climbing `uncovered` count is the signal to add a `--watch-program`:
+/// those reads are the ones paying an RPC round trip to stay safe.
+pub static CACHE_READS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec_with_registry!(
+        "relay_cache_reads_total",
+        "Cache reads by subscription coverage",
+        &["coverage"],
+        REGISTRY
+    )
+    .expect("metric registers")
+});
+
+/// 1 while the feed is delivering, 0 once it has gone silent past the
+/// timeout. The clock sysvar updates every slot, so this is a true
+/// liveness signal rather than a measure of chain activity.
+pub static FEED_HEALTHY: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec_with_registry!(
+        "relay_feed_healthy",
+        "Whether the account subscription feed is delivering",
+        &["feed"],
+        REGISTRY
+    )
+    .expect("metric registers")
+});
+
 pub static WATCHES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec_with_registry!(
         "relay_watches",

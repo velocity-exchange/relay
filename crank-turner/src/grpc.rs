@@ -29,7 +29,7 @@ use yellowstone_grpc_proto::prelude::{
     SubscribeRequestPing,
 };
 
-use crate::feed::{AccountUpdate, FeedSender};
+use crate::feed::{AccountUpdate, Coverage, FeedSender};
 
 #[derive(Debug, Clone)]
 pub struct GrpcFeedConfig {
@@ -201,6 +201,11 @@ async fn run(
             }
         };
         backoff = Duration::from_secs(1);
+        // Subscribed: silence about these accounts now means "unchanged".
+        feed.set_coverage(Coverage {
+            accounts: interest.borrow().iter().copied().collect(),
+            programs: watch_programs.iter().copied().collect(),
+        });
         debug!("grpc subscribed");
 
         loop {
@@ -243,10 +248,12 @@ async fn run(
                     },
                     Some(Err(err)) => {
                         warn!(error = %err, "grpc stream error; reconnecting");
+                        feed.set_coverage(Coverage::default());
                         break;
                     }
                     None => {
                         warn!("grpc stream ended; reconnecting");
+                        feed.set_coverage(Coverage::default());
                         break;
                     }
                 },
@@ -261,8 +268,14 @@ async fn run(
                         );
                         if let Err(err) = sink.send(request).await {
                             warn!(error = %err, "grpc filter update failed; reconnecting");
+                            feed.set_coverage(Coverage::default());
                             break;
                         }
+                        // Newly interested accounts are covered from here.
+                        feed.set_coverage(Coverage {
+                            accounts: interest.borrow().iter().copied().collect(),
+                            programs: watch_programs.iter().copied().collect(),
+                        });
                     }
                     Err(_) => return, // interest sender dropped: shut down
                 },

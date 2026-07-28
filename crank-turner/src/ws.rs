@@ -18,7 +18,7 @@ use solana_sdk::sysvar;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
-use crate::feed::{AccountUpdate, FeedSender};
+use crate::feed::{AccountUpdate, Coverage, FeedSender};
 
 /// `target_programs` narrows the watch-registry subscription to those
 /// programs (one subscription each); empty subscribes to every watch.
@@ -105,6 +105,7 @@ async fn session(
     feed: &FeedSender,
     interest: &mut tokio::sync::watch::Receiver<std::collections::HashSet<Pubkey>>,
 ) -> SessionEnd {
+    feed.set_coverage(Coverage::default());
     let client = match PubsubClient::new(ws_url).await {
         Ok(client) => client,
         Err(err) => return SessionEnd::Failed(format!("connect: {err}")),
@@ -218,6 +219,12 @@ async fn session(
             Err(err) => return SessionEnd::Failed(format!("program_subscribe {program}: {err}")),
         }
     }
+    // Everything above is subscribed, so silence about these accounts now
+    // means "unchanged" rather than "nobody listening".
+    feed.set_coverage(Coverage {
+        accounts: wanted.iter().copied().collect(),
+        programs: watch_programs.iter().copied().collect(),
+    });
     debug!(subscriptions = streams.len(), "ws session subscribed");
 
     let mut merged = futures_util::stream::select_all(streams);
@@ -239,6 +246,9 @@ async fn session(
         }
     };
     drop(merged);
+    // The session is over: stop vouching for anything before the
+    // reconnect, so the cache revalidates in the meantime.
+    feed.set_coverage(Coverage::default());
     futures_util::future::join_all(unsubs.into_iter().map(|unsub| unsub())).await;
     end
 }

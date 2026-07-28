@@ -56,6 +56,8 @@ cargo run -p relay-crank-turner -- --rpc-url https://your-rpc --keypair ~/keeper
 
 All simulation runs locally in an in-process SVM — pass `--watch-program <YOUR_PROGRAM>` so the accounts it needs are streamed into the cache and simulation stops touching the network (`--remote-sim` opts out).
 
+Accounts are only served from cache without revalidation when a subscription actually covers them and the feed is alive; anything uncovered is refetched within `--max-age-uncovered-ms` so simulation never runs on stale state.
+
 Operational flags: `--concurrency` (cranks in flight per tick), `--min-program-profit` (skip programs whose recent cranks lost money), `--metrics-port` (Prometheus `/metrics` + `/health`, default 9899), `--max-cranks-per-tx` (pack cranks into shared transactions, default 3), `--max-priority-fee`.
 
 Every flag also reads from env (`RELAY_RPC_URL`, `RELAY_KEEPER_KEYPAIR`, `RELAY_TRANSPORT`, `RELAY_GRPC_ENDPOINT`, `RELAY_MIN_CRANK_PAYMENT`, `RELAY_TICK_MS`, ...). Subscriptions only replace account reads; simulation and submission always go over RPC.

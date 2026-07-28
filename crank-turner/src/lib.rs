@@ -46,7 +46,7 @@ pub mod turner;
 pub mod ws;
 
 pub use cached::{CachedSource, CachedSourceConfig};
-pub use feed::{feed_channel, AccountUpdate, FeedReceiver, FeedSender};
+pub use feed::{feed_channel, AccountUpdate, Coverage, FeedReceiver, FeedSender};
 pub use filter::{RefreshSummary, RejectReason, WatchFilter};
 pub use grpc::{spawn_grpc_feed, GrpcFeedConfig};
 pub use local_sim::{LocalSimConfig, LocalSimSource};

@@ -824,7 +824,11 @@ async fn cached_source_serves_feed_updates_and_publishes_interest() {
         receiver,
         CachedSourceConfig {
             relay_program: relay_id(),
-            repoll_every: 0, // never fall back: prove the cache is doing the work
+            // Trust the cache indefinitely so this test isolates the
+            // update-merging behavior from the freshness policy.
+            max_age_uncovered: std::time::Duration::from_secs(3600),
+            max_age_covered: std::time::Duration::from_secs(3600),
+            feed_silence_timeout: std::time::Duration::from_secs(3600),
             watch_programs: Vec::new(),
         },
     );
@@ -888,9 +892,11 @@ async fn turner_cranks_through_cached_source() {
         receiver,
         CachedSourceConfig {
             relay_program: relay_id(),
-            // No live backend in this test, so repoll every read keeps the
-            // cache honest against the inner source.
-            repoll_every: 1,
+            // No live backend in this test, so revalidate every read to
+            // keep the cache honest against the inner source.
+            max_age_uncovered: std::time::Duration::ZERO,
+            max_age_covered: std::time::Duration::ZERO,
+            feed_silence_timeout: std::time::Duration::from_secs(3600),
             watch_programs: Vec::new(),
         },
     );
@@ -1275,24 +1281,16 @@ async fn conditions_are_cranked_concurrently() {
     turner.refresh_watches().await.unwrap();
 
     h.warp(t0 + 200, 2);
-    let started = std::time::Instant::now();
     let outcomes = turner.tick().await.unwrap();
-    let elapsed = started.elapsed();
 
     // Five books × two conditions each.
     assert_eq!(outcomes.len(), 10, "{outcomes:?}");
     assert_eq!(sent(&outcomes).len(), 5, "every book swept: {outcomes:?}");
-    assert!(
-        *peak.lock().unwrap() > 1,
-        "simulations should overlap, peak was {}",
-        peak.lock().unwrap()
-    );
-    // Sequential would be at least (conditions × 60ms); concurrent is far
-    // less. Loose bound so a slow machine does not flake it.
-    assert!(
-        elapsed < std::time::Duration::from_millis(60 * 6),
-        "tick took {elapsed:?}, suspiciously close to sequential"
-    );
+    // Overlap is the thing to assert; wall-clock would just measure the
+    // test machine. With concurrency 8 and ten due conditions, a
+    // sequential turner would never exceed a peak of 1.
+    let peak = *peak.lock().unwrap();
+    assert!(peak >= 4, "simulations should overlap, peak was {peak}");
 }
 
 /// The submitter owns send/confirm: the turner hands off a signed
@@ -1492,24 +1490,33 @@ async fn watched_program_accounts_are_never_refetched() {
         fetches: Arc::new(Mutex::new(0)),
     };
     let fetches = Arc::clone(&counted.fetches);
-    let (_sender, receiver) = feed_channel();
+    let (sender, receiver) = feed_channel();
     let cached = CachedSource::new(
         counted,
         receiver,
         CachedSourceConfig {
             relay_program: relay_id(),
-            // Would otherwise refetch on every read.
-            repoll_every: 1,
+            // Would otherwise revalidate on every read.
+            max_age_uncovered: std::time::Duration::ZERO,
+            max_age_covered: std::time::Duration::from_secs(3600),
+            feed_silence_timeout: std::time::Duration::from_secs(3600),
             watch_programs: vec![demo_id()],
         },
     );
+    // A live backend vouching for the program, plus a heartbeat so the
+    // feed counts as healthy.
+    sender.set_coverage(relay_crank_turner::Coverage {
+        accounts: Default::default(),
+        programs: [demo_id()].into_iter().collect(),
+    });
+    heartbeat(&sender);
 
     // First read populates the cache.
     cached.get_multiple_accounts(&[h.book]).await.unwrap();
     let after_first = *fetches.lock().unwrap();
 
-    // The book is owned by a watched program, so subsequent reads are
-    // served from cache despite repoll_every = 1.
+    // The book is owned by a covered program, so silence means unchanged
+    // and subsequent reads are served without revalidating.
     for _ in 0..5 {
         let served = cached.get_multiple_accounts(&[h.book]).await.unwrap();
         assert!(served[0].is_some());
@@ -1517,8 +1524,24 @@ async fn watched_program_accounts_are_never_refetched() {
     assert_eq!(
         *fetches.lock().unwrap(),
         after_first,
-        "watched-program accounts must not be refetched"
+        "covered accounts must not be refetched"
     );
+}
+
+/// Send one update so the feed registers as alive (the clock plays this
+/// role in production, updating every slot).
+fn heartbeat(sender: &relay_crank_turner::FeedSender) {
+    let _ = sender.updates.send(AccountUpdate {
+        pubkey: solana_sdk::sysvar::clock::id(),
+        account: Some(Account {
+            lamports: 1,
+            data: vec![0u8; 8],
+            owner: Pubkey::new_from_array([0u8; 32]),
+            executable: false,
+            rent_epoch: 0,
+        }),
+        slot: 1,
+    });
 }
 
 // --- transaction packing ---
@@ -1617,4 +1640,147 @@ async fn packing_can_be_disabled() {
         .collect();
     assert_eq!(sent(&outcomes).len(), 3, "{outcomes:?}");
     assert_eq!(signatures.len(), 3, "one transaction per crank");
+}
+
+// --- cache freshness ---
+
+fn freshness_cache(
+    h: &Harness,
+    fetches: &Arc<Mutex<usize>>,
+    config: CachedSourceConfig,
+) -> (
+    relay_crank_turner::FeedSender,
+    CachedSource<NoRemoteSimSource>,
+) {
+    let counted = NoRemoteSimSource {
+        inner: LiteSvmSource::new(&h.svm, &h.watch_keys),
+        fetches: Arc::clone(fetches),
+    };
+    let (sender, receiver) = feed_channel();
+    (sender, CachedSource::new(counted, receiver, config))
+}
+
+fn freshness_config(watch_programs: Vec<Pubkey>) -> CachedSourceConfig {
+    CachedSourceConfig {
+        relay_program: relay_id(),
+        // Zero: an uncovered account must be revalidated on every read.
+        max_age_uncovered: std::time::Duration::ZERO,
+        max_age_covered: std::time::Duration::from_secs(3600),
+        feed_silence_timeout: std::time::Duration::from_secs(3600),
+        watch_programs,
+    }
+}
+
+/// An account nobody is subscribed to is never served from cache past its
+/// (short) age, because silence about it means nothing. This is the case
+/// that would otherwise feed a simulation a stale account.
+#[tokio::test]
+async fn uncovered_accounts_are_revalidated() {
+    let h = setup(PAYMENT, 100, TurnerConfig::default());
+    let fetches = Arc::new(Mutex::new(0));
+    // Coverage is never published: nothing is subscribed.
+    let (sender, cached) = freshness_cache(&h, &fetches, freshness_config(vec![]));
+    heartbeat(&sender);
+
+    for _ in 0..3 {
+        cached.get_multiple_accounts(&[h.book]).await.unwrap();
+    }
+    assert_eq!(
+        *fetches.lock().unwrap(),
+        3,
+        "an uncovered account must be refetched every read"
+    );
+}
+
+/// And the value it serves is the current one — an out-of-band change is
+/// visible to the very next read, so a simulation cannot run against a
+/// world that has moved on.
+#[tokio::test]
+async fn uncovered_reads_see_out_of_band_changes() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    let fetches = Arc::new(Mutex::new(0));
+    let (sender, cached) = freshness_cache(&h, &fetches, freshness_config(vec![]));
+    heartbeat(&sender);
+
+    let before = cached.get_multiple_accounts(&[h.book]).await.unwrap();
+    assert_eq!(before[0].as_ref().unwrap().data[STAGING_OFFSET], 0);
+
+    // Change the account behind the cache's back, with no feed update.
+    {
+        let mut svm = h.svm.lock().unwrap();
+        let mut account = svm.get_account(&h.book).unwrap();
+        account.data[STAGING_OFFSET] = 0xAB;
+        svm.set_account(h.book, account).unwrap();
+    }
+    let after = cached.get_multiple_accounts(&[h.book]).await.unwrap();
+    assert_eq!(
+        after[0].as_ref().unwrap().data[STAGING_OFFSET],
+        0xAB,
+        "cache served a stale account to a would-be simulation"
+    );
+    let _ = &mut h;
+}
+
+/// A dead feed invalidates coverage: subscriptions that are no longer
+/// delivering must not license serving stale accounts.
+#[tokio::test]
+async fn silent_feed_stops_trusting_coverage() {
+    let h = setup(PAYMENT, 100, TurnerConfig::default());
+    let fetches = Arc::new(Mutex::new(0));
+    let mut config = freshness_config(vec![demo_id()]);
+    // Any silence at all counts as a dead feed, and covered accounts get
+    // the uncovered treatment once it is.
+    config.feed_silence_timeout = std::time::Duration::ZERO;
+    config.max_age_uncovered = std::time::Duration::ZERO;
+    let (sender, cached) = freshness_cache(&h, &fetches, config);
+    sender.set_coverage(relay_crank_turner::Coverage {
+        accounts: Default::default(),
+        programs: [demo_id()].into_iter().collect(),
+    });
+
+    for _ in 0..3 {
+        cached.get_multiple_accounts(&[h.book]).await.unwrap();
+    }
+    assert_eq!(
+        *fetches.lock().unwrap(),
+        3,
+        "a silent feed must not be trusted, even where it claims coverage"
+    );
+
+    let encoded = relay_crank_turner::metrics::encode();
+    assert!(encoded.contains("relay_feed_healthy"));
+    assert!(encoded.contains("relay_cache_reads_total"));
+}
+
+/// Dropping a subscription revokes coverage immediately, without waiting
+/// for the silence timeout.
+#[tokio::test]
+async fn dropped_subscription_revokes_coverage() {
+    let h = setup(PAYMENT, 100, TurnerConfig::default());
+    let fetches = Arc::new(Mutex::new(0));
+    let (sender, cached) = freshness_cache(&h, &fetches, freshness_config(vec![demo_id()]));
+    sender.set_coverage(relay_crank_turner::Coverage {
+        accounts: Default::default(),
+        programs: [demo_id()].into_iter().collect(),
+    });
+    heartbeat(&sender);
+
+    cached.get_multiple_accounts(&[h.book]).await.unwrap();
+    let while_covered = *fetches.lock().unwrap();
+    cached.get_multiple_accounts(&[h.book]).await.unwrap();
+    assert_eq!(
+        *fetches.lock().unwrap(),
+        while_covered,
+        "covered reads should not refetch"
+    );
+
+    // The backend loses its session and says so.
+    sender.set_coverage(relay_crank_turner::Coverage::default());
+    heartbeat(&sender);
+    cached.get_multiple_accounts(&[h.book]).await.unwrap();
+    assert_eq!(
+        *fetches.lock().unwrap(),
+        while_covered + 1,
+        "revoked coverage must force revalidation"
+    );
 }
