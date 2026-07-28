@@ -3,8 +3,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use relay_crank_turner::{
-    derive_ws_url, feed_channel, spawn_grpc_feed, spawn_ws_feed, CachedSource, CachedSourceConfig,
-    ChainSource, GrpcFeedConfig, Outcome, RpcSource, Turner, TurnerConfig, WatchFilter,
+    derive_ws_url, feed_channel, metrics, spawn_grpc_feed, spawn_submitter, spawn_ws_feed,
+    CachedSource, CachedSourceConfig, ChainSource, GrpcFeedConfig, Outcome, RpcSource,
+    SubmitterConfig, Turner, TurnerConfig, WatchFilter,
 };
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
@@ -88,6 +89,16 @@ struct Args {
     /// write lock.
     #[arg(long, env = "RELAY_GUARD_NONCE", default_value_t = 0)]
     guard_nonce: u8,
+    /// How many conditions to resolve and submit at once.
+    #[arg(long, env = "RELAY_CONCURRENCY", default_value_t = 8)]
+    concurrency: usize,
+    /// Skip target programs whose recent cranks netted less than this many
+    /// lamports. Default: never skip.
+    #[arg(long, env = "RELAY_MIN_PROGRAM_PROFIT", allow_negative_numbers = true)]
+    min_program_profit: Option<i64>,
+    /// Port for /metrics and /health.
+    #[arg(long, env = "RELAY_METRICS_PORT", default_value_t = 9899)]
+    metrics_port: u16,
 }
 
 #[tokio::main]
@@ -120,13 +131,31 @@ async fn main() -> Result<()> {
         min_crank_payment: args.min_crank_payment,
         guard_payments: !args.no_guard,
         guard_nonce: args.guard_nonce,
+        concurrency: args.concurrency,
+        min_program_profit: args.min_program_profit.unwrap_or(i64::MIN),
         filter: filter.clone(),
         ..TurnerConfig::default()
     };
+
+    let metrics_port = args.metrics_port;
+    tokio::spawn(async move {
+        if let Err(err) = metrics::serve(metrics_port).await {
+            warn!(error = %format!("{err:#}"), "metrics server stopped");
+        }
+    });
     let rpc = RpcSource::new(args.rpc_url.clone());
 
     match args.transport {
-        Transport::Rpc => run(Turner::new(rpc, keeper, config), &args).await,
+        Transport::Rpc => {
+            let source = std::sync::Arc::new(rpc);
+            let submitter =
+                spawn_submitter(std::sync::Arc::clone(&source), SubmitterConfig::default());
+            run(
+                Turner::new(source, keeper, config).with_submitter(submitter),
+                &args,
+            )
+            .await
+        }
         Transport::Ws => {
             let ws_url = args
                 .ws_url
@@ -140,8 +169,15 @@ async fn main() -> Result<()> {
                 sender,
             );
             info!(%ws_url, "websocket subscriptions enabled");
-            let source = CachedSource::new(rpc, receiver, cached_config(&args));
-            run(Turner::new(source, keeper, config), &args).await
+            let source =
+                std::sync::Arc::new(CachedSource::new(rpc, receiver, cached_config(&args)));
+            let submitter =
+                spawn_submitter(std::sync::Arc::clone(&source), SubmitterConfig::default());
+            run(
+                Turner::new(source, keeper, config).with_submitter(submitter),
+                &args,
+            )
+            .await
         }
         Transport::Grpc => {
             let endpoint = args
@@ -159,8 +195,15 @@ async fn main() -> Result<()> {
                 sender,
             );
             info!(%endpoint, "yellowstone gRPC subscriptions enabled");
-            let source = CachedSource::new(rpc, receiver, cached_config(&args));
-            run(Turner::new(source, keeper, config), &args).await
+            let source =
+                std::sync::Arc::new(CachedSource::new(rpc, receiver, cached_config(&args)));
+            let submitter =
+                spawn_submitter(std::sync::Arc::clone(&source), SubmitterConfig::default());
+            run(
+                Turner::new(source, keeper, config).with_submitter(submitter),
+                &args,
+            )
+            .await
         }
     }
 }

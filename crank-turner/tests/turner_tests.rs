@@ -15,15 +15,15 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use litesvm::LiteSVM;
 use relay_crank_turner::{
-    feed_channel, AccountUpdate, CachedSource, CachedSourceConfig, ChainSource, ClockSnapshot,
-    Outcome, RejectReason, SimOutcome, SkipReason, Stage, Turner, TurnerConfig, WatchFilter,
+    feed_channel, AccountUpdate, BlockhashInfo, CachedSource, CachedSourceConfig, ChainSource,
+    ClockSnapshot, Outcome, RejectReason, SignatureOutcome, SimOutcome, SkipReason, Stage, Turner,
+    TurnerConfig, WatchFilter,
 };
 use relay_spec as spec;
 use sha2::{Digest, Sha256};
 use solana_account::ReadableAccount;
 use solana_sdk::account::Account;
 use solana_sdk::clock::Clock;
-use solana_sdk::hash::Hash;
 use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature};
@@ -73,6 +73,18 @@ struct LiteSvmSource {
     /// litesvm has no getProgramAccounts; the harness registers watch
     /// pubkeys here as it creates them.
     watch_keys: Arc<Mutex<Vec<Pubkey>>>,
+    /// Signatures this source has sent, so `signature_statuses` can answer.
+    sent: Arc<Mutex<std::collections::HashSet<Signature>>>,
+}
+
+impl LiteSvmSource {
+    fn new(svm: &Arc<Mutex<LiteSVM>>, watch_keys: &Arc<Mutex<Vec<Pubkey>>>) -> Self {
+        Self {
+            svm: Arc::clone(svm),
+            watch_keys: Arc::clone(watch_keys),
+            sent: Arc::new(Mutex::new(std::collections::HashSet::new())),
+        }
+    }
 }
 
 #[async_trait]
@@ -111,10 +123,32 @@ impl ChainSource for LiteSvmSource {
         })
     }
 
-    async fn latest_blockhash(&self) -> Result<Hash> {
-        let mut svm = self.svm.lock().unwrap();
-        svm.expire_blockhash();
-        Ok(svm.latest_blockhash())
+    async fn latest_blockhash(&self) -> Result<BlockhashInfo> {
+        let svm = self.svm.lock().unwrap();
+        Ok(BlockhashInfo {
+            hash: svm.latest_blockhash(),
+            // litesvm does not expire by height; nothing here tests the
+            // resend path, which submit.rs owns.
+            last_valid_block_height: u64::MAX,
+        })
+    }
+
+    async fn block_height(&self) -> Result<u64> {
+        let clock: Clock = self.svm.lock().unwrap().get_sysvar();
+        Ok(clock.slot)
+    }
+
+    async fn signature_statuses(
+        &self,
+        signatures: &[Signature],
+    ) -> Result<Vec<Option<SignatureOutcome>>> {
+        // litesvm applies transactions synchronously, so anything the
+        // harness sent has already landed.
+        let sent = self.sent.lock().unwrap();
+        Ok(signatures
+            .iter()
+            .map(|signature| sent.contains(signature).then_some(SignatureOutcome::Landed))
+            .collect())
     }
 
     async fn simulate_transaction(
@@ -159,10 +193,14 @@ impl ChainSource for LiteSvmSource {
     }
 
     async fn send_transaction(&self, tx: &Transaction) -> Result<Signature> {
-        let mut svm = self.svm.lock().unwrap();
-        svm.send_transaction(tx.clone())
-            .map(|meta| meta.signature)
-            .map_err(|failed| anyhow!("send failed: {:?}", failed.err))
+        let signature = {
+            let mut svm = self.svm.lock().unwrap();
+            svm.send_transaction(tx.clone())
+                .map(|meta| meta.signature)
+                .map_err(|failed| anyhow!("send failed: {:?}", failed.err))?
+        };
+        self.sent.lock().unwrap().insert(signature);
+        Ok(signature)
     }
 }
 
@@ -218,10 +256,7 @@ fn setup_with_treasury(
 
     let svm = Arc::new(Mutex::new(svm));
     let watch_keys = Arc::new(Mutex::new(Vec::new()));
-    let source = LiteSvmSource {
-        svm: Arc::clone(&svm),
-        watch_keys: Arc::clone(&watch_keys),
-    };
+    let source = LiteSvmSource::new(&svm, &watch_keys);
     let mut harness = Harness {
         turner: Turner::new(source, keeper, config),
         svm,
@@ -354,6 +389,55 @@ impl Harness {
     fn keeper_balance(&self) -> u64 {
         let keeper = self.turner.keeper_pubkey();
         self.svm.lock().unwrap().get_balance(&keeper).unwrap()
+    }
+
+    /// Create and register another book, so a tick has several
+    /// independent targets (watches dedupe by target+offset).
+    fn add_book(&mut self, payment: u64, evict_threshold: u32) -> Pubkey {
+        let book = Pubkey::new_unique();
+        {
+            let mut svm = self.svm.lock().unwrap();
+            let rent = svm.minimum_balance_for_rent_exemption(BOOK_ACCOUNT_LEN);
+            svm.set_account(
+                book,
+                Account {
+                    lamports: rent + TREASURY,
+                    data: vec![0u8; BOOK_ACCOUNT_LEN],
+                    owner: demo_id(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        }
+        let args: Vec<u8> = payment
+            .to_le_bytes()
+            .into_iter()
+            .chain(evict_threshold.to_le_bytes())
+            .collect();
+        self.send_admin(demo_ix(
+            "initialize_book_v0",
+            vec![
+                AccountMeta::new_readonly(self.authority.pubkey(), true),
+                AccountMeta::new(book, false),
+            ],
+            &args,
+        ));
+        self.register_watch(book, CONDITIONS_OFFSET);
+        book
+    }
+
+    /// Add an entry to a specific book.
+    fn add_entry_to(&mut self, book: Pubkey, expiry_ts: i64) {
+        let ix = demo_ix(
+            "add_entry_v0",
+            vec![
+                AccountMeta::new(book, false),
+                AccountMeta::new_readonly(self.authority.pubkey(), true),
+            ],
+            &expiry_ts.to_le_bytes(),
+        );
+        self.send_admin(ix);
     }
 
     fn conditions(&self) -> Vec<spec::ConditionV0> {
@@ -674,10 +758,7 @@ async fn at_slot_wake_fires_at_target_slot() {
 #[tokio::test]
 async fn cached_source_serves_feed_updates_and_publishes_interest() {
     let h = setup(PAYMENT, 100, TurnerConfig::default());
-    let inner = LiteSvmSource {
-        svm: Arc::clone(&h.svm),
-        watch_keys: Arc::clone(&h.watch_keys),
-    };
+    let inner = LiteSvmSource::new(&h.svm, &h.watch_keys);
     let (sender, receiver) = feed_channel();
     let cached = CachedSource::new(
         inner,
@@ -740,10 +821,7 @@ async fn turner_cranks_through_cached_source() {
     let t0 = h.t0;
     h.add_entry(t0 + 100);
 
-    let inner = LiteSvmSource {
-        svm: Arc::clone(&h.svm),
-        watch_keys: Arc::clone(&h.watch_keys),
-    };
+    let inner = LiteSvmSource::new(&h.svm, &h.watch_keys);
     let (_sender, receiver) = feed_channel();
     let cached = CachedSource::new(
         inner,
@@ -804,10 +882,7 @@ async fn filter_scopes_turner_to_its_own_programs() {
     // Scoped to demo-book: the foreign watch is rejected from the registry
     // alone, before its 4KB target is ever read.
     h.turner = Turner::new(
-        LiteSvmSource {
-            svm: Arc::clone(&h.svm),
-            watch_keys: Arc::clone(&h.watch_keys),
-        },
+        LiteSvmSource::new(&h.svm, &h.watch_keys),
         Keypair::new(),
         TurnerConfig {
             filter: WatchFilter::for_programs([demo_id()]),
@@ -838,10 +913,7 @@ async fn filter_scopes_turner_to_its_own_programs() {
 
     // Denylisting our own program empties the working set entirely.
     h.turner = Turner::new(
-        LiteSvmSource {
-            svm: Arc::clone(&h.svm),
-            watch_keys: Arc::clone(&h.watch_keys),
-        },
+        LiteSvmSource::new(&h.svm, &h.watch_keys),
         Keypair::new(),
         TurnerConfig {
             filter: WatchFilter {
@@ -867,10 +939,7 @@ async fn filter_drops_watches_that_pay_too_little() {
     h.add_entry(t0 + 100);
 
     h.turner = Turner::new(
-        LiteSvmSource {
-            svm: Arc::clone(&h.svm),
-            watch_keys: Arc::clone(&h.watch_keys),
-        },
+        LiteSvmSource::new(&h.svm, &h.watch_keys),
         Keypair::new(),
         TurnerConfig {
             min_crank_payment: cheap + 1,
@@ -893,10 +962,7 @@ async fn filter_enforces_size_and_count_ceilings() {
     let mut h = setup(PAYMENT, 100, TurnerConfig::default());
 
     h.turner = Turner::new(
-        LiteSvmSource {
-            svm: Arc::clone(&h.svm),
-            watch_keys: Arc::clone(&h.watch_keys),
-        },
+        LiteSvmSource::new(&h.svm, &h.watch_keys),
         Keypair::new(),
         TurnerConfig {
             filter: WatchFilter {
@@ -911,10 +977,7 @@ async fn filter_enforces_size_and_count_ceilings() {
     assert_eq!(summary.rejected_for(RejectReason::TargetTooLarge), 1);
 
     h.turner = Turner::new(
-        LiteSvmSource {
-            svm: Arc::clone(&h.svm),
-            watch_keys: Arc::clone(&h.watch_keys),
-        },
+        LiteSvmSource::new(&h.svm, &h.watch_keys),
         Keypair::new(),
         TurnerConfig {
             filter: WatchFilter {
@@ -952,10 +1015,7 @@ async fn program_allowlist_is_pushed_to_the_provider() {
     }
     h.register_watch(foreign_target, 0);
 
-    let source = LiteSvmSource {
-        svm: Arc::clone(&h.svm),
-        watch_keys: Arc::clone(&h.watch_keys),
-    };
+    let source = LiteSvmSource::new(&h.svm, &h.watch_keys);
     let all = source
         .get_watch_accounts(&relay_id(), &[])
         .await
@@ -1057,4 +1117,232 @@ async fn guard_reverts_a_crank_that_underpays() {
         "{outcomes:?}"
     );
     assert_eq!(h.entry_count(), 1, "executor work reverted with the guard");
+}
+
+// --- operational behavior ---
+
+/// A source that stalls every simulation, so a sequential turner would
+/// take `n * delay` and a concurrent one about `delay`.
+#[derive(Clone)]
+struct SlowSource {
+    inner: LiteSvmSource,
+    delay: std::time::Duration,
+    peak_concurrent: Arc<Mutex<usize>>,
+    live: Arc<Mutex<usize>>,
+}
+
+#[async_trait]
+impl ChainSource for SlowSource {
+    async fn get_multiple_accounts(&self, pubkeys: &[Pubkey]) -> Result<Vec<Option<Account>>> {
+        self.inner.get_multiple_accounts(pubkeys).await
+    }
+    async fn get_watch_accounts(
+        &self,
+        program: &Pubkey,
+        target_programs: &[Pubkey],
+    ) -> Result<Vec<(Pubkey, Account)>> {
+        self.inner
+            .get_watch_accounts(program, target_programs)
+            .await
+    }
+    async fn clock(&self) -> Result<ClockSnapshot> {
+        self.inner.clock().await
+    }
+    async fn latest_blockhash(&self) -> Result<BlockhashInfo> {
+        self.inner.latest_blockhash().await
+    }
+    async fn block_height(&self) -> Result<u64> {
+        self.inner.block_height().await
+    }
+    async fn signature_statuses(
+        &self,
+        signatures: &[Signature],
+    ) -> Result<Vec<Option<SignatureOutcome>>> {
+        self.inner.signature_statuses(signatures).await
+    }
+    async fn simulate_transaction(
+        &self,
+        tx: &Transaction,
+        return_accounts: &[Pubkey],
+    ) -> Result<SimOutcome> {
+        {
+            let mut live = self.live.lock().unwrap();
+            *live += 1;
+            let mut peak = self.peak_concurrent.lock().unwrap();
+            *peak = (*peak).max(*live);
+        }
+        tokio::time::sleep(self.delay).await;
+        *self.live.lock().unwrap() -= 1;
+        self.inner.simulate_transaction(tx, return_accounts).await
+    }
+    async fn send_transaction(&self, tx: &Transaction) -> Result<Signature> {
+        self.inner.send_transaction(tx).await
+    }
+}
+
+/// Conditions are cranked concurrently, not one after another. Every crank
+/// is several RPC round trips, so this is the difference between a turner
+/// that keeps up and one that falls behind as the registry grows.
+#[tokio::test]
+async fn conditions_are_cranked_concurrently() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    let t0 = h.t0;
+    h.add_entry(t0 + 100);
+
+    // Independent books: watches dedupe by (target, offset), so repeating
+    // one target would collapse to a single condition set.
+    (0..4).for_each(|_| {
+        let book = h.add_book(PAYMENT, 100);
+        h.add_entry_to(book, t0 + 100);
+    });
+
+    let peak = Arc::new(Mutex::new(0usize));
+    let slow = SlowSource {
+        inner: LiteSvmSource::new(&h.svm, &h.watch_keys),
+        delay: std::time::Duration::from_millis(60),
+        peak_concurrent: Arc::clone(&peak),
+        live: Arc::new(Mutex::new(0)),
+    };
+    let mut turner = Turner::new(slow, Keypair::new(), TurnerConfig::default());
+    {
+        let mut svm = h.svm.lock().unwrap();
+        svm.airdrop(&turner.keeper_pubkey(), 1_000_000_000).unwrap();
+    }
+    turner.refresh_watches().await.unwrap();
+
+    h.warp(t0 + 200, 2);
+    let started = std::time::Instant::now();
+    let outcomes = turner.tick().await.unwrap();
+    let elapsed = started.elapsed();
+
+    // Five books × two conditions each.
+    assert_eq!(outcomes.len(), 10, "{outcomes:?}");
+    assert_eq!(sent(&outcomes).len(), 5, "every book swept: {outcomes:?}");
+    assert!(
+        *peak.lock().unwrap() > 1,
+        "simulations should overlap, peak was {}",
+        peak.lock().unwrap()
+    );
+    // Sequential would be at least (conditions × 60ms); concurrent is far
+    // less. Loose bound so a slow machine does not flake it.
+    assert!(
+        elapsed < std::time::Duration::from_millis(60 * 6),
+        "tick took {elapsed:?}, suspiciously close to sequential"
+    );
+}
+
+/// The submitter owns send/confirm: the turner hands off a signed
+/// transaction and keeps going, and the transaction still lands.
+#[tokio::test]
+async fn submitter_lands_transactions_off_the_decision_loop() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    let t0 = h.t0;
+    h.add_entry(t0 + 100);
+
+    let source = Arc::new(LiteSvmSource::new(&h.svm, &h.watch_keys));
+    let submitter = relay_crank_turner::spawn_submitter(
+        Arc::clone(&source),
+        relay_crank_turner::SubmitterConfig {
+            blockhash_refresh: std::time::Duration::from_millis(20),
+            confirm_interval: std::time::Duration::from_millis(20),
+            ..Default::default()
+        },
+    );
+    let mut turner = Turner::new(Arc::clone(&source), Keypair::new(), TurnerConfig::default())
+        .with_submitter(submitter.clone());
+    {
+        let mut svm = h.svm.lock().unwrap();
+        svm.airdrop(&turner.keeper_pubkey(), 1_000_000_000).unwrap();
+    }
+    turner.refresh_watches().await.unwrap();
+
+    h.warp(t0 + 200, 2);
+    let outcomes = turner.tick().await.unwrap();
+    assert_eq!(sent(&outcomes).len(), 1, "{outcomes:?}");
+
+    // The turner returned before the cluster confirmed; the submitter
+    // finishes the job and books the profit.
+    let program = demo_id();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while submitter.profit_for(&program) == 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        submitter.profit_for(&program),
+        PAYMENT as i64,
+        "a landed crank should book its payment"
+    );
+    assert_eq!(h.entry_count(), 0, "the work actually landed");
+}
+
+/// A program whose recent cranks lost money gets skipped rather than
+/// retried forever.
+#[tokio::test]
+async fn unprofitable_programs_are_skipped() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    let t0 = h.t0;
+    h.add_entry(t0 + 100);
+
+    let source = Arc::new(LiteSvmSource::new(&h.svm, &h.watch_keys));
+    let submitter = relay_crank_turner::spawn_submitter(
+        Arc::clone(&source),
+        relay_crank_turner::SubmitterConfig {
+            blockhash_refresh: std::time::Duration::from_millis(20),
+            confirm_interval: std::time::Duration::from_millis(20),
+            ..Default::default()
+        },
+    );
+    // Demand more profit than this program will ever show.
+    let mut turner = Turner::new(
+        Arc::clone(&source),
+        Keypair::new(),
+        TurnerConfig {
+            min_program_profit: 1_000_000,
+            ..TurnerConfig::default()
+        },
+    )
+    .with_submitter(submitter);
+    {
+        let mut svm = h.svm.lock().unwrap();
+        svm.airdrop(&turner.keeper_pubkey(), 1_000_000_000).unwrap();
+    }
+    turner.refresh_watches().await.unwrap();
+
+    h.warp(t0 + 200, 2);
+    let outcomes = turner.tick().await.unwrap();
+    assert!(sent(&outcomes).is_empty(), "{outcomes:?}");
+    assert!(
+        outcomes
+            .iter()
+            .any(|o| matches!(o, Outcome::Skipped(_, SkipReason::Unprofitable))),
+        "{outcomes:?}"
+    );
+    assert_eq!(h.entry_count(), 1, "nothing was cranked");
+}
+
+/// Metrics record what happened, including the subscription-vs-repoll
+/// split that reveals a silently dead stream.
+#[tokio::test]
+async fn metrics_record_crank_outcomes() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    h.refresh().await;
+    let t0 = h.t0;
+    h.add_entry(t0 + 100);
+    h.warp(t0 + 200, 2);
+    assert_eq!(sent(&h.tick().await).len(), 1);
+
+    let encoded = relay_crank_turner::metrics::encode();
+    assert!(
+        encoded.contains("relay_cranks_total"),
+        "crank counter missing from:\n{encoded}"
+    );
+    assert!(encoded.contains("relay_tick_seconds"));
+    assert!(encoded.contains("relay_watches"));
+    // A tick observed at least one crank outcome.
+    assert!(
+        encoded
+            .lines()
+            .any(|line| line.starts_with("relay_cranks_total") && !line.ends_with(" 0")),
+        "no crank recorded in:\n{encoded}"
+    );
 }

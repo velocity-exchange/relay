@@ -21,7 +21,6 @@ use anyhow::Result;
 use async_trait::async_trait;
 use solana_sdk::account::Account;
 use solana_sdk::clock::Clock;
-use solana_sdk::hash::Hash;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use solana_sdk::sysvar;
@@ -161,6 +160,15 @@ impl<Inner: ChainSource> ChainSource for CachedSource<Inner> {
                 .collect()
         });
 
+        // Which reads the subscription served vs which fell through to
+        // RPC: a subscription that has silently died shows up here first.
+        crate::metrics::UPDATE_SOURCE
+            .with_label_values(&["subscription"])
+            .inc_by((pubkeys.len() - misses.len()) as u64);
+        crate::metrics::UPDATE_SOURCE
+            .with_label_values(&["repoll"])
+            .inc_by(misses.len() as u64);
+
         if !misses.is_empty() {
             let fetched = self.inner.get_multiple_accounts(&misses).await?;
             self.with_state(|state, _| {
@@ -255,8 +263,19 @@ impl<Inner: ChainSource> ChainSource for CachedSource<Inner> {
         }
     }
 
-    async fn latest_blockhash(&self) -> Result<Hash> {
+    async fn latest_blockhash(&self) -> Result<crate::source::BlockhashInfo> {
         self.inner.latest_blockhash().await
+    }
+
+    async fn block_height(&self) -> Result<u64> {
+        self.inner.block_height().await
+    }
+
+    async fn signature_statuses(
+        &self,
+        signatures: &[Signature],
+    ) -> Result<Vec<Option<crate::source::SignatureOutcome>>> {
+        self.inner.signature_statuses(signatures).await
     }
 
     async fn simulate_transaction(

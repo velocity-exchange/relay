@@ -88,6 +88,14 @@ Generic daemon, patterned on tuktuk-crank-turner. Data access goes through a `Ch
 | `ws` | `programSubscribe` (watch registry) + `accountSubscribe` (targets, watched accounts, clock) | keeper-bots-v2 websocket mode, velocity-rs ws mode |
 | `grpc` | Yellowstone/geyser: one stream, owner filter for watches + pubkey filter for the interest set, filter updates pushed on the live stream | keep-rs (`GRPC_ENDPOINT`/`GRPC_X_TOKEN`) |
 
+### Operational shape
+
+The turner is three cooperating pieces, following tuktuk's crank turner where it earned it:
+
+- **Decision loop** (`turner.rs`) — each tick *decides* which wakes are due (sequential, no I/O), cranks the due ones **concurrently** (`--concurrency`, default 8; every crank is several RPC round trips, so this is the throughput knob), then folds the bookkeeping back in. Splitting it that way means the concurrent phase borrows nothing mutable: no locks, no channels between cranks.
+- **Submitter** (`submit.rs`) — a channel-fed subsystem that owns send/confirm/resend so the decision loop never blocks on the cluster. One shared blockhash refreshed on a timer and published over a `watch` channel (instead of a `getLatestBlockhash` per transaction); unconfirmed signatures tracked and polled in batches; resend while the blockhash lives, then a distinct `Expired` outcome so the caller retries promptly instead of counting it as the condition's fault. The turner signs, so it knows the signature immediately and returns without waiting.
+- **Profitability + metrics** — the submitter books each outcome into a rolling per-program net-lamports window, published over another `watch` channel; `--min-program-profit` skips programs that keep losing money rather than retrying them forever. Prometheus at `/metrics`, liveness at `/health`. Two labels are there for otherwise-invisible failures: `relay_update_source` (subscription vs repoll — a dead stream shows up as the poll counter climbing alone) and `relay_wake_lag_seconds` (how late cranks are, i.e. whether the turner is oversubscribed).
+
 `ws` and `grpc` are `CachedSource<RpcSource>`: the subscription feeds an account cache, and misses (plus a periodic `repoll_every` refetch, the tuktuk dual ws+poll insurance) fall through to RPC. Subscriptions only replace *reads* — simulation and submission always go to RPC. Loop per condition:
 
 ```

@@ -31,6 +31,20 @@ pub struct ClockSnapshot {
     pub unix_timestamp: i64,
 }
 
+/// A blockhash and the block height past which it can no longer land.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockhashInfo {
+    pub hash: Hash,
+    pub last_valid_block_height: u64,
+}
+
+/// What became of a submitted signature, as far as the cluster knows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignatureOutcome {
+    Landed,
+    Failed(String),
+}
+
 /// Simulation result, reduced to what the turner decides on.
 #[derive(Debug, Clone, Default)]
 pub struct SimOutcome {
@@ -61,7 +75,17 @@ pub trait ChainSource: Send + Sync {
 
     async fn clock(&self) -> Result<ClockSnapshot>;
 
-    async fn latest_blockhash(&self) -> Result<Hash>;
+    async fn latest_blockhash(&self) -> Result<BlockhashInfo>;
+
+    /// Current block height, for deciding whether a blockhash has expired.
+    async fn block_height(&self) -> Result<u64>;
+
+    /// Status of submitted signatures, in the order asked for. `None` =
+    /// not yet observed.
+    async fn signature_statuses(
+        &self,
+        signatures: &[Signature],
+    ) -> Result<Vec<Option<SignatureOutcome>>>;
 
     /// Simulate, returning post-execution data for `return_accounts` (in
     /// order) alongside logs and return data.
@@ -72,6 +96,47 @@ pub trait ChainSource: Send + Sync {
     ) -> Result<SimOutcome>;
 
     async fn send_transaction(&self, tx: &Transaction) -> Result<Signature>;
+}
+
+/// Sharing a source between the turner and the submitter is the norm, so
+/// `Arc` forwards the trait rather than making every caller deref.
+#[async_trait]
+impl<T: ChainSource + ?Sized> ChainSource for std::sync::Arc<T> {
+    async fn get_multiple_accounts(&self, pubkeys: &[Pubkey]) -> Result<Vec<Option<Account>>> {
+        (**self).get_multiple_accounts(pubkeys).await
+    }
+    async fn get_watch_accounts(
+        &self,
+        program: &Pubkey,
+        target_programs: &[Pubkey],
+    ) -> Result<Vec<(Pubkey, Account)>> {
+        (**self).get_watch_accounts(program, target_programs).await
+    }
+    async fn clock(&self) -> Result<ClockSnapshot> {
+        (**self).clock().await
+    }
+    async fn latest_blockhash(&self) -> Result<BlockhashInfo> {
+        (**self).latest_blockhash().await
+    }
+    async fn block_height(&self) -> Result<u64> {
+        (**self).block_height().await
+    }
+    async fn signature_statuses(
+        &self,
+        signatures: &[Signature],
+    ) -> Result<Vec<Option<SignatureOutcome>>> {
+        (**self).signature_statuses(signatures).await
+    }
+    async fn simulate_transaction(
+        &self,
+        tx: &Transaction,
+        return_accounts: &[Pubkey],
+    ) -> Result<SimOutcome> {
+        (**self).simulate_transaction(tx, return_accounts).await
+    }
+    async fn send_transaction(&self, tx: &Transaction) -> Result<Signature> {
+        (**self).send_transaction(tx).await
+    }
 }
 
 /// RPC-polling source. Reads at `processed` commitment — fast, possibly
@@ -188,11 +253,44 @@ impl ChainSource for RpcSource {
         })
     }
 
-    async fn latest_blockhash(&self) -> Result<Hash> {
-        self.client
-            .get_latest_blockhash()
+    async fn latest_blockhash(&self) -> Result<BlockhashInfo> {
+        let (hash, last_valid_block_height) = self
+            .client
+            .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
             .await
-            .context("get_latest_blockhash")
+            .context("get_latest_blockhash")?;
+        Ok(BlockhashInfo {
+            hash,
+            last_valid_block_height,
+        })
+    }
+
+    async fn block_height(&self) -> Result<u64> {
+        self.client.get_block_height().await.context("block_height")
+    }
+
+    async fn signature_statuses(
+        &self,
+        signatures: &[Signature],
+    ) -> Result<Vec<Option<SignatureOutcome>>> {
+        // One call per 256 signatures is the RPC limit; batches this large
+        // are already unusual for a single turner.
+        let mut out = Vec::with_capacity(signatures.len());
+        for chunk in signatures.chunks(256) {
+            let statuses = self
+                .client
+                .get_signature_statuses(chunk)
+                .await
+                .context("get_signature_statuses")?
+                .value;
+            out.extend(statuses.into_iter().map(|status| {
+                status.map(|status| match status.err {
+                    Some(err) => SignatureOutcome::Failed(err.to_string()),
+                    None => SignatureOutcome::Landed,
+                })
+            }));
+        }
+        Ok(out)
     }
 
     async fn simulate_transaction(

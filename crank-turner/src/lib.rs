@@ -38,7 +38,9 @@ pub mod cached;
 pub mod feed;
 pub mod filter;
 pub mod grpc;
+pub mod metrics;
 pub mod source;
+pub mod submit;
 pub mod turner;
 pub mod ws;
 
@@ -46,7 +48,10 @@ pub use cached::{CachedSource, CachedSourceConfig};
 pub use feed::{feed_channel, AccountUpdate, FeedReceiver, FeedSender};
 pub use filter::{RefreshSummary, RejectReason, WatchFilter};
 pub use grpc::{spawn_grpc_feed, GrpcFeedConfig};
-pub use source::{ChainSource, ClockSnapshot, RpcSource, SimOutcome};
+pub use source::{
+    BlockhashInfo, ChainSource, ClockSnapshot, RpcSource, SignatureOutcome, SimOutcome,
+};
+pub use submit::{spawn as spawn_submitter, PendingTx, SubmitterConfig, SubmitterHandle, TxResult};
 pub use turner::{
     CondKey, Outcome, SkipReason, Stage, Turner, TurnerConfig, Watch, RELAY_PROGRAM_ID,
 };

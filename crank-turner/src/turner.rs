@@ -13,8 +13,10 @@
 //! costs two ~1k-CU instructions instead of an invoke.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use relay_spec as spec;
 use solana_sdk::account::Account;
 use solana_sdk::instruction::{AccountMeta, Instruction};
@@ -24,7 +26,9 @@ use solana_sdk::signer::Signer;
 use solana_sdk::transaction::Transaction;
 
 use crate::filter::{RefreshSummary, WatchFilter};
+use crate::metrics;
 use crate::source::{ChainSource, ClockSnapshot};
+use crate::submit::{PendingTx, SubmitterHandle};
 
 /// One registered watch, parsed from a `WatchV0` account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +56,8 @@ pub enum SkipReason {
     /// Target data at the watch offset is not a parseable condition block
     /// (or a condition has an unknown wake kind) — inert, ignored.
     ParseFailed,
+    /// The target program's recent cranks have cost more than they paid.
+    Unprofitable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +110,14 @@ pub struct TurnerConfig {
     /// unrestricted; scope it to your own programs when other protocols
     /// share the registry.
     pub filter: WatchFilter,
+    /// How many conditions to resolve and submit at once. Every crank is
+    /// several RPC round trips, so a sequential turner spends nearly all
+    /// its time waiting; this is the single biggest throughput knob.
+    pub concurrency: usize,
+    /// Skip programs whose rolling net lamports are below this (negative
+    /// allows some loss). Only applies when a submitter is attached, since
+    /// that is what observes outcomes.
+    pub min_program_profit: i64,
 }
 
 /// System program id (the all-zero address), required by
@@ -123,6 +137,8 @@ impl Default for TurnerConfig {
             guard_payments: true,
             guard_nonce: 0,
             filter: WatchFilter::default(),
+            concurrency: 8,
+            min_program_profit: i64::MIN,
         }
     }
 }
@@ -146,6 +162,23 @@ pub struct Turner<S: ChainSource> {
     config: TurnerConfig,
     watches: Vec<Watch>,
     state: HashMap<CondKey, CondState>,
+    /// Where signed transactions go. Without one the turner sends inline
+    /// through the source and forgets — fine for tests and small
+    /// deployments, but it neither confirms nor resends.
+    submitter: Option<SubmitterHandle>,
+}
+
+/// How a condition's bookkeeping should change after an attempt. Collected
+/// during the concurrent phase and applied afterwards, so the execution
+/// path needs no shared mutable state at all — no locks, no channels.
+#[derive(Debug)]
+enum StateUpdate {
+    /// Resolver reported nothing to do; settle the wake and back off.
+    NoWork { last_seen: Option<Vec<u8>> },
+    /// Crank submitted.
+    Sent,
+    /// Attempt failed; extend the exponential backoff.
+    Failed,
 }
 
 impl<S: ChainSource> Turner<S> {
@@ -156,7 +189,16 @@ impl<S: ChainSource> Turner<S> {
             config,
             watches: Vec::new(),
             state: HashMap::new(),
+            submitter: None,
         }
+    }
+
+    /// Route submissions through a [`SubmitterHandle`], which owns the
+    /// shared blockhash, confirmation tracking, resends, and profitability
+    /// accounting.
+    pub fn with_submitter(mut self, submitter: SubmitterHandle) -> Self {
+        self.submitter = Some(submitter);
+        self
     }
 
     pub fn keeper_pubkey(&self) -> Pubkey {
@@ -239,6 +281,12 @@ impl<S: ChainSource> Turner<S> {
                 .map(|w| (*w, crate::filter::RejectReason::OverCapacity)),
         );
         summary.admitted = kept.len();
+        metrics::WATCHES
+            .with_label_values(&["admitted"])
+            .set(kept.len() as i64);
+        metrics::WATCHES
+            .with_label_values(&["rejected"])
+            .set(summary.rejected.len() as i64);
         self.watches = kept.to_vec();
         // Forget state for watches we no longer track, so a re-admitted
         // watch starts clean rather than inheriting a stale backoff.
@@ -266,9 +314,15 @@ impl<S: ChainSource> Turner<S> {
             .ok_or(crate::filter::RejectReason::PaysTooLittle)
     }
 
-    /// One pass over every known condition. Returns an outcome per
-    /// condition so callers (and tests) see exactly what happened.
+    /// One pass over every known condition.
+    ///
+    /// Three phases: decide which wakes are due (cheap, sequential, no
+    /// I/O), crank the due ones **concurrently**, then fold the resulting
+    /// bookkeeping back in. Splitting it this way is what makes the
+    /// concurrent phase lock-free — it borrows nothing mutable — and keeps
+    /// one slow simulation from stalling every other condition.
     pub async fn tick(&mut self) -> Result<Vec<Outcome>> {
+        let started = Instant::now();
         let clock = self.source.clock().await?;
 
         // Load all targets, parse their condition blocks.
@@ -304,7 +358,9 @@ impl<S: ChainSource> Turner<S> {
             target_accounts.get(pk).or_else(|| extra_accounts.get(pk))
         };
 
-        let mut outcomes = Vec::new();
+        // Phase 1 — decide. Pure function of cached state and accounts.
+        let mut outcomes: Vec<Outcome> = Vec::new();
+        let mut due: Vec<Due> = Vec::new();
         for (watch, conditions) in &parsed {
             let Some(conditions) = conditions else {
                 outcomes.push(Outcome::Skipped(
@@ -315,8 +371,6 @@ impl<S: ChainSource> Turner<S> {
             };
             for (index, condition) in conditions.iter().enumerate() {
                 let key: CondKey = (watch.target, watch.offset, index as u8);
-                // Change-wake current bytes, read before the mutable state
-                // borrow inside evaluate_condition.
                 let watched_now: Option<Vec<u8>> = match condition.wake() {
                     Ok(spec::WakeView::OnAccountChange {
                         address,
@@ -329,34 +383,88 @@ impl<S: ChainSource> Turner<S> {
                     ),
                     _ => None,
                 };
-                let outcome = self
-                    .evaluate_condition(key, condition, &clock, watched_now)
-                    .await;
+                match self.decide(key, watch, condition, &clock, watched_now) {
+                    Ok(ready) => due.push(ready),
+                    Err(skipped) => outcomes.push(skipped),
+                }
+            }
+        }
+        metrics::TICK_SECONDS
+            .with_label_values(&["decide"])
+            .observe(started.elapsed().as_secs_f64());
+
+        // Phase 2 — crank the due conditions concurrently. Bounded so a
+        // large registry cannot open an unbounded number of RPC calls.
+        let executing = Instant::now();
+        metrics::IN_FLIGHT
+            .with_label_values(&["cranks"])
+            .set(due.len() as i64);
+        // Explicit loops: the closure forms would need `&mut running`
+        // alongside the `&self` the in-flight futures hold.
+        let mut updates: Vec<(CondKey, StateUpdate)> = Vec::new();
+        {
+            let mut running = FuturesUnordered::new();
+            let mut queued = due.into_iter();
+            for _ in 0..self.config.concurrency {
+                match queued.next() {
+                    Some(next) => running.push(self.crank(next, &clock)),
+                    None => break,
+                }
+            }
+            // Refill as each finishes, so the pipeline stays full rather
+            // than draining in lockstep batches.
+            while let Some((outcome, key, update)) = running.next().await {
+                if let Some(next) = queued.next() {
+                    running.push(self.crank(next, &clock));
+                }
+                updates.push((key, update));
                 outcomes.push(outcome);
             }
         }
+        metrics::IN_FLIGHT.with_label_values(&["cranks"]).set(0);
+        metrics::TICK_SECONDS
+            .with_label_values(&["execute"])
+            .observe(executing.elapsed().as_secs_f64());
+
+        // Phase 3 — apply bookkeeping.
+        updates
+            .into_iter()
+            .for_each(|(key, update)| self.apply(key, update, &clock));
+        metrics::TICK_SECONDS
+            .with_label_values(&["total"])
+            .observe(started.elapsed().as_secs_f64());
         Ok(outcomes)
     }
 
-    async fn evaluate_condition(
-        &mut self,
+    /// Is this condition due? `Err` carries the skip outcome.
+    fn decide(
+        &self,
         key: CondKey,
+        watch: &Watch,
         condition: &spec::ConditionV0,
         clock: &ClockSnapshot,
         watched_now: Option<Vec<u8>>,
-    ) -> Outcome {
+    ) -> Result<Due, Outcome> {
         if !condition.is_active() {
-            return Outcome::Skipped(key, SkipReason::Inactive);
+            return Err(Outcome::Skipped(key, SkipReason::Inactive));
         }
         if condition.min_payment < self.config.min_crank_payment {
-            return Outcome::Skipped(key, SkipReason::BelowMinPayment);
+            return Err(Outcome::Skipped(key, SkipReason::BelowMinPayment));
         }
         let Ok(wake) = condition.wake() else {
-            return Outcome::Skipped(key, SkipReason::ParseFailed);
+            return Err(Outcome::Skipped(key, SkipReason::ParseFailed));
         };
-        let state = self.state.entry(key).or_default();
+        // A program that keeps losing us money is deprioritized rather
+        // than retried forever.
+        if let Some(submitter) = &self.submitter {
+            if submitter.profit_for(&watch.target_program) < self.config.min_program_profit {
+                return Err(Outcome::Skipped(key, SkipReason::Unprofitable));
+            }
+        }
+        let default = CondState::default();
+        let state = self.state.get(&key).unwrap_or(&default);
         if clock.slot < state.suppress_until {
-            return Outcome::Skipped(key, SkipReason::Backoff);
+            return Err(Outcome::Skipped(key, SkipReason::Backoff));
         }
         let due = match wake {
             spec::WakeView::AtTimestamp { unix_ts } => unix_ts <= clock.unix_timestamp,
@@ -369,30 +477,104 @@ impl<S: ChainSource> Turner<S> {
             }
         };
         if !due {
-            return Outcome::Skipped(key, SkipReason::NotDue);
+            return Err(Outcome::Skipped(key, SkipReason::NotDue));
         }
+        // How late we are, relative to when the wake actually came due.
+        let lag = match wake {
+            spec::WakeView::AtTimestamp { unix_ts } => {
+                (clock.unix_timestamp - unix_ts).max(0) as f64
+            }
+            _ => 0.0,
+        };
+        metrics::WAKE_LAG
+            .with_label_values(&[&metrics::program_label(&watch.target_program)])
+            .observe(lag);
+        Ok(Due {
+            key,
+            program: watch.target_program,
+            condition: *condition,
+            watched_now,
+        })
+    }
 
-        match self.crank(key, condition, clock, watched_now).await {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                self.record_failure(key, clock);
-                Outcome::Failed {
-                    condition: key,
-                    stage: Stage::Send,
-                    error: format!("{err:#}"),
-                }
+    /// Fold one attempt's bookkeeping back into the condition state.
+    fn apply(&mut self, key: CondKey, update: StateUpdate, clock: &ClockSnapshot) {
+        match update {
+            StateUpdate::NoWork { last_seen } => {
+                let backoff = self.config.no_work_backoff_slots;
+                let state = self.state.entry(key).or_default();
+                state.last_seen = last_seen;
+                state.last_fired = Some(clock.slot);
+                state.suppress_until = clock.slot + backoff;
+                state.failures = 0;
+            }
+            StateUpdate::Sent => {
+                let state = self.state.entry(key).or_default();
+                // The crank mutates watched state; force a fresh change
+                // evaluation next tick rather than diffing against a
+                // pre-crank snapshot.
+                state.last_seen = None;
+                state.last_fired = Some(clock.slot);
+                state.suppress_until = clock.slot + 1;
+                state.failures = 0;
+            }
+            StateUpdate::Failed => {
+                let base = self.config.failure_backoff_slots;
+                let state = self.state.entry(key).or_default();
+                state.failures += 1;
+                state.suppress_until = clock.slot + (base << state.failures.min(6));
             }
         }
     }
 
-    /// Resolve → build → simulate → send, for a condition whose wake is due.
-    async fn crank(
-        &mut self,
-        key: CondKey,
-        condition: &spec::ConditionV0,
-        clock: &ClockSnapshot,
-        watched_now: Option<Vec<u8>>,
-    ) -> Result<Outcome> {
+    /// Resolve → build → simulate → submit, for one due condition.
+    ///
+    /// Takes `&self`: everything it learns comes back as a [`StateUpdate`]
+    /// for the caller to apply, which is what lets a whole tick's worth of
+    /// cranks run concurrently without a lock between them.
+    async fn crank(&self, due: Due, clock: &ClockSnapshot) -> (Outcome, CondKey, StateUpdate) {
+        let key = due.key;
+        let program = metrics::program_label(&due.program);
+        match self.try_crank(&due, clock).await {
+            Ok((outcome, update)) => {
+                let label = match &outcome {
+                    Outcome::Sent { .. } => "sent",
+                    Outcome::NoWork(_) => "no_work",
+                    Outcome::Failed { stage, .. } => {
+                        metrics::FAILURES
+                            .with_label_values(&[stage_label(stage), &program])
+                            .inc();
+                        "failed"
+                    }
+                    Outcome::Skipped(..) => "skipped",
+                };
+                metrics::CRANKS.with_label_values(&[label, &program]).inc();
+                (outcome, key, update)
+            }
+            Err(err) => {
+                metrics::CRANKS
+                    .with_label_values(&["failed", &program])
+                    .inc();
+                metrics::FAILURES
+                    .with_label_values(&["build", &program])
+                    .inc();
+                (
+                    Outcome::Failed {
+                        condition: key,
+                        stage: Stage::Send,
+                        error: format!("{err:#}"),
+                    },
+                    key,
+                    StateUpdate::Failed,
+                )
+            }
+        }
+    }
+
+    async fn try_crank(&self, due: &Due, clock: &ClockSnapshot) -> Result<(Outcome, StateUpdate)> {
+        let key = due.key;
+        let condition = &due.condition;
+
         // Simulate the resolver, asking for its accounts back so the staged
         // payload can be read out of post-execution state.
         let resolver_accounts: Vec<Pubkey> = condition
@@ -410,31 +592,31 @@ impl<S: ChainSource> Turner<S> {
             data: condition.resolver_disc.to_vec(),
         };
         let sim = {
-            let tx = self.signed_tx(&[resolver_ix]).await?;
+            let (tx, _) = self.signed_tx(&[resolver_ix]).await?;
             self.source
                 .simulate_transaction(&tx, &resolver_accounts)
                 .await?
         };
         if let Some(err) = sim.err {
-            self.record_failure(key, clock);
-            return Ok(Outcome::Failed {
-                condition: key,
-                stage: Stage::ResolveSim,
-                error: err,
-            });
+            return Ok((
+                Outcome::Failed {
+                    condition: key,
+                    stage: Stage::ResolveSim,
+                    error: err,
+                },
+                StateUpdate::Failed,
+            ));
         }
 
         let pointer = spec::ResponsePointerV0::read(sim.return_data.as_deref().unwrap_or_default())
             .map_err(|e| anyhow::anyhow!("resolver return data: {e:?}"))?;
         if !pointer.has_work() {
-            // The wake was evaluated: settle its state so a stale-early hint
-            // doesn't re-simulate every tick.
-            let state = self.state.entry(key).or_default();
-            state.last_seen = watched_now;
-            state.last_fired = Some(clock.slot);
-            state.suppress_until = clock.slot + self.config.no_work_backoff_slots;
-            state.failures = 0;
-            return Ok(Outcome::NoWork(key));
+            return Ok((
+                Outcome::NoWork(key),
+                StateUpdate::NoWork {
+                    last_seen: due.watched_now.clone(),
+                },
+            ));
         }
         let resolved = read_staged(&sim.accounts, &pointer).context("staged resolver payload")?;
 
@@ -467,32 +649,66 @@ impl<S: ChainSource> Turner<S> {
         };
         let ixs = self.guarded(executor_ix, condition.min_payment);
 
-        // Simulate, then fire. With guards on, a successful simulation is
-        // also the payment check.
-        let tx = self.signed_tx(&ixs).await?;
+        // Simulate, then submit. With guards on, a successful simulation
+        // is also the payment check.
+        let (tx, last_valid_block_height) = self.signed_tx(&ixs).await?;
         let sim = self.source.simulate_transaction(&tx, &[]).await?;
         if let Some(err) = sim.err {
-            self.record_failure(key, clock);
-            return Ok(Outcome::Failed {
-                condition: key,
-                stage: Stage::ExecuteSim,
-                error: err,
-            });
+            return Ok((
+                Outcome::Failed {
+                    condition: key,
+                    stage: Stage::ExecuteSim,
+                    error: err,
+                },
+                StateUpdate::Failed,
+            ));
         }
-        let signature = self.source.send_transaction(&tx).await?;
+        let signature = self
+            .submit(
+                tx,
+                due.program,
+                condition.min_payment,
+                last_valid_block_height,
+            )
+            .await?;
+        let _ = clock;
+        Ok((
+            Outcome::Sent {
+                condition: key,
+                signature,
+                min_payment: condition.min_payment,
+            },
+            StateUpdate::Sent,
+        ))
+    }
 
-        let state = self.state.entry(key).or_default();
-        // The crank mutates watched state; force a fresh change evaluation
-        // next tick rather than diffing against a pre-crank snapshot.
-        state.last_seen = None;
-        state.last_fired = Some(clock.slot);
-        state.suppress_until = clock.slot + 1;
-        state.failures = 0;
-        Ok(Outcome::Sent {
-            condition: key,
-            signature,
-            min_payment: condition.min_payment,
-        })
+    /// Hand a signed transaction to the submitter, or send it inline when
+    /// none is attached. Either way the signature is already known — the
+    /// turner signed it — so nothing here waits on the cluster.
+    async fn submit(
+        &self,
+        tx: Transaction,
+        program: Pubkey,
+        expected_payment: u64,
+        last_valid_block_height: u64,
+    ) -> Result<Signature> {
+        let signature = tx.signatures[0];
+        match &self.submitter {
+            Some(submitter) => {
+                submitter
+                    .outbox
+                    .send(PendingTx {
+                        transaction: tx,
+                        signature,
+                        program,
+                        expected_payment,
+                        last_valid_block_height,
+                    })
+                    .map_err(|_| anyhow::anyhow!("submitter stopped"))?;
+                Ok(signature)
+            }
+            None => self.source.send_transaction(&tx).await,
+        }
     }
 
     /// Bracket an executor with the payment guards (or pass it through
@@ -535,20 +751,22 @@ impl<S: ChainSource> Turner<S> {
         .0
     }
 
-    fn record_failure(&mut self, key: CondKey, clock: &ClockSnapshot) {
-        let base = self.config.failure_backoff_slots;
-        let state = self.state.entry(key).or_default();
-        state.failures += 1;
-        state.suppress_until = clock.slot + (base << state.failures.min(6));
-    }
-
-    async fn signed_tx(&self, ixs: &[Instruction]) -> Result<Transaction> {
-        let blockhash = self.source.latest_blockhash().await?;
-        Ok(Transaction::new_signed_with_payer(
-            ixs,
-            Some(&self.keeper.pubkey()),
-            &[&self.keeper],
-            blockhash,
+    /// Sign against the shared blockhash the submitter keeps refreshed,
+    /// falling back to a direct fetch when running without one. Returns
+    /// the block height past which the transaction can no longer land.
+    async fn signed_tx(&self, ixs: &[Instruction]) -> Result<(Transaction, u64)> {
+        let info = match self.submitter.as_ref().and_then(|s| s.cached_blockhash()) {
+            Some(info) => info,
+            None => self.source.latest_blockhash().await?,
+        };
+        Ok((
+            Transaction::new_signed_with_payer(
+                ixs,
+                Some(&self.keeper.pubkey()),
+                &[&self.keeper],
+                info.hash,
+            ),
+            info.last_valid_block_height,
         ))
     }
 
@@ -574,6 +792,23 @@ fn require_keeper_placeholder(resolved: &spec::ResolvedCrankV0) -> Result<()> {
         .any(|a| a.address == spec::KEEPER_PLACEHOLDER)
         .then_some(())
         .context("resolver output names no keeper placeholder")
+}
+
+/// A condition whose wake came due, carried into the concurrent phase.
+#[derive(Debug)]
+struct Due {
+    key: CondKey,
+    program: Pubkey,
+    condition: spec::ConditionV0,
+    watched_now: Option<Vec<u8>>,
+}
+
+fn stage_label(stage: &Stage) -> &'static str {
+    match stage {
+        Stage::ResolveSim => "resolve_sim",
+        Stage::ExecuteSim => "execute_sim",
+        Stage::Send => "send",
+    }
 }
 
 fn account_ref_meta(a: &spec::AccountRefV0) -> AccountMeta {

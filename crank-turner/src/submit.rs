@@ -1,0 +1,307 @@
+//! Transaction submission as its own subsystem, fed by a channel.
+//!
+//! Keeping this off the decision loop is the point: send, confirm, and
+//! resend all involve RPC round trips, and a turner that awaited them
+//! inline would stop evaluating conditions while a transaction settles.
+//! The turner signs (so it knows the signature immediately), hands the
+//! transaction over, and moves on.
+//!
+//! Lifted from tuktuk's sender, which learned these the hard way:
+//!
+//! - **One shared blockhash**, refreshed on a timer and published over a
+//!   watch channel, instead of a `getLatestBlockhash` per transaction.
+//! - **Track unconfirmed signatures** and poll `getSignatureStatuses` in
+//!   batches rather than awaiting each send.
+//! - **Resend while the blockhash is still valid**; re-sign once it
+//!   expires, up to a limit, then give up with a distinct outcome so the
+//!   caller retries immediately rather than counting it as a real failure.
+//! - **Classify failures.** "The blockhash expired" and "the executor
+//!   underpaid" deserve different reactions.
+
+use std::collections::HashMap;
+use std::time::Duration;
+
+use solana_sdk::pubkey::Pubkey;
+use solana_sdk::signature::Signature;
+use solana_sdk::transaction::Transaction;
+use tokio::sync::{mpsc, watch};
+use tracing::{debug, info, warn};
+
+use crate::metrics;
+use crate::source::{BlockhashInfo, ChainSource, SignatureOutcome};
+
+/// How a submitted transaction ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxResult {
+    /// Landed and succeeded.
+    Landed,
+    /// Landed and the runtime rejected it (guard tripped, executor failed,
+    /// state moved). The turner should back this condition off.
+    Failed(String),
+    /// Never landed before its blockhash expired, after exhausting
+    /// re-signs. Not the condition's fault — retry promptly.
+    Expired,
+}
+
+/// A signed transaction plus what the submitter needs to account for it.
+#[derive(Debug, Clone)]
+pub struct PendingTx {
+    pub transaction: Transaction,
+    pub signature: Signature,
+    /// Target program, for per-program metrics and profitability.
+    pub program: Pubkey,
+    /// What the crank is expected to earn, for profitability accounting.
+    pub expected_payment: u64,
+    pub last_valid_block_height: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubmitterConfig {
+    /// How often to refresh the shared blockhash.
+    pub blockhash_refresh: Duration,
+    /// How often to poll for confirmations.
+    pub confirm_interval: Duration,
+    /// Resend attempts before declaring a transaction expired.
+    pub max_resends: u32,
+    /// Rolling window length for per-program profitability.
+    pub profit_window: usize,
+}
+
+impl Default for SubmitterConfig {
+    fn default() -> Self {
+        Self {
+            blockhash_refresh: Duration::from_secs(2),
+            confirm_interval: Duration::from_secs(2),
+            max_resends: 3,
+            profit_window: 20,
+        }
+    }
+}
+
+/// Rolling net lamports per target program, published for the turner to
+/// gate on. A program whose cranks keep costing more than they pay gets
+/// deprioritized instead of retried forever — the tuktuk profitability
+/// lesson, which keeps a fleet of independent turners from all grinding on
+/// the same loss-making work.
+pub type ProfitSnapshot = HashMap<Pubkey, i64>;
+
+/// Handle the turner holds: an outbox plus two read-only views.
+#[derive(Clone)]
+pub struct SubmitterHandle {
+    pub outbox: mpsc::UnboundedSender<PendingTx>,
+    pub blockhash: watch::Receiver<Option<BlockhashInfo>>,
+    pub profit: watch::Receiver<ProfitSnapshot>,
+}
+
+impl SubmitterHandle {
+    /// Latest cached blockhash, if the refresher has produced one.
+    pub fn cached_blockhash(&self) -> Option<BlockhashInfo> {
+        self.blockhash.borrow().clone()
+    }
+
+    /// Rolling net lamports for a program (negative = losing money).
+    pub fn profit_for(&self, program: &Pubkey) -> i64 {
+        self.profit.borrow().get(program).copied().unwrap_or(0)
+    }
+}
+
+struct Tracked {
+    pending: PendingTx,
+    resends: u32,
+}
+
+/// Spawn the submitter: a blockhash refresher, and a send/confirm loop.
+pub fn spawn<S: ChainSource + 'static>(
+    source: std::sync::Arc<S>,
+    config: SubmitterConfig,
+) -> SubmitterHandle {
+    let (outbox, inbox) = mpsc::unbounded_channel();
+    let (blockhash_tx, blockhash_rx) = watch::channel(None);
+    let (profit_tx, profit_rx) = watch::channel(ProfitSnapshot::new());
+
+    tokio::spawn(refresh_blockhash(
+        std::sync::Arc::clone(&source),
+        config.blockhash_refresh,
+        blockhash_tx,
+    ));
+    tokio::spawn(run(source, config, inbox, profit_tx));
+
+    SubmitterHandle {
+        outbox,
+        blockhash: blockhash_rx,
+        profit: profit_rx,
+    }
+}
+
+async fn refresh_blockhash<S: ChainSource>(
+    source: std::sync::Arc<S>,
+    every: Duration,
+    tx: watch::Sender<Option<BlockhashInfo>>,
+) {
+    let mut interval = tokio::time::interval(every);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        match source.latest_blockhash().await {
+            Ok(info) => {
+                let _ = tx.send(Some(info));
+            }
+            Err(err) => warn!(error = %format!("{err:#}"), "blockhash refresh failed"),
+        }
+    }
+}
+
+async fn run<S: ChainSource>(
+    source: std::sync::Arc<S>,
+    config: SubmitterConfig,
+    mut inbox: mpsc::UnboundedReceiver<PendingTx>,
+    profit: watch::Sender<ProfitSnapshot>,
+) {
+    let mut tracked: HashMap<Signature, Tracked> = HashMap::new();
+    let mut history: HashMap<Pubkey, Vec<i64>> = HashMap::new();
+    let mut confirm = tokio::time::interval(config.confirm_interval);
+    confirm.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            incoming = inbox.recv() => match incoming {
+                Some(pending) => {
+                    if let Err(err) = source.send_transaction(&pending.transaction).await {
+                        // A failed send is not a lost transaction: it may
+                        // still have reached the cluster, so keep tracking.
+                        warn!(signature = %pending.signature, error = %format!("{err:#}"), "send failed");
+                    }
+                    metrics::IN_FLIGHT.with_label_values(&["transactions"]).inc();
+                    tracked.insert(pending.signature, Tracked { pending, resends: 0 });
+                }
+                None => {
+                    debug!("submitter outbox closed");
+                    return;
+                }
+            },
+            _ = confirm.tick() => {
+                sweep(&source, &config, &mut tracked, &mut history, &profit).await;
+            }
+        }
+    }
+}
+
+/// One confirmation pass: settle what landed, resend what is still valid,
+/// expire what is not.
+async fn sweep<S: ChainSource>(
+    source: &S,
+    config: &SubmitterConfig,
+    tracked: &mut HashMap<Signature, Tracked>,
+    history: &mut HashMap<Pubkey, Vec<i64>>,
+    profit: &watch::Sender<ProfitSnapshot>,
+) {
+    if tracked.is_empty() {
+        return;
+    }
+    let signatures: Vec<Signature> = tracked.keys().copied().collect();
+    let statuses = match source.signature_statuses(&signatures).await {
+        Ok(statuses) => statuses,
+        Err(err) => {
+            warn!(error = %format!("{err:#}"), "signature status poll failed");
+            return;
+        }
+    };
+    let block_height = source.block_height().await.unwrap_or(0);
+
+    let settled: Vec<(Signature, TxResult)> = signatures
+        .iter()
+        .zip(statuses)
+        .filter_map(|(signature, status)| match status {
+            Some(SignatureOutcome::Landed) => Some((*signature, TxResult::Landed)),
+            Some(SignatureOutcome::Failed(err)) => Some((*signature, TxResult::Failed(err))),
+            None => None,
+        })
+        .collect();
+
+    settled.iter().for_each(|(signature, result)| {
+        if let Some(entry) = tracked.remove(signature) {
+            record(
+                &entry.pending,
+                result,
+                history,
+                profit,
+                config.profit_window,
+            );
+        }
+    });
+
+    // Anything still unconfirmed: resend while the blockhash lives, then
+    // surface a distinct expiry so the caller retries rather than treating
+    // it as the condition's fault.
+    let stale: Vec<Signature> = tracked
+        .iter()
+        .filter(|(_, entry)| entry.pending.last_valid_block_height < block_height)
+        .map(|(signature, _)| *signature)
+        .collect();
+    for signature in stale {
+        let Some(entry) = tracked.get_mut(&signature) else {
+            continue;
+        };
+        entry.resends += 1;
+        if entry.resends > config.max_resends {
+            let entry = tracked.remove(&signature).expect("just looked up");
+            record(
+                &entry.pending,
+                &TxResult::Expired,
+                history,
+                profit,
+                config.profit_window,
+            );
+        } else if let Err(err) = source.send_transaction(&entry.pending.transaction).await {
+            warn!(%signature, error = %format!("{err:#}"), "resend failed");
+        }
+    }
+}
+
+fn record(
+    pending: &PendingTx,
+    result: &TxResult,
+    history: &mut HashMap<Pubkey, Vec<i64>>,
+    profit: &watch::Sender<ProfitSnapshot>,
+    window: usize,
+) {
+    metrics::IN_FLIGHT
+        .with_label_values(&["transactions"])
+        .dec();
+    let program = metrics::program_label(&pending.program);
+    let label = match result {
+        TxResult::Landed => "landed",
+        TxResult::Failed(_) => "failed",
+        TxResult::Expired => "expired",
+    };
+    metrics::TRANSACTIONS.with_label_values(&[label]).inc();
+    if let TxResult::Failed(err) = result {
+        info!(signature = %pending.signature, error = %err, "transaction failed on chain");
+    }
+
+    // Profit accounting: a landed crank earns its payment, anything else
+    // just burned a fee. Both are approximations good enough to steer with.
+    let delta = match result {
+        TxResult::Landed => {
+            metrics::LAMPORTS
+                .with_label_values(&["earned", &program])
+                .inc_by(pending.expected_payment);
+            pending.expected_payment as i64
+        }
+        _ => {
+            metrics::LAMPORTS
+                .with_label_values(&["spent", &program])
+                .inc_by(5000);
+            -5000
+        }
+    };
+    let entries = history.entry(pending.program).or_default();
+    entries.push(delta);
+    if entries.len() > window {
+        entries.remove(0);
+    }
+    let net: i64 = entries.iter().sum();
+    profit.send_modify(|snapshot| {
+        snapshot.insert(pending.program, net);
+    });
+}
