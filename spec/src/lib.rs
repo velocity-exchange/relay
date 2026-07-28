@@ -8,9 +8,9 @@
 //! instruction; the resolver stages a [`ResolvedCrankV0`] payload in one of
 //! its own writable accounts and returns a [`ResponsePointerV0`] locating
 //! it. The turner reads the staged bytes out of the simulation's
-//! post-execution account state, then submits the **executor** (usually
-//! wrapped in relay's `crank_v0`, which asserts the keeper got paid
-//! `min_payment`).
+//! post-execution account state, then submits the **executor** directly,
+//! bracketed by relay's payment guards (`begin_guard_v0` … executor …
+//! `assert_paid_v0`) so an underpaying crank reverts.
 //!
 //! **Why staging instead of raw return data:** return data is capped at
 //! 1024 bytes, which bounds how many accounts/args a resolver could name —
@@ -64,11 +64,14 @@ pub const KEEPER_PLACEHOLDER: [u8; 32] = *b"relay/keeper/placeholder\0\0\0\0\0\0
 /// to take many itself.
 pub const MAX_RESOLVER_ACCOUNTS: usize = 4;
 
-/// Anchor instruction discriminator of relay's `crank_v0`
-/// (`sha256("global:crank_v0")[..8]`). Pinned here so turners don't need a
-/// hash dependency; the program's test suite asserts it matches the
-/// generated constant.
-pub const CRANK_V0_DISCRIMINATOR: [u8; 8] = [176, 209, 83, 95, 203, 163, 210, 99];
+/// Anchor instruction discriminators of relay's payment guards. Pinned
+/// here so turners don't need a hash dependency; the program's test suite
+/// asserts they match the generated constants.
+pub const BEGIN_GUARD_V0_DISCRIMINATOR: [u8; 8] = [151, 249, 122, 144, 42, 38, 241, 176];
+pub const ASSERT_PAID_V0_DISCRIMINATOR: [u8; 8] = [117, 202, 135, 43, 41, 100, 21, 141];
+
+/// PDA seed prefix for a keeper's guard account: `["guard", keeper, nonce]`.
+pub const GUARD_SEED: &[u8] = b"guard";
 
 /// Anchor account discriminator of relay's `WatchV0`
 /// (`sha256("account:WatchV0")[..8]`).
@@ -641,24 +644,22 @@ impl WatchV0 {
     }
 }
 
-/// Encode `crank_v0`'s instruction data:
-/// `[CRANK_V0_DISCRIMINATOR][offset: u32][condition_index: u8][keeper_index: u8][data: Vec<u8>]`
-/// — the borsh wire of the program's `CrankArgsV0`. `keeper_index` is the
-/// position of the keeper (payment recipient) within the executor account
-/// list — i.e. where [`KEEPER_PLACEHOLDER`] sat in the staged payload.
-pub fn encode_crank_v0_data(
-    offset: u32,
-    condition_index: u8,
-    keeper_index: u8,
-    data: &[u8],
-) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8 + 4 + 2 + 4 + data.len());
-    out.extend_from_slice(&CRANK_V0_DISCRIMINATOR);
-    out.extend_from_slice(&offset.to_le_bytes());
-    out.push(condition_index);
-    out.push(keeper_index);
-    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-    out.extend_from_slice(data);
+/// Encode `begin_guard_v0`'s instruction data:
+/// `[BEGIN_GUARD_V0_DISCRIMINATOR][nonce: u8]`.
+pub fn encode_begin_guard_v0_data(nonce: u8) -> [u8; 9] {
+    let mut out = [0u8; 9];
+    out[..8].copy_from_slice(&BEGIN_GUARD_V0_DISCRIMINATOR);
+    out[8] = nonce;
+    out
+}
+
+/// Encode `assert_paid_v0`'s instruction data:
+/// `[ASSERT_PAID_V0_DISCRIMINATOR][min_payment: u64][nonce: u8]`.
+pub fn encode_assert_paid_v0_data(min_payment: u64, nonce: u8) -> [u8; 17] {
+    let mut out = [0u8; 17];
+    out[..8].copy_from_slice(&ASSERT_PAID_V0_DISCRIMINATOR);
+    out[8..16].copy_from_slice(&min_payment.to_le_bytes());
+    out[16] = nonce;
     out
 }
 
@@ -920,13 +921,14 @@ mod tests {
     }
 
     #[test]
-    fn crank_data_layout() {
-        let data = encode_crank_v0_data(640, 2, 0, &[0xAB, 0xCD]);
-        assert_eq!(&data[..8], &CRANK_V0_DISCRIMINATOR);
-        assert_eq!(&data[8..12], &640u32.to_le_bytes());
-        assert_eq!(data[12], 2);
-        assert_eq!(data[13], 0);
-        assert_eq!(&data[14..18], &2u32.to_le_bytes());
-        assert_eq!(&data[18..], &[0xAB, 0xCD]);
+    fn guard_data_layout() {
+        let begin = encode_begin_guard_v0_data(3);
+        assert_eq!(&begin[..8], &BEGIN_GUARD_V0_DISCRIMINATOR);
+        assert_eq!(begin[8], 3);
+
+        let assert_paid = encode_assert_paid_v0_data(50_000, 3);
+        assert_eq!(&assert_paid[..8], &ASSERT_PAID_V0_DISCRIMINATOR);
+        assert_eq!(&assert_paid[8..16], &50_000u64.to_le_bytes());
+        assert_eq!(assert_paid[16], 3);
     }
 }

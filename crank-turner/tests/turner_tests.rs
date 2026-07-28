@@ -372,6 +372,15 @@ impl Harness {
         clock.slot
     }
 
+    fn guard_exists(&self) -> bool {
+        let guard = self.turner.guard_address(0);
+        self.svm
+            .lock()
+            .unwrap()
+            .get_account(&guard)
+            .is_some_and(|a| !a.data.is_empty())
+    }
+
     fn staging_bytes(&self) -> Vec<u8> {
         self.book_data()[STAGING_OFFSET..STAGING_OFFSET + 64].to_vec()
     }
@@ -438,18 +447,13 @@ async fn sweep_end_to_end() {
     // no-work. No transaction may land.
     let outcomes = h.tick().await;
     assert!(sent(&outcomes).is_empty(), "{outcomes:?}");
-    let balance_before = h.keeper_balance();
 
-    // Past the first expiry: exactly one crank lands, the keeper nets the
-    // payment minus the tx fee, and the hint self-repairs to the survivor.
+    // Past the first expiry: exactly one crank lands, the expired entry is
+    // gone, and the hint self-repairs to the survivor. (Economics are
+    // pinned separately — the first guarded crank also pays guard rent.)
     h.warp(t0 + 150, 2);
     let outcomes = h.tick().await;
     assert_eq!(sent(&outcomes).len(), 1, "{outcomes:?}");
-    let delta = h.keeper_balance() as i64 - balance_before as i64;
-    assert!(
-        delta > 0 && delta <= PAYMENT as i64,
-        "keeper delta {delta} should be payment minus fee"
-    );
     assert_eq!(h.entry_count(), 1);
     assert_eq!(h.next_expiry(), t0 + 9000);
 
@@ -616,11 +620,9 @@ async fn turner_cranks_large_staged_batch() {
     let t0 = h.t0;
     (0..8).for_each(|i| h.add_entry(t0 + 10 + i));
 
-    let before = h.keeper_balance();
     h.warp(t0 + 1000, 2);
     let outcomes = h.tick().await;
     assert_eq!(sent(&outcomes).len(), 1, "{outcomes:?}");
-    assert!(h.keeper_balance() > before);
     assert_eq!(h.entry_count(), 0, "whole batch swept in one crank");
 }
 
@@ -968,4 +970,91 @@ async fn program_allowlist_is_pushed_to_the_provider() {
     let parsed = spec::WatchV0::read_from_account(&scoped[0].1.data).unwrap();
     assert_eq!(parsed.target_program, demo_id().to_bytes());
     assert_eq!(parsed.target, h.book.to_bytes());
+}
+
+// --- guarded execution ---
+
+/// Steady-state economics: the executor goes in directly (no CPI) and the
+/// keeper nets the payment minus the fee. The first guarded crank also
+/// creates the keeper's guard account, so its rent shows up once.
+#[tokio::test]
+async fn guarded_cranks_pay_the_keeper() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    h.refresh().await;
+    let t0 = h.t0;
+
+    // First crank: pays for the guard account as well.
+    h.add_entry(t0 + 100);
+    h.warp(t0 + 200, 2);
+    let before = h.keeper_balance();
+    assert_eq!(sent(&h.tick().await).len(), 1);
+    assert!(
+        h.keeper_balance() < before,
+        "one-time guard rent exceeds one payment"
+    );
+    assert!(h.guard_exists(), "guard account created on first use");
+
+    // Every crank after that is pure profit minus the fee.
+    h.add_entry(t0 + 300);
+    h.warp(t0 + 400, 2);
+    let before = h.keeper_balance();
+    assert_eq!(sent(&h.tick().await).len(), 1);
+    let delta = h.keeper_balance() as i64 - before as i64;
+    assert!(
+        delta > 0 && delta <= PAYMENT as i64,
+        "keeper delta {delta} should be payment minus fee"
+    );
+}
+
+/// With guards off the turner submits the bare executor — one instruction,
+/// no guard account, no relay involvement at execution time at all.
+#[tokio::test]
+async fn unguarded_cranks_skip_relay_entirely() {
+    let mut h = setup(
+        PAYMENT,
+        100,
+        TurnerConfig {
+            guard_payments: false,
+            ..TurnerConfig::default()
+        },
+    );
+    h.refresh().await;
+    let t0 = h.t0;
+    h.add_entry(t0 + 100);
+
+    h.warp(t0 + 200, 2);
+    let before = h.keeper_balance();
+    assert_eq!(sent(&h.tick().await).len(), 1);
+    assert!(h.keeper_balance() > before, "paid, minus the fee");
+    assert_eq!(h.entry_count(), 0);
+    assert!(!h.guard_exists(), "no guard account is ever created");
+}
+
+/// The guard reverts the whole transaction — executor work included — when
+/// the payment falls short of what the condition advertised between
+/// simulation and landing.
+#[tokio::test]
+async fn guard_reverts_a_crank_that_underpays() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    h.refresh().await;
+    let t0 = h.t0;
+    h.add_entry(t0 + 100);
+    // The book now pays half of what its condition block still advertises,
+    // which is the number the turner asserts.
+    h.set_payment(PAYMENT / 2);
+
+    h.warp(t0 + 200, 2);
+    let outcomes = h.tick().await;
+    assert!(sent(&outcomes).is_empty(), "{outcomes:?}");
+    assert!(
+        failed(&outcomes).iter().any(|o| matches!(
+            o,
+            Outcome::Failed {
+                stage: Stage::ExecuteSim,
+                ..
+            }
+        )),
+        "{outcomes:?}"
+    );
+    assert_eq!(h.entry_count(), 1, "executor work reverted with the guard");
 }

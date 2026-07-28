@@ -3,6 +3,14 @@
 //! simulation → send. Deliberately a pull-style `tick()` state machine so
 //! tests (and alternative runtimes) drive it deterministically; `main.rs`
 //! wraps it in a timer.
+//!
+//! The executor goes into the transaction **directly**, bracketed by
+//! relay's payment guards rather than wrapped in a CPI: `begin_guard_v0`
+//! snapshots the keeper's balance, the executor runs, `assert_paid_v0`
+//! reverts everything unless the keeper gained at least the turner's
+//! price. That keeps all four CPI levels available to the executor's own
+//! call stack (a velocity crank that calls into the CLOB needs them) and
+//! costs two ~1k-CU instructions instead of an invoke.
 
 use std::collections::HashMap;
 
@@ -84,11 +92,23 @@ pub struct TurnerConfig {
     /// Base for exponential failure backoff (doubles per consecutive
     /// failure, capped at 2^6).
     pub failure_backoff_slots: u64,
+    /// Bracket executors with relay's payment guards. Off means trusting
+    /// simulation alone: cheaper, but nothing catches a payment that
+    /// shrinks between simulating and landing.
+    pub guard_payments: bool,
+    /// Which of the keeper's guard accounts to use. Turners running cranks
+    /// concurrently should vary this per in-flight transaction so they
+    /// don't serialize on one write lock.
+    pub guard_nonce: u8,
     /// Which watches this turner is willing to track at all. Default is
     /// unrestricted; scope it to your own programs when other protocols
     /// share the registry.
     pub filter: WatchFilter,
 }
+
+/// System program id (the all-zero address), required by
+/// `begin_guard_v0`'s lazy guard-account creation.
+const SYSTEM_PROGRAM_ID: Pubkey = Pubkey::new_from_array([0u8; 32]);
 
 /// Default relay program id (`declare_id!` in `programs/relay`).
 pub const RELAY_PROGRAM_ID: &str = "4D5tPhw9sqkdkR5CpmP427TH6y9p9AMuKUukUEHn3Mpu";
@@ -100,6 +120,8 @@ impl Default for TurnerConfig {
             min_crank_payment: 0,
             no_work_backoff_slots: 8,
             failure_backoff_slots: 16,
+            guard_payments: true,
+            guard_nonce: 0,
             filter: WatchFilter::default(),
         }
     }
@@ -416,37 +438,38 @@ impl<S: ChainSource> Turner<S> {
         }
         let resolved = read_staged(&sim.accounts, &pointer).context("staged resolver payload")?;
 
-        // Build the crank_v0-wrapped executor.
+        // Build the executor itself — no CPI wrapper.
         let keeper = self.keeper.pubkey();
-        let keeper_index = resolved
-            .accounts
-            .iter()
-            .position(|a| a.address == spec::KEEPER_PLACEHOLDER)
-            .context("resolver output names no keeper placeholder")?;
-        let executor_metas = resolved.accounts.iter().map(|a| AccountMeta {
-            pubkey: if a.address == spec::KEEPER_PLACEHOLDER {
-                keeper
-            } else {
-                Pubkey::from(a.address)
-            },
-            is_signer: false,
-            is_writable: a.is_writable(),
-        });
-        let crank_ix = Instruction {
-            program_id: self.config.relay_program,
-            accounts: [
-                AccountMeta::new_readonly(key.0, false),
-                AccountMeta::new_readonly(Pubkey::from(condition.executor_program), false),
-            ]
-            .into_iter()
-            .chain(executor_metas)
-            .collect(),
-            data: spec::encode_crank_v0_data(key.1, key.2, keeper_index as u8, &resolved.data),
+        require_keeper_placeholder(&resolved)?;
+        let executor_ix = Instruction {
+            program_id: Pubkey::from(condition.executor_program),
+            accounts: resolved
+                .accounts
+                .iter()
+                .map(|a| AccountMeta {
+                    pubkey: if a.address == spec::KEEPER_PLACEHOLDER {
+                        keeper
+                    } else {
+                        Pubkey::from(a.address)
+                    },
+                    // Executors are permissionless by contract; a turner
+                    // never lends its signature to one.
+                    is_signer: false,
+                    is_writable: a.is_writable(),
+                })
+                .collect(),
+            data: condition
+                .executor_disc
+                .iter()
+                .copied()
+                .chain(resolved.data.iter().copied())
+                .collect(),
         };
+        let ixs = self.guarded(executor_ix, condition.min_payment);
 
-        // Simulate, then fire. `crank_v0` asserts the keeper payment, so a
-        // successful simulation is also the payment check.
-        let tx = self.signed_tx(&[crank_ix]).await?;
+        // Simulate, then fire. With guards on, a successful simulation is
+        // also the payment check.
+        let tx = self.signed_tx(&ixs).await?;
         let sim = self.source.simulate_transaction(&tx, &[]).await?;
         if let Some(err) = sim.err {
             self.record_failure(key, clock);
@@ -470,6 +493,46 @@ impl<S: ChainSource> Turner<S> {
             signature,
             min_payment: condition.min_payment,
         })
+    }
+
+    /// Bracket an executor with the payment guards (or pass it through
+    /// untouched when guarding is disabled).
+    fn guarded(&self, executor: Instruction, min_payment: u64) -> Vec<Instruction> {
+        if !self.config.guard_payments {
+            return vec![executor];
+        }
+        let keeper = self.keeper.pubkey();
+        let nonce = self.config.guard_nonce;
+        let guard = self.guard_address(nonce);
+        vec![
+            Instruction {
+                program_id: self.config.relay_program,
+                accounts: vec![
+                    AccountMeta::new(keeper, true),
+                    AccountMeta::new(guard, false),
+                    AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+                ],
+                data: spec::encode_begin_guard_v0_data(nonce).to_vec(),
+            },
+            executor,
+            Instruction {
+                program_id: self.config.relay_program,
+                accounts: vec![
+                    AccountMeta::new_readonly(keeper, false),
+                    AccountMeta::new(guard, false),
+                ],
+                data: spec::encode_assert_paid_v0_data(min_payment, nonce).to_vec(),
+            },
+        ]
+    }
+
+    /// The keeper's guard PDA for a given nonce.
+    pub fn guard_address(&self, nonce: u8) -> Pubkey {
+        Pubkey::find_program_address(
+            &[spec::GUARD_SEED, self.keeper.pubkey().as_ref(), &[nonce]],
+            &self.config.relay_program,
+        )
+        .0
     }
 
     fn record_failure(&mut self, key: CondKey, clock: &ClockSnapshot) {
@@ -500,6 +563,17 @@ impl<S: ChainSource> Turner<S> {
             .filter_map(|(pk, acc)| acc.map(|a| (*pk, a)))
             .collect())
     }
+}
+
+/// Executors must name the keeper somewhere, or there is nothing to be
+/// paid into and the guard would assert against a stranger's balance.
+fn require_keeper_placeholder(resolved: &spec::ResolvedCrankV0) -> Result<()> {
+    resolved
+        .accounts
+        .iter()
+        .any(|a| a.address == spec::KEEPER_PLACEHOLDER)
+        .then_some(())
+        .context("resolver output names no keeper placeholder")
 }
 
 fn account_ref_meta(a: &spec::AccountRefV0) -> AccountMeta {

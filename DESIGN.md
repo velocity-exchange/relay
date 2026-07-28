@@ -60,9 +60,23 @@ The fee bar drops the *whole watch*, not just the underachieving condition: a bo
 Anchor v2 (anchor-next, same pinned rev as velocity's anchor-v2 workspace). Two jobs:
 
 1. **Registry**: `register_watch_v0(target, offset)` / `close_watch_v0`. A `WatchV0` is `[disc][target_program][target][registrar][offset]` — discovery metadata only. `target_program` is read from the target account, not from args. Registration is permissionless (garbage watches parse-fail and get dropped at refresh); the registrar can close and reclaim rent.
-2. **Payment assert**: `crank_v0(offset, condition_index, keeper_index, data)` wrapper — reads the condition in place from the target account, CPIs the executor (every account `is_signer: false`), asserts the keeper's lamports grew by ≥ `min_payment`. This makes sim-only payment verification trivial for the turner (sim success ⇒ payment ok) and armors the sim-to-land race. Executors must not require signers (crank ixs are permissionless by design).
+2. **Payment guards**: `begin_guard_v0` / `assert_paid_v0`, bracketing the executor:
 
-Turners MAY submit executor ixs directly (unwrapped) — the wrapper is optional armor, not a toll booth. There is no payment escrow: executors pay keepers from their own program's funds (treasury PDA, the condition account itself, wherever) — the target program prices its own cranks.
+```
+[ begin_guard_v0 ]  [ the executor, directly ]  [ assert_paid_v0(min_payment) ]
+   snapshot keeper                                  revert unless keeper
+   lamports                                         gained >= min_payment
+```
+
+**Not a CPI.** An earlier design wrapped the executor in a `crank_v0` invoke; guards replace it because wrapping cost a CPI level the executor's own call stack needs (a velocity crank calling into the CLOB is already two deep, against a limit of four) plus per-invoke overhead and account re-serialization. Guards are two ~1k-CU instructions that touch two accounts. This is the [Lighthouse](https://github.com/Jac0xb/lighthouse) shape: assert on state around a call instead of mediating the call.
+
+Reading the balance *inside* execution at both ends makes the pair fee-agnostic (the fee is already deducted when the first guard runs) and immune to concurrent balance changes — it measures this transaction's delta, not an absolute floor. The guard account is a PDA seeded `["guard", keeper, nonce]`, created on first use and reused forever; nothing in it survives a failed transaction, and a successful one disarms it, so it is pure scratch that happens to need an address. The nonce lets one keeper run concurrent cranks without serializing on a single write lock.
+
+`min_payment` is the **turner's** price, passed in the guard's args — not read from the condition on chain. A turner asserts what it is willing to work for; the target's advertised number is only an input to that decision.
+
+Guards are optional (`--no-guard`): a turner that trusts its simulation can submit the bare executor, and relay is then not involved in execution at all. There is no payment escrow either — executors pay keepers from their own program's funds (treasury PDA, the condition account itself, wherever), so the target program prices its own cranks.
+
+Note this means relay no longer validates conditions at execution time. That costs nothing: `active`, and every other field of a condition, was always advisory — executors are permissionless, so anyone could always call one directly, guard or no guard.
 
 ## Crank turner (`crank-turner`)
 
@@ -78,7 +92,7 @@ Generic daemon, patterned on tuktuk-crank-turner. Data access goes through a `Ch
 
 ```
 wake hint due? → sim resolver → work? → read staged payload from post-sim account state
-  → build crank_v0(executor) tx with keeper injected
+  → build [begin_guard, executor, assert_paid] with the keeper injected
   → sim (success ⇒ pays ≥ min_payment) → send → backoff/dedup bookkeeping
 ```
 

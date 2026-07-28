@@ -48,7 +48,11 @@ pub mod relay {
         instructions::close_watch_v0::handle_close_watch_v0(ctx)
     }
 
-    pub fn crank_v0(ctx: &mut Context<CrankV0>, args: CrankArgsV0) -> Result<()> {
-        instructions::crank_v0::handle_crank_v0(ctx, args)
+    pub fn begin_guard_v0(ctx: &mut Context<BeginGuardV0>, args: BeginGuardArgsV0) -> Result<()> {
+        instructions::begin_guard_v0::handle_begin_guard_v0(ctx, args)
+    }
+
+    pub fn assert_paid_v0(ctx: &mut Context<AssertPaidV0>, args: AssertPaidArgsV0) -> Result<()> {
+        instructions::assert_paid_v0::handle_assert_paid_v0(ctx, args)
     }
 }

@@ -2,8 +2,8 @@
 //! Require the SBF build first: `./scripts/build-programs.sh` (or
 //! `cargo-build-sbf --tools-version v1.52 --manifest-path relay/Cargo.toml`).
 //!
-//! `crank_v0`'s cross-program behavior is covered in demo-book's test suite,
-//! which loads both programs.
+//! The payment guards are exercised end-to-end in demo-book's test suite,
+//! which loads both programs and brackets a real executor.
 
 use anchor_v2_testing::{
     Keypair, LiteSVM, Message, Signer, VersionedMessage, VersionedTransaction,
@@ -120,9 +120,14 @@ fn custom_error_code(failed: &FailedTransactionMetadata) -> Option<u32> {
 #[test]
 fn spec_constants_match_generated() {
     assert_eq!(
-        instruction::CrankV0::DISCRIMINATOR,
-        &relay_spec::CRANK_V0_DISCRIMINATOR,
-        "spec CRANK_V0_DISCRIMINATOR drifted from the program"
+        instruction::BeginGuardV0::DISCRIMINATOR,
+        &relay_spec::BEGIN_GUARD_V0_DISCRIMINATOR,
+        "spec BEGIN_GUARD_V0_DISCRIMINATOR drifted from the program"
+    );
+    assert_eq!(
+        instruction::AssertPaidV0::DISCRIMINATOR,
+        &relay_spec::ASSERT_PAID_V0_DISCRIMINATOR,
+        "spec ASSERT_PAID_V0_DISCRIMINATOR drifted from the program"
     );
     assert_eq!(
         WatchV0::DISCRIMINATOR,
@@ -130,23 +135,32 @@ fn spec_constants_match_generated() {
         "spec WATCH_V0_DISCRIMINATOR drifted from the program"
     );
     assert_eq!(WATCH_ACCOUNT_LEN, relay_spec::WATCH_V0_LEN);
+    assert_eq!(relay::state::GUARD_SEED, relay_spec::GUARD_SEED);
 }
 
 #[test]
-fn crank_args_wire_matches_spec_encoder() {
-    let program_data = instruction::CrankV0 {
-        args: relay::CrankArgsV0 {
-            offset: 616,
-            condition_index: 1,
-            keeper_index: 0,
-            data: vec![9, 8, 7],
+fn guard_args_wire_matches_spec_encoders() {
+    let begin = instruction::BeginGuardV0 {
+        args: relay::BeginGuardArgsV0 { nonce: 3 },
+    }
+    .data();
+    assert_eq!(
+        begin,
+        relay_spec::encode_begin_guard_v0_data(3),
+        "spec begin_guard_v0 encoder drifted from the program's wincode wire"
+    );
+
+    let assert_paid = instruction::AssertPaidV0 {
+        args: relay::AssertPaidArgsV0 {
+            min_payment: 50_000,
+            nonce: 3,
         },
     }
     .data();
-    let spec_data = relay_spec::encode_crank_v0_data(616, 1, 0, &[9, 8, 7]);
     assert_eq!(
-        program_data, spec_data,
-        "spec crank_v0 encoder drifted from the program's wincode wire"
+        assert_paid,
+        relay_spec::encode_assert_paid_v0_data(50_000, 3),
+        "spec assert_paid_v0 encoder drifted from the program's wincode wire"
     );
 }
 
@@ -212,7 +226,7 @@ fn close_watch_rejects_non_registrar() {
     let failed = send(&mut ctx, ix).unwrap_err();
     assert_eq!(
         custom_error_code(&failed),
-        Some(6007),
+        Some(6003),
         "expected InvalidRegistrar, got {:?}",
         failed.err
     );

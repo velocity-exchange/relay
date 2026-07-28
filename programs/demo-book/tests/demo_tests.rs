@@ -104,19 +104,25 @@ fn setup_with_treasury(treasury: u64) -> Ctx {
     ctx
 }
 
-#[allow(clippy::result_large_err)] // litesvm's error type; tests match on it
+#[allow(clippy::result_large_err)]
 fn send(ctx: &mut Ctx, ix: Instruction) -> Result<TransactionMetadata, FailedTransactionMetadata> {
+    send_all(ctx, &[ix])
+}
+
+/// Send a whole instruction list — how a turner submits a guarded crank:
+/// `begin_guard_v0`, the executor itself (no CPI wrapper), `assert_paid_v0`.
+#[allow(clippy::result_large_err)] // litesvm's error type; tests match on it
+fn send_all(
+    ctx: &mut Ctx,
+    ixs: &[Instruction],
+) -> Result<TransactionMetadata, FailedTransactionMetadata> {
     ctx.svm.expire_blockhash();
     let blockhash = ctx.svm.latest_blockhash();
-    let msg = Message::new_with_blockhash(
-        std::slice::from_ref(&ix),
-        Some(&ctx.payer.pubkey()),
-        &blockhash,
-    );
+    let msg = Message::new_with_blockhash(ixs, Some(&ctx.payer.pubkey()), &blockhash);
     let mut signers: Vec<&dyn anchor_v2_testing::Signer> = vec![&ctx.payer];
-    let needs_authority = ix
-        .accounts
+    let needs_authority = ixs
         .iter()
+        .flat_map(|ix| ix.accounts.iter())
         .any(|m| m.is_signer && m.pubkey.to_bytes() == ctx.authority.pubkey().to_bytes());
     if needs_authority {
         signers.push(&ctx.authority);
@@ -158,12 +164,6 @@ fn add_entry(ctx: &mut Ctx, expiry_ts: i64) {
 fn read_conditions(ctx: &Ctx) -> Vec<spec::ConditionV0> {
     let data = ctx.svm.get_account(&ctx.book).unwrap().data;
     spec::read_conditions_unaligned(&data, CONDITIONS_OFFSET).unwrap()
-}
-
-fn write_conditions(ctx: &mut Ctx, conditions: &[spec::ConditionV0]) {
-    let mut account = ctx.svm.get_account(&ctx.book).unwrap();
-    spec::write_block(&mut account.data[CONDITIONS_OFFSET..], conditions).unwrap();
-    ctx.svm.set_account(ctx.book, account).unwrap();
 }
 
 fn sweep_wake_ts(conditions: &[spec::ConditionV0]) -> i64 {
@@ -270,32 +270,60 @@ fn executor_ix(ctx: &Ctx, condition_index: u8, resolved: &spec::ResolvedCrankV0)
     }
 }
 
-/// crank_v0-wrapped executor submission, built exactly as the turner builds
-/// it (spec encoder, not the program's generated client).
-fn crank_ix(ctx: &Ctx, condition_index: u8, resolved: &spec::ResolvedCrankV0) -> Instruction {
-    let (exec_metas, keeper_index) = executor_metas(resolved, ctx.keeper);
-    let mut accounts = vec![
-        AccountMeta {
-            pubkey: ctx.book,
-            is_signer: false,
-            is_writable: false,
+/// The keeper's guard PDA, derived exactly as the turner derives it.
+fn guard_address(keeper: Pubkey, nonce: u8) -> Pubkey {
+    Pubkey::find_program_address(&[spec::GUARD_SEED, keeper.as_ref(), &[nonce]], &relay_id()).0
+}
+
+/// A guarded crank, built the way the turner builds it: the executor goes
+/// in directly (no CPI), bracketed by relay's payment guards.
+fn guarded_crank(
+    ctx: &Ctx,
+    keeper: Pubkey,
+    condition_index: u8,
+    resolved: &spec::ResolvedCrankV0,
+    min_payment: u64,
+) -> Vec<Instruction> {
+    let nonce = 0u8;
+    let guard = guard_address(keeper, nonce);
+    vec![
+        Instruction {
+            program_id: relay_id(),
+            accounts: vec![
+                AccountMeta::new(keeper, true),
+                AccountMeta::new(guard, false),
+                AccountMeta::new_readonly(Pubkey::new_from_array([0u8; 32]), false),
+            ],
+            data: spec::encode_begin_guard_v0_data(nonce).to_vec(),
         },
-        AccountMeta {
-            pubkey: demo_id(),
-            is_signer: false,
-            is_writable: false,
+        executor_ix_for(ctx, condition_index, resolved, keeper),
+        Instruction {
+            program_id: relay_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(keeper, false),
+                AccountMeta::new(guard, false),
+            ],
+            data: spec::encode_assert_paid_v0_data(min_payment, nonce).to_vec(),
         },
-    ];
-    accounts.extend(exec_metas);
+    ]
+}
+
+/// Executor instruction with an explicit keeper substituted in.
+fn executor_ix_for(
+    ctx: &Ctx,
+    condition_index: u8,
+    resolved: &spec::ResolvedCrankV0,
+    keeper: Pubkey,
+) -> Instruction {
+    let conditions = read_conditions(ctx);
+    let condition = &conditions[condition_index as usize];
+    let (metas, _) = executor_metas(resolved, keeper);
+    let mut data = condition.executor_disc.to_vec();
+    data.extend_from_slice(&resolved.data);
     Instruction {
-        program_id: relay_id(),
-        accounts,
-        data: spec::encode_crank_v0_data(
-            CONDITIONS_OFFSET as u32,
-            condition_index,
-            keeper_index,
-            &resolved.data,
-        ),
+        program_id: Pubkey::new_from_array(condition.executor_program),
+        accounts: metas,
+        data,
     }
 }
 
@@ -476,32 +504,59 @@ fn cancel_leaves_hint_early_and_sweep_noops() {
     assert!(resolve(&mut ctx, SWEEP_CONDITION).is_none());
 }
 
-// --- crank_v0 wrapper ---
+// --- payment guards ---
 
 #[test]
-fn crank_v0_happy_path() {
+fn guarded_crank_happy_path() {
     let mut ctx = setup();
     let t = now(&ctx);
     add_entry(&mut ctx, t + 100);
     warp_to(&mut ctx, t + 200);
 
-    let resolved = resolve(&mut ctx, SWEEP_CONDITION).expect("work");
+    // The payer is the keeper here: the guard requires the keeper to sign,
+    // and a turner's keeper is always its fee payer.
+    let keeper = ctx.payer.pubkey();
 
-    let before = keeper_balance(&ctx);
-    let ix = crank_ix(&ctx, SWEEP_CONDITION, &resolved);
-    send(&mut ctx, ix).unwrap();
-    assert_eq!(keeper_balance(&ctx), before + PAYMENT);
+    // First guarded crank also creates the guard account, so the keeper
+    // pays its (one-time) rent on top of the fee.
+    let resolved = resolve(&mut ctx, SWEEP_CONDITION).expect("work");
+    let ixs = guarded_crank(&ctx, keeper, SWEEP_CONDITION, &resolved, PAYMENT);
+    send_all(&mut ctx, &ixs).unwrap();
+    assert_eq!(entry_count(&ctx), 0);
+
+    // Steady state: the guard account already exists, so a crank nets the
+    // payment minus the transaction fee.
+    add_entry(&mut ctx, t + 300);
+    warp_to(&mut ctx, t + 400);
+    let resolved = resolve(&mut ctx, SWEEP_CONDITION).expect("work");
+    let before = ctx.svm.get_balance(&keeper).unwrap();
+    let ixs = guarded_crank(&ctx, keeper, SWEEP_CONDITION, &resolved, PAYMENT);
+    send_all(&mut ctx, &ixs).unwrap();
+    let after = ctx.svm.get_balance(&keeper).unwrap();
+    assert!(
+        after > before,
+        "keeper should net the payment minus the fee: {before} -> {after}"
+    );
+    assert!(after - before <= PAYMENT);
+    assert_eq!(entry_count(&ctx), 0);
 }
 
 #[test]
-fn crank_v0_rejects_underpayment() {
+fn guard_reverts_underpayment() {
     let mut ctx = setup();
     let t = now(&ctx);
     add_entry(&mut ctx, t + 100);
     warp_to(&mut ctx, t + 200);
+    let keeper = ctx.payer.pubkey();
 
-    // Divergence: executors now pay less than the block's advertised
-    // min_payment.
+    // Arm the guard account once so its rent is not part of this test.
+    let resolved = resolve(&mut ctx, SWEEP_CONDITION).expect("work");
+    let ixs = guarded_crank(&ctx, keeper, SWEEP_CONDITION, &resolved, PAYMENT);
+    send_all(&mut ctx, &ixs).unwrap();
+
+    // Now the book pays less than the turner asserts.
+    add_entry(&mut ctx, t + 300);
+    warp_to(&mut ctx, t + 400);
     let ix = instruction::SetPaymentV0 {
         args: SetPaymentArgsV0 {
             payment_per_crank: PAYMENT / 2,
@@ -514,100 +569,61 @@ fn crank_v0_rejects_underpayment() {
     send(&mut ctx, ix).unwrap();
 
     let resolved = resolve(&mut ctx, SWEEP_CONDITION).expect("work");
-    let ix = crank_ix(&ctx, SWEEP_CONDITION, &resolved);
-    let failed = send(&mut ctx, ix).unwrap_err();
+    let entries_before = entry_count(&ctx);
+    let ixs = guarded_crank(&ctx, keeper, SWEEP_CONDITION, &resolved, PAYMENT);
+    let failed = send_all(&mut ctx, &ixs).unwrap_err();
     assert_eq!(
         custom_error_code(&failed),
-        Some(6006), // InsufficientKeeperPayment
+        Some(6000), // InsufficientKeeperPayment
         "expected InsufficientKeeperPayment, got {:?}",
         failed.err
     );
+    // The whole transaction reverted, executor work included.
+    assert_eq!(entry_count(&ctx), entries_before);
 
-    // Unwrapped, the executor itself is fine — the wrapper is what catches
-    // the divergence.
-    let before = keeper_balance(&ctx);
-    let ix = executor_ix(&ctx, SWEEP_CONDITION, &resolved);
+    // Unguarded, the same executor succeeds — the guard is what refuses.
+    let ix = executor_ix_for(&ctx, SWEEP_CONDITION, &resolved, keeper);
     send(&mut ctx, ix).unwrap();
-    assert_eq!(keeper_balance(&ctx), before + PAYMENT / 2);
+    assert!(entry_count(&ctx) < entries_before);
 }
 
 #[test]
-fn crank_v0_rejects_inactive_condition() {
+fn assert_paid_requires_an_armed_guard() {
     let mut ctx = setup();
     let t = now(&ctx);
     add_entry(&mut ctx, t + 100);
     warp_to(&mut ctx, t + 200);
+    let keeper = ctx.payer.pubkey();
+
+    // Arm and consume a guard so the account exists but is disarmed.
     let resolved = resolve(&mut ctx, SWEEP_CONDITION).expect("work");
+    let ixs = guarded_crank(&ctx, keeper, SWEEP_CONDITION, &resolved, PAYMENT);
+    send_all(&mut ctx, &ixs).unwrap();
 
-    let mut conditions = read_conditions(&ctx);
-    conditions[SWEEP_CONDITION as usize].active = 0;
-    write_conditions(&mut ctx, &conditions);
-
-    let ix = crank_ix(&ctx, SWEEP_CONDITION, &resolved);
-    let failed = send(&mut ctx, ix).unwrap_err();
-    assert_eq!(custom_error_code(&failed), Some(6002)); // ConditionInactive
+    // A trailing guard with no matching arm must fail rather than measure
+    // against stale state.
+    let ixs = guarded_crank(&ctx, keeper, SWEEP_CONDITION, &resolved, PAYMENT);
+    let trailing_only = vec![ixs[2].clone()];
+    let failed = send_all(&mut ctx, &trailing_only).unwrap_err();
+    assert_eq!(custom_error_code(&failed), Some(6001)); // GuardNotArmed
 }
 
 #[test]
-fn crank_v0_rejects_executor_program_mismatch() {
+fn guard_measures_only_this_transaction() {
     let mut ctx = setup();
     let t = now(&ctx);
     add_entry(&mut ctx, t + 100);
     warp_to(&mut ctx, t + 200);
+    let keeper = ctx.payer.pubkey();
+
+    // Asserting more than the book pays fails even though the keeper's
+    // absolute balance is enormous — the guard measures the delta, not the
+    // balance.
     let resolved = resolve(&mut ctx, SWEEP_CONDITION).expect("work");
-
-    // Pass relay itself as executor_program; the block says demo-book.
-    let mut ix = crank_ix(&ctx, SWEEP_CONDITION, &resolved);
-    ix.accounts[1].pubkey = relay_id();
-    let failed = send(&mut ctx, ix).unwrap_err();
-    assert_eq!(custom_error_code(&failed), Some(6003)); // ExecutorProgramMismatch
-}
-
-#[test]
-fn crank_v0_rejects_self_reentry() {
-    let mut ctx = setup();
-    let t = now(&ctx);
-    add_entry(&mut ctx, t + 100);
-    warp_to(&mut ctx, t + 200);
-    let resolved = resolve(&mut ctx, SWEEP_CONDITION).expect("work");
-
-    // Craft a block whose executor is relay itself.
-    let mut conditions = read_conditions(&ctx);
-    conditions[SWEEP_CONDITION as usize].executor_program = relay_id().to_bytes();
-    write_conditions(&mut ctx, &conditions);
-
-    let mut ix = crank_ix(&ctx, SWEEP_CONDITION, &resolved);
-    ix.accounts[1].pubkey = relay_id(); // match the crafted block
-    let failed = send(&mut ctx, ix).unwrap_err();
-    assert_eq!(custom_error_code(&failed), Some(6004)); // SelfReentry
-}
-
-#[test]
-fn crank_v0_rejects_garbage_offset_and_bad_indices() {
-    let mut ctx = setup();
-    let t = now(&ctx);
-    add_entry(&mut ctx, t + 100);
-    warp_to(&mut ctx, t + 200);
-    let resolved = resolve(&mut ctx, SWEEP_CONDITION).expect("work");
-
-    // Offset pointing at entry data, not the block.
-    let mut ix = crank_ix(&ctx, SWEEP_CONDITION, &resolved);
-    ix.data = spec::encode_crank_v0_data(8, SWEEP_CONDITION, 0, &resolved.data);
-    let failed = send(&mut ctx, ix).unwrap_err();
-    assert_eq!(custom_error_code(&failed), Some(6000)); // InvalidConditionBlock
-
-    // Condition index out of bounds.
-    let mut ix = crank_ix(&ctx, SWEEP_CONDITION, &resolved);
-    ix.data = spec::encode_crank_v0_data(CONDITIONS_OFFSET as u32, 9, 0, &resolved.data);
-    let failed = send(&mut ctx, ix).unwrap_err();
-    assert_eq!(custom_error_code(&failed), Some(6001)); // ConditionIndexOutOfBounds
-
-    // Keeper index past the remaining accounts.
-    let mut ix = crank_ix(&ctx, SWEEP_CONDITION, &resolved);
-    ix.data =
-        spec::encode_crank_v0_data(CONDITIONS_OFFSET as u32, SWEEP_CONDITION, 9, &resolved.data);
-    let failed = send(&mut ctx, ix).unwrap_err();
-    assert_eq!(custom_error_code(&failed), Some(6005)); // KeeperIndexOutOfBounds
+    assert!(ctx.svm.get_balance(&keeper).unwrap() > PAYMENT * 1000);
+    let ixs = guarded_crank(&ctx, keeper, SWEEP_CONDITION, &resolved, PAYMENT + 1);
+    let failed = send_all(&mut ctx, &ixs).unwrap_err();
+    assert_eq!(custom_error_code(&failed), Some(6000));
 }
 
 // --- evict: change condition ---
@@ -639,7 +655,7 @@ fn evict_flow() {
     assert_eq!(&resolved.data, &1u64.to_le_bytes()); // victim = oldest id
 
     let before = keeper_balance(&ctx);
-    let ix = crank_ix(&ctx, EVICT_CONDITION, &resolved);
+    let ix = executor_ix(&ctx, EVICT_CONDITION, &resolved);
     send(&mut ctx, ix).unwrap();
     assert_eq!(keeper_balance(&ctx), before + PAYMENT);
 
@@ -685,7 +701,7 @@ fn staged_payload_can_exceed_return_data_cap() {
 
     // And the batch actually cranks.
     let before = keeper_balance(&ctx);
-    let ix = crank_ix(&ctx, SWEEP_CONDITION, &resolved);
+    let ix = executor_ix(&ctx, SWEEP_CONDITION, &resolved);
     send(&mut ctx, ix).unwrap();
     assert_eq!(keeper_balance(&ctx), before + PAYMENT);
     assert_eq!(entry_count(&ctx), 0);

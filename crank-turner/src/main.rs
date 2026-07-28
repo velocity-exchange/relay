@@ -78,6 +78,16 @@ struct Args {
     /// (0 = never) — insurance against a silently dead subscription.
     #[arg(long, env = "RELAY_REPOLL_EVERY", default_value_t = 32)]
     repoll_every: u64,
+    /// Submit executors bare instead of bracketing them with relay's
+    /// payment guards. Cheaper, but nothing catches a payment that shrinks
+    /// between simulating and landing.
+    #[arg(long, env = "RELAY_NO_GUARD", default_value_t = false)]
+    no_guard: bool,
+    /// Which of the keeper's guard accounts to use. Vary it across
+    /// concurrent turners sharing a keeper so they don't serialize on one
+    /// write lock.
+    #[arg(long, env = "RELAY_GUARD_NONCE", default_value_t = 0)]
+    guard_nonce: u8,
 }
 
 #[tokio::main]
@@ -108,6 +118,8 @@ async fn main() -> Result<()> {
     let config = TurnerConfig {
         relay_program: args.program_id,
         min_crank_payment: args.min_crank_payment,
+        guard_payments: !args.no_guard,
+        guard_nonce: args.guard_nonce,
         filter: filter.clone(),
         ..TurnerConfig::default()
     };

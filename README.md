@@ -9,7 +9,7 @@ See [DESIGN.md](./DESIGN.md) for the full design and rationale.
 1. A target program lays out a zero-copy condition block (`relay-spec`) in one of its accounts and registers `(account, offset)` with the relay program as a `WatchV0`.
 2. Each `ConditionV0` names a **wake hint** (timestamp / slot / watched-bytes-changed / every-N-slots), a **resolver** instruction, an **executor** instruction, and a `min_payment`.
 3. The turner evaluates wake hints against its account feed. When one is due it *simulates* the resolver, which stages the executor's account list + args in one of its own accounts and returns a 10-byte pointer; the turner reads the payload out of post-simulation account state. Account resolution is program code, so it can't drift — and since the resolver is only simulated, the staging write never touches chain state.
-4. The turner wraps the executor in relay's `crank_v0`, which asserts the keeper got paid `min_payment`, simulates (success ⇒ payment verified), and sends.
+4. The turner submits the executor **directly**, bracketed by relay's payment guards (`begin_guard_v0` … executor … `assert_paid_v0`), simulates (success ⇒ payment verified), and sends. Guards are assertions, not a CPI wrapper, so they cost no CPI depth — the executor keeps all four levels for its own call stack. `--no-guard` drops them entirely.
 
 The on-chain instruction is always the authoritative predicate — a stale turner costs itself a simulation or a failed-tx fee, never a wrong crank.
 
@@ -18,7 +18,7 @@ The on-chain instruction is always the authoritative predicate — a stale turne
 | Path | What |
 |---|---|
 | `spec/` | `relay-spec` — pod wire types (bytemuck only); embed this in your program |
-| `programs/relay/` | watch registry + `crank_v0` payment-assert wrapper (Anchor v2) |
+| `programs/relay/` | watch registry + payment guard instructions (Anchor v2) |
 | `programs/demo-book/` | reference target: expiring entries swept for a reward, soft-cap eviction |
 | `crank-turner/` | the generic turner daemon + litesvm end-to-end tests |
 

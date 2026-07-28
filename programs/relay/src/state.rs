@@ -32,3 +32,30 @@ const_assert_eq!(
     8 + core::mem::offset_of!(WatchV0, target_program),
     relay_spec::WATCH_TARGET_PROGRAM_OFFSET
 );
+
+/// PDA seed prefix for [`GuardV0`].
+pub const GUARD_SEED: &[u8] = relay_spec::GUARD_SEED;
+
+/// Scratch account bracketing a crank: `begin_guard_v0` records the
+/// keeper's balance here, `assert_paid_v0` measures the delta against it.
+///
+/// Nothing here survives a failed transaction (all state reverts), and a
+/// successful one disarms it — so a guard is pure scratch that happens to
+/// need an address. One per `(keeper, nonce)`; the nonce lets a turner run
+/// concurrent cranks without serializing on a single write lock.
+#[account]
+pub struct GuardV0 {
+    pub keeper: Address,
+    /// Keeper lamports at arm time (post-fee, since it is read during
+    /// execution).
+    pub snapshot: u64,
+    /// 0 = disarmed. A trailing guard with no matching arm fails.
+    pub armed: u8,
+    pub bump: u8,
+    pub nonce: u8,
+    pub _pad: [u8; 5],
+}
+
+const_assert_eq!(core::mem::size_of::<GuardV0>(), 48);
+
+pub const GUARD_ACCOUNT_LEN: usize = 8 + core::mem::size_of::<GuardV0>();
