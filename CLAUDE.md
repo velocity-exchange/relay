@@ -27,7 +27,8 @@ Prefer declarative iterator chains (`map`/`filter`/`fold`/`try_fold`/`find`/`col
 
 ## Invariants that must not drift
 
-- The pod layouts are ABI: `CONDITION_LEN = 280`, `BLOCK_HEADER_LEN = 16`, `ACCOUNT_REF_LEN = 33`, `RESPONSE_POINTER_LEN = 10`, `WATCH_V0_LEN = 80` are compile-asserted in the spec and re-asserted in tests. Never reorder/resize fields of a `V0` type — add a `V1`.
+- The pod layouts are ABI: `CONDITION_LEN = 280`, `BLOCK_HEADER_LEN = 16`, `ACCOUNT_REF_LEN = 33`, `RESPONSE_POINTER_LEN = 10`, `WATCH_V0_LEN = 112` are compile-asserted in the spec and re-asserted in tests. Never reorder/resize fields of a `V0` type — add a `V1`.
+- `WatchV0.target_program` must stay at `WATCH_TARGET_PROGRAM_OFFSET` (8) and must keep being read from the target account's owner, never from instruction args — turners memcmp-filter the registry on it, and a forgeable value would let anyone bypass an operator's allowlist.
 - Resolvers stage their payload in a writable account and return a pointer; they must never rely on raw return data for the payload (1024-byte cap). Staging is simulation-only — a resolver that a program lets *land* would commit scratch bytes, which is harmless but pointless.
 - Condition blocks must sit at an **8-aligned** account-data offset (zero-copy reads require it); `demo-book` compile-asserts its offset.
 - Spec constants (`CRANK_V0_DISCRIMINATOR`, `WATCH_V0_DISCRIMINATOR`) are pinned copies of program-generated values; `programs/relay/tests/relay_tests.rs` asserts they match. If you change an instruction/account name, update the spec constant AND the test.

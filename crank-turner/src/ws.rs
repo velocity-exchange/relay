@@ -13,7 +13,6 @@ use solana_account_decoder::UiAccountEncoding;
 use solana_commitment_config::CommitmentConfig;
 use solana_pubsub_client::nonblocking::pubsub_client::PubsubClient;
 use solana_rpc_client_api::config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
-use solana_rpc_client_api::filter::{Memcmp, RpcFilterType};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::sysvar;
 use tokio::task::JoinHandle;
@@ -21,8 +20,15 @@ use tracing::{debug, warn};
 
 use crate::feed::{AccountUpdate, FeedSender};
 
-pub fn spawn_ws_feed(ws_url: String, relay_program: Pubkey, feed: FeedSender) -> JoinHandle<()> {
-    tokio::spawn(run(ws_url, relay_program, feed))
+/// `target_programs` narrows the watch-registry subscription to those
+/// programs (one subscription each); empty subscribes to every watch.
+pub fn spawn_ws_feed(
+    ws_url: String,
+    relay_program: Pubkey,
+    target_programs: Vec<Pubkey>,
+    feed: FeedSender,
+) -> JoinHandle<()> {
+    tokio::spawn(run(ws_url, relay_program, target_programs, feed))
 }
 
 /// Derive a websocket url from an RPC url the way the Solana CLI does.
@@ -33,11 +39,24 @@ pub fn derive_ws_url(rpc_url: &str) -> String {
     ws.replacen(":8899", ":8900", 1)
 }
 
-async fn run(ws_url: String, relay_program: Pubkey, feed: FeedSender) {
+async fn run(
+    ws_url: String,
+    relay_program: Pubkey,
+    target_programs: Vec<Pubkey>,
+    feed: FeedSender,
+) {
     let mut backoff = Duration::from_secs(1);
     let mut interest = feed.interest.clone();
     loop {
-        match session(&ws_url, relay_program, &feed, &mut interest).await {
+        match session(
+            &ws_url,
+            relay_program,
+            &target_programs,
+            &feed,
+            &mut interest,
+        )
+        .await
+        {
             SessionEnd::InterestChanged => {
                 // Immediate rebuild with the new set.
                 backoff = Duration::from_secs(1);
@@ -61,6 +80,7 @@ enum SessionEnd {
 async fn session(
     ws_url: &str,
     relay_program: Pubkey,
+    target_programs: &[Pubkey],
     feed: &FeedSender,
     interest: &mut tokio::sync::watch::Receiver<std::collections::HashSet<Pubkey>>,
 ) -> SessionEnd {
@@ -74,27 +94,34 @@ async fn session(
         ..Default::default()
     };
 
-    // Watch registry: one program subscription, filtered to WatchV0 shape.
-    let (program_stream, program_unsub) = match client
-        .program_subscribe(
-            &relay_program,
-            Some(RpcProgramAccountsConfig {
-                filters: Some(vec![
-                    RpcFilterType::DataSize(relay_spec::WATCH_V0_LEN as u64),
-                    RpcFilterType::Memcmp(Memcmp::new_raw_bytes(
-                        0,
-                        relay_spec::WATCH_V0_DISCRIMINATOR.to_vec(),
-                    )),
-                ]),
-                account_config: account_config.clone(),
-                ..Default::default()
-            }),
-        )
-        .await
-    {
-        Ok(sub) => sub,
-        Err(err) => return SessionEnd::Failed(format!("program_subscribe: {err}")),
+    // Watch registry: one program subscription per allowed target program
+    // (memcmp can only match one value), or a single unfiltered one.
+    let watch_queries: Vec<Option<Pubkey>> = if target_programs.is_empty() {
+        vec![None]
+    } else {
+        target_programs.iter().copied().map(Some).collect()
     };
+    let mut program_streams = Vec::new();
+    let mut program_unsubs = Vec::new();
+    for target_program in &watch_queries {
+        match client
+            .program_subscribe(
+                &relay_program,
+                Some(RpcProgramAccountsConfig {
+                    filters: Some(crate::source::watch_filters(target_program.as_ref())),
+                    account_config: account_config.clone(),
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            Ok((stream, unsub)) => {
+                program_streams.push(stream);
+                program_unsubs.push(unsub);
+            }
+            Err(err) => return SessionEnd::Failed(format!("program_subscribe: {err}")),
+        }
+    }
 
     // Interested accounts (targets, change-watched accounts, clock): one
     // account subscription each, tagged with its pubkey.
@@ -103,7 +130,7 @@ async fn session(
         wanted.push(sysvar::clock::id());
     }
     let mut streams = Vec::new();
-    let mut unsubs = vec![program_unsub];
+    let mut unsubs = program_unsubs;
     for pubkey in &wanted {
         match client
             .account_subscribe(pubkey, Some(account_config.clone()))
@@ -125,8 +152,8 @@ async fn session(
             Err(err) => return SessionEnd::Failed(format!("account_subscribe {pubkey}: {err}")),
         }
     }
-    streams.push(
-        program_stream
+    streams.extend(program_streams.into_iter().map(|stream| {
+        stream
             .map(|response| AccountUpdate {
                 pubkey: response
                     .value
@@ -136,8 +163,8 @@ async fn session(
                 account: response.value.account.decode(),
                 slot: response.context.slot,
             })
-            .boxed(),
-    );
+            .boxed()
+    }));
     debug!(subscriptions = streams.len(), "ws session subscribed");
 
     let mut merged = futures_util::stream::select_all(streams);

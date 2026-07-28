@@ -39,11 +39,27 @@ Because resolvers are only ever simulated, the staging write never lands on chai
 
 Programs embed the block as typed fields (`cond_header: ConditionBlockHeaderV0, conditions: [ConditionV0; N]`) — see demo-book — or via `relay_spec::read_block / read_block_mut / write_block` over a byte region.
 
+## Scoping a turner (`WatchFilter`)
+
+The registry is permissionless, so a turner that tracked everything could be made to work for free: another protocol registers thousands of multi-megabyte targets paying a lamport a crank, and your turner fetches, subscribes to, parses, and simulates all of them. `WatchFilter` is how an operator scopes a turner to work it wants, cheapest check first:
+
+| Stage | Rule | Cost |
+|---|---|---|
+| Server-side | `allowed_target_programs` → `getProgramAccounts` / geyser memcmp on `WatchV0.target_program` | non-matching watches are never transmitted |
+| Registry-only | `blocked_target_programs`, `allowed_registrars`, `allowed_targets` | decided from the 112-byte watch account |
+| Post-fetch | `max_target_bytes`, owner-drift check | one fetch per refresh |
+| Post-parse | `min_crank_payment` | one parse per refresh |
+| Last | `max_watches` | — |
+
+`target_program` is recorded **by the relay program from the target account's owner** at registration, so a registrar can't claim someone else's program to slip past an allowlist. It leads the `WatchV0` layout precisely so it is memcmp-able.
+
+The fee bar drops the *whole watch*, not just the underachieving condition: a book with nothing worth cranking stops being fetched and subscribed until the next refresh, rather than costing a fetch every tick forever. Everything here is resource policy, never correctness — `crank_v0`'s payment assert is what guarantees a turner actually gets paid.
+
 ## Program (`programs/relay`)
 
 Anchor v2 (anchor-next, same pinned rev as velocity's anchor-v2 workspace). Two jobs:
 
-1. **Registry**: `register_watch_v0(target, offset)` / `close_watch_v0`. A `WatchV0` account is discovery metadata only — the turner scans the registry to find condition blocks. Registration is permissionless (garbage watches parse-fail and get ignored); the registrar can close.
+1. **Registry**: `register_watch_v0(target, offset)` / `close_watch_v0`. A `WatchV0` is `[disc][target_program][target][registrar][offset]` — discovery metadata only. `target_program` is read from the target account, not from args. Registration is permissionless (garbage watches parse-fail and get dropped at refresh); the registrar can close and reclaim rent.
 2. **Payment assert**: `crank_v0(offset, condition_index, keeper_index, data)` wrapper — reads the condition in place from the target account, CPIs the executor (every account `is_signer: false`), asserts the keeper's lamports grew by ≥ `min_payment`. This makes sim-only payment verification trivial for the turner (sim success ⇒ payment ok) and armors the sim-to-land race. Executors must not require signers (crank ixs are permissionless by design).
 
 Turners MAY submit executor ixs directly (unwrapped) — the wrapper is optional armor, not a toll booth. There is no payment escrow: executors pay keepers from their own program's funds (treasury PDA, the condition account itself, wherever) — the target program prices its own cranks.

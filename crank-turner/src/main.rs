@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use relay_crank_turner::{
     derive_ws_url, feed_channel, spawn_grpc_feed, spawn_ws_feed, CachedSource, CachedSourceConfig,
-    ChainSource, GrpcFeedConfig, Outcome, RpcSource, Turner, TurnerConfig,
+    ChainSource, GrpcFeedConfig, Outcome, RpcSource, Turner, TurnerConfig, WatchFilter,
 };
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
@@ -46,9 +46,28 @@ struct Args {
     /// relay program id.
     #[arg(long, env = "RELAY_PROGRAM_ID", default_value_t = TurnerConfig::default().relay_program)]
     program_id: Pubkey,
-    /// Skip conditions advertising less than this many lamports.
+    /// Skip conditions advertising less than this many lamports. A watch
+    /// with no condition clearing the bar is dropped from the working set
+    /// entirely, so its target stops being fetched and subscribed.
     #[arg(long, env = "RELAY_MIN_CRANK_PAYMENT", default_value_t = 0)]
     min_crank_payment: u64,
+    /// Only crank watches whose target is owned by one of these programs.
+    /// Pushed down to the RPC/geyser provider, so other protocols' watches
+    /// are never transmitted. Repeatable / comma-separated. Default: all.
+    #[arg(long, env = "RELAY_TARGET_PROGRAMS", value_delimiter = ',')]
+    target_program: Vec<Pubkey>,
+    /// Never crank these programs. Repeatable / comma-separated.
+    #[arg(long, env = "RELAY_BLOCKED_PROGRAMS", value_delimiter = ',')]
+    blocked_program: Vec<Pubkey>,
+    /// Only crank watches registered by these keys. Repeatable.
+    #[arg(long, env = "RELAY_ALLOWED_REGISTRARS", value_delimiter = ',')]
+    allowed_registrar: Vec<Pubkey>,
+    /// Drop watches whose target account exceeds this many bytes.
+    #[arg(long, env = "RELAY_MAX_TARGET_BYTES")]
+    max_target_bytes: Option<usize>,
+    /// Hard ceiling on how many watches to track at once.
+    #[arg(long, env = "RELAY_MAX_WATCHES")]
+    max_watches: Option<usize>,
     /// Milliseconds between ticks.
     #[arg(long, env = "RELAY_TICK_MS", default_value_t = 1000)]
     tick_ms: u64,
@@ -72,9 +91,24 @@ async fn main() -> Result<()> {
 
     let keeper = Keypair::read_from_file(shellexpand(&args.keypair))
         .map_err(|e| anyhow::anyhow!("read keypair {}: {e}", args.keypair))?;
+    let filter = WatchFilter {
+        allowed_target_programs: args.target_program.iter().copied().collect(),
+        blocked_target_programs: args.blocked_program.iter().copied().collect(),
+        allowed_registrars: args.allowed_registrar.iter().copied().collect(),
+        allowed_targets: Default::default(),
+        max_target_bytes: args.max_target_bytes,
+        max_watches: args.max_watches,
+    };
+    if filter.allowed_target_programs.is_empty() {
+        warn!(
+            "no --target-program allowlist: this turner will track every watch in the registry, \
+             including other protocols'"
+        );
+    }
     let config = TurnerConfig {
         relay_program: args.program_id,
         min_crank_payment: args.min_crank_payment,
+        filter: filter.clone(),
         ..TurnerConfig::default()
     };
     let rpc = RpcSource::new(args.rpc_url.clone());
@@ -87,7 +121,12 @@ async fn main() -> Result<()> {
                 .clone()
                 .unwrap_or_else(|| derive_ws_url(&args.rpc_url));
             let (sender, receiver) = feed_channel();
-            spawn_ws_feed(ws_url.clone(), args.program_id, sender);
+            spawn_ws_feed(
+                ws_url.clone(),
+                args.program_id,
+                filter.server_side_programs(),
+                sender,
+            );
             info!(%ws_url, "websocket subscriptions enabled");
             let source = CachedSource::new(rpc, receiver, cached_config(&args));
             run(Turner::new(source, keeper, config), &args).await
@@ -104,6 +143,7 @@ async fn main() -> Result<()> {
                     x_token: args.grpc_x_token.clone(),
                 },
                 args.program_id,
+                filter.server_side_programs(),
                 sender,
             );
             info!(%endpoint, "yellowstone gRPC subscriptions enabled");
@@ -135,7 +175,11 @@ async fn run<S: ChainSource>(mut turner: Turner<S>, args: &Args) -> Result<()> {
         }
         if ticks.is_multiple_of(args.refresh_ticks) {
             match turner.refresh_watches().await {
-                Ok(n) => info!(watches = n, "registry refreshed"),
+                Ok(summary) => info!(
+                    watches = summary.admitted,
+                    filtered_out = summary.rejected.len(),
+                    "registry refreshed"
+                ),
                 Err(e) => warn!(error = %format!("{e:#}"), "registry refresh failed"),
             }
         }

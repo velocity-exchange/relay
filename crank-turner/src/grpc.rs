@@ -23,8 +23,10 @@ use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
 use yellowstone_grpc_proto::geyser::CommitmentLevel;
 use yellowstone_grpc_proto::prelude::{
     subscribe_request_filter_accounts_filter::Filter as AccountsFilterOneof,
+    subscribe_request_filter_accounts_filter_memcmp::Data as AccountsFilterMemcmpOneof,
     subscribe_update::UpdateOneof, SubscribeRequest, SubscribeRequestFilterAccounts,
-    SubscribeRequestFilterAccountsFilter, SubscribeRequestPing,
+    SubscribeRequestFilterAccountsFilter, SubscribeRequestFilterAccountsFilterMemcmp,
+    SubscribeRequestPing,
 };
 
 use crate::feed::{AccountUpdate, FeedSender};
@@ -35,29 +37,74 @@ pub struct GrpcFeedConfig {
     pub x_token: Option<String>,
 }
 
+/// `target_programs` narrows the watch-registry filter to those programs
+/// (one filter entry each); empty streams every watch.
 pub fn spawn_grpc_feed(
     config: GrpcFeedConfig,
     relay_program: Pubkey,
+    target_programs: Vec<Pubkey>,
     feed: FeedSender,
 ) -> JoinHandle<()> {
-    tokio::spawn(run(config, relay_program, feed))
+    tokio::spawn(run(config, relay_program, target_programs, feed))
 }
 
-fn build_request(relay_program: &Pubkey, interest: &HashSet<Pubkey>) -> SubscribeRequest {
-    let accounts: HashMap<String, SubscribeRequestFilterAccounts> = [
-        (
+/// Watch-registry filters: the relay program as owner, `WatchV0` size, and
+/// — when the operator scoped the turner — a memcmp pinning
+/// `target_program`, so other protocols' watches never cross the wire.
+fn watch_filters(target_program: Option<&Pubkey>) -> Vec<SubscribeRequestFilterAccountsFilter> {
+    [SubscribeRequestFilterAccountsFilter {
+        filter: Some(AccountsFilterOneof::Datasize(
+            relay_spec::WATCH_V0_LEN as u64,
+        )),
+    }]
+    .into_iter()
+    .chain(
+        target_program.map(|pk| SubscribeRequestFilterAccountsFilter {
+            filter: Some(AccountsFilterOneof::Memcmp(
+                SubscribeRequestFilterAccountsFilterMemcmp {
+                    offset: relay_spec::WATCH_TARGET_PROGRAM_OFFSET as u64,
+                    data: Some(AccountsFilterMemcmpOneof::Bytes(pk.to_bytes().to_vec())),
+                },
+            )),
+        }),
+    )
+    .collect()
+}
+
+fn build_request(
+    relay_program: &Pubkey,
+    target_programs: &[Pubkey],
+    interest: &HashSet<Pubkey>,
+) -> SubscribeRequest {
+    let watch_entries: Vec<(String, SubscribeRequestFilterAccounts)> = if target_programs.is_empty()
+    {
+        vec![(
             "watches".to_string(),
             SubscribeRequestFilterAccounts {
                 owner: vec![relay_program.to_string()],
-                filters: vec![SubscribeRequestFilterAccountsFilter {
-                    filter: Some(AccountsFilterOneof::Datasize(
-                        relay_spec::WATCH_V0_LEN as u64,
-                    )),
-                }],
+                filters: watch_filters(None),
                 ..Default::default()
             },
-        ),
-        (
+        )]
+    } else {
+        target_programs
+            .iter()
+            .enumerate()
+            .map(|(i, target_program)| {
+                (
+                    format!("watches-{i}"),
+                    SubscribeRequestFilterAccounts {
+                        owner: vec![relay_program.to_string()],
+                        filters: watch_filters(Some(target_program)),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect()
+    };
+    let accounts: HashMap<String, SubscribeRequestFilterAccounts> = watch_entries
+        .into_iter()
+        .chain([(
             "interest".to_string(),
             SubscribeRequestFilterAccounts {
                 account: interest
@@ -68,9 +115,8 @@ fn build_request(relay_program: &Pubkey, interest: &HashSet<Pubkey>) -> Subscrib
                     .collect(),
                 ..Default::default()
             },
-        ),
-    ]
-    .into();
+        )])
+        .collect();
     SubscribeRequest {
         accounts,
         commitment: Some(CommitmentLevel::Processed as i32),
@@ -78,7 +124,12 @@ fn build_request(relay_program: &Pubkey, interest: &HashSet<Pubkey>) -> Subscrib
     }
 }
 
-async fn run(config: GrpcFeedConfig, relay_program: Pubkey, feed: FeedSender) {
+async fn run(
+    config: GrpcFeedConfig,
+    relay_program: Pubkey,
+    target_programs: Vec<Pubkey>,
+    feed: FeedSender,
+) {
     let mut backoff = Duration::from_secs(1);
     let mut interest = feed.interest.clone();
     loop {
@@ -103,7 +154,11 @@ async fn run(config: GrpcFeedConfig, relay_program: Pubkey, feed: FeedSender) {
             }
         };
 
-        let request = build_request(&relay_program, &interest.borrow_and_update());
+        let request = build_request(
+            &relay_program,
+            &target_programs,
+            &interest.borrow_and_update(),
+        );
         let (mut sink, mut stream) = match client.subscribe_with_request(Some(request)).await {
             Ok(pair) => pair,
             Err(err) => {
@@ -166,8 +221,11 @@ async fn run(config: GrpcFeedConfig, relay_program: Pubkey, feed: FeedSender) {
                 changed = interest.changed() => match changed {
                     Ok(()) => {
                         // Filter update on the live stream — no reconnect.
-                        let request =
-                            build_request(&relay_program, &interest.borrow_and_update());
+                        let request = build_request(
+                            &relay_program,
+                            &target_programs,
+                            &interest.borrow_and_update(),
+                        );
                         if let Err(err) = sink.send(request).await {
                             warn!(error = %err, "grpc filter update failed; reconnecting");
                             break;

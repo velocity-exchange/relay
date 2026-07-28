@@ -36,6 +36,7 @@
 
 pub mod cached;
 pub mod feed;
+pub mod filter;
 pub mod grpc;
 pub mod source;
 pub mod turner;
@@ -43,6 +44,7 @@ pub mod ws;
 
 pub use cached::{CachedSource, CachedSourceConfig};
 pub use feed::{feed_channel, AccountUpdate, FeedReceiver, FeedSender};
+pub use filter::{RefreshSummary, RejectReason, WatchFilter};
 pub use grpc::{spawn_grpc_feed, GrpcFeedConfig};
 pub use source::{ChainSource, ClockSnapshot, RpcSource, SimOutcome};
 pub use turner::{

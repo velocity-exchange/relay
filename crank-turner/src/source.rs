@@ -48,9 +48,16 @@ pub struct SimOutcome {
 pub trait ChainSource: Send + Sync {
     async fn get_multiple_accounts(&self, pubkeys: &[Pubkey]) -> Result<Vec<Option<Account>>>;
 
-    /// relay watch accounts (pre-filtered to plausible `WatchV0`s by
-    /// size/discriminator where the transport allows).
-    async fn get_watch_accounts(&self, program: &Pubkey) -> Result<Vec<(Pubkey, Account)>>;
+    /// relay watch accounts, pre-filtered to plausible `WatchV0`s by
+    /// size/discriminator. `target_programs` is the operator's program
+    /// allowlist: non-empty means the provider itself should filter on the
+    /// watch's `target_program` (memcmp), so another protocol's watches are
+    /// never transmitted. Empty means no program restriction.
+    async fn get_watch_accounts(
+        &self,
+        program: &Pubkey,
+        target_programs: &[Pubkey],
+    ) -> Result<Vec<(Pubkey, Account)>>;
 
     async fn clock(&self) -> Result<ClockSnapshot>;
 
@@ -82,6 +89,26 @@ impl RpcSource {
     }
 }
 
+/// `WatchV0`-shaped account filters, optionally narrowed to one target
+/// program. Shared by the RPC and websocket paths.
+pub fn watch_filters(target_program: Option<&Pubkey>) -> Vec<RpcFilterType> {
+    [
+        RpcFilterType::DataSize(relay_spec::WATCH_V0_LEN as u64),
+        RpcFilterType::Memcmp(Memcmp::new_raw_bytes(
+            0,
+            relay_spec::WATCH_V0_DISCRIMINATOR.to_vec(),
+        )),
+    ]
+    .into_iter()
+    .chain(target_program.map(|pk| {
+        RpcFilterType::Memcmp(Memcmp::new_raw_bytes(
+            relay_spec::WATCH_TARGET_PROGRAM_OFFSET,
+            pk.to_bytes().to_vec(),
+        ))
+    }))
+    .collect()
+}
+
 fn decode_ui_account(ui: solana_account_decoder::UiAccount) -> Option<Account> {
     let data = match &ui.data {
         UiAccountData::Binary(blob, UiAccountEncoding::Base64) => {
@@ -109,30 +136,43 @@ impl ChainSource for RpcSource {
             .context("get_multiple_accounts")
     }
 
-    async fn get_watch_accounts(&self, program: &Pubkey) -> Result<Vec<(Pubkey, Account)>> {
-        // Deprecated in favor of the ui-accounts variant, but this one
-        // returns `Account` directly, which is what the trait wants.
-        #[allow(deprecated)]
-        self.client
-            .get_program_accounts_with_config(
-                program,
-                RpcProgramAccountsConfig {
-                    filters: Some(vec![
-                        RpcFilterType::DataSize(relay_spec::WATCH_V0_LEN as u64),
-                        RpcFilterType::Memcmp(Memcmp::new_raw_bytes(
-                            0,
-                            relay_spec::WATCH_V0_DISCRIMINATOR.to_vec(),
-                        )),
-                    ]),
-                    account_config: RpcAccountInfoConfig {
-                        encoding: Some(UiAccountEncoding::Base64),
+    async fn get_watch_accounts(
+        &self,
+        program: &Pubkey,
+        target_programs: &[Pubkey],
+    ) -> Result<Vec<(Pubkey, Account)>> {
+        // A memcmp can only match one value, so an allowlist of N programs
+        // is N queries. Worth it: the alternative is downloading every
+        // other protocol's registry entries and discarding them locally.
+        let queries: Vec<Option<Pubkey>> = if target_programs.is_empty() {
+            vec![None]
+        } else {
+            target_programs.iter().copied().map(Some).collect()
+        };
+        let mut out = Vec::new();
+        for target_program in queries {
+            let filters = watch_filters(target_program.as_ref());
+            // Deprecated in favor of the ui-accounts variant, but this one
+            // returns `Account` directly, which is what the trait wants.
+            #[allow(deprecated)]
+            let accounts = self
+                .client
+                .get_program_accounts_with_config(
+                    program,
+                    RpcProgramAccountsConfig {
+                        filters: Some(filters),
+                        account_config: RpcAccountInfoConfig {
+                            encoding: Some(UiAccountEncoding::Base64),
+                            ..Default::default()
+                        },
                         ..Default::default()
                     },
-                    ..Default::default()
-                },
-            )
-            .await
-            .context("get_program_accounts(watches)")
+                )
+                .await
+                .context("get_program_accounts(watches)")?;
+            out.extend(accounts);
+        }
+        Ok(out)
     }
 
     async fn clock(&self) -> Result<ClockSnapshot> {

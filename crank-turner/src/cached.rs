@@ -187,10 +187,17 @@ impl<Inner: ChainSource> ChainSource for CachedSource<Inner> {
         }))
     }
 
-    async fn get_watch_accounts(&self, program: &Pubkey) -> Result<Vec<(Pubkey, Account)>> {
+    async fn get_watch_accounts(
+        &self,
+        program: &Pubkey,
+        target_programs: &[Pubkey],
+    ) -> Result<Vec<(Pubkey, Account)>> {
         let warm = self.with_state(|state, _| state.warm);
         if !warm {
-            let accounts = self.inner.get_watch_accounts(program).await?;
+            let accounts = self
+                .inner
+                .get_watch_accounts(program, target_programs)
+                .await?;
             self.with_state(|state, _| {
                 accounts.into_iter().for_each(|(pk, account)| {
                     state.watch_keys.insert(pk);
@@ -203,6 +210,10 @@ impl<Inner: ChainSource> ChainSource for CachedSource<Inner> {
                 state.warm = true;
             });
         }
+        // The backend's own subscription filter may be broader than the
+        // caller's allowlist (or absent), so re-apply it here.
+        let allowed: std::collections::HashSet<[u8; 32]> =
+            target_programs.iter().map(|pk| pk.to_bytes()).collect();
         Ok(self.with_state(|state, config| {
             state
                 .watch_keys
@@ -215,6 +226,11 @@ impl<Inner: ChainSource> ChainSource for CachedSource<Inner> {
                         .filter(|acc| {
                             acc.owner == config.relay_program
                                 && acc.data.len() == relay_spec::WATCH_V0_LEN
+                        })
+                        .filter(|acc| {
+                            allowed.is_empty()
+                                || relay_spec::WatchV0::read_from_account(&acc.data)
+                                    .is_ok_and(|w| allowed.contains(&w.target_program))
                         })
                         .map(|acc| (*pk, acc))
                 })

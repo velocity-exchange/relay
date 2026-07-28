@@ -15,12 +15,16 @@ use solana_sdk::signature::{Keypair, Signature};
 use solana_sdk::signer::Signer;
 use solana_sdk::transaction::Transaction;
 
+use crate::filter::{RefreshSummary, WatchFilter};
 use crate::source::{ChainSource, ClockSnapshot};
 
 /// One registered watch, parsed from a `WatchV0` account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Watch {
+    /// Owner program of `target`, recorded on chain at registration.
+    pub target_program: Pubkey,
     pub target: Pubkey,
+    pub registrar: Pubkey,
     pub offset: u32,
 }
 
@@ -80,6 +84,10 @@ pub struct TurnerConfig {
     /// Base for exponential failure backoff (doubles per consecutive
     /// failure, capped at 2^6).
     pub failure_backoff_slots: u64,
+    /// Which watches this turner is willing to track at all. Default is
+    /// unrestricted; scope it to your own programs when other protocols
+    /// share the registry.
+    pub filter: WatchFilter,
 }
 
 /// Default relay program id (`declare_id!` in `programs/relay`).
@@ -92,6 +100,7 @@ impl Default for TurnerConfig {
             min_crank_payment: 0,
             no_work_backoff_slots: 8,
             failure_backoff_slots: 16,
+            filter: WatchFilter::default(),
         }
     }
 }
@@ -136,25 +145,103 @@ impl<S: ChainSource> Turner<S> {
         &self.source
     }
 
-    /// Re-scan the registry. Unparseable accounts are ignored; duplicate
-    /// `(target, offset)` registrations collapse to one.
-    pub async fn refresh_watches(&mut self) -> Result<usize> {
+    /// Re-scan the registry and re-apply the watch filter. Returns what
+    /// was admitted and why anything else was dropped.
+    ///
+    /// Filters run cheapest-first: the provider is asked only for allowed
+    /// programs (server-side memcmp), registry-only rules are decided from
+    /// the watch account alone, and only survivors have their target
+    /// fetched for the size / owner / fee checks. A watch dropped here
+    /// stops being fetched and subscribed entirely until the next refresh.
+    pub async fn refresh_watches(&mut self) -> Result<RefreshSummary> {
+        let filter = self.config.filter.clone();
         let accounts = self
             .source
-            .get_watch_accounts(&self.config.relay_program)
+            .get_watch_accounts(&self.config.relay_program, &filter.server_side_programs())
             .await?;
-        let mut watches: Vec<Watch> = accounts
+        let mut candidates: Vec<Watch> = accounts
             .iter()
             .filter_map(|(_, account)| spec::WatchV0::read_from_account(&account.data).ok())
             .map(|w| Watch {
+                target_program: Pubkey::from(w.target_program),
                 target: Pubkey::from(w.target),
+                registrar: Pubkey::from(w.registrar),
                 offset: w.offset,
             })
             .collect();
-        watches.sort_by_key(|w| (w.target.to_bytes(), w.offset));
-        watches.dedup();
-        self.watches = watches;
-        Ok(self.watches.len())
+        candidates.sort_by_key(|w| (w.target.to_bytes(), w.offset));
+        candidates.dedup();
+
+        let mut summary = RefreshSummary::default();
+        let (registry_ok, registry_rejected): (Vec<_>, Vec<_>) = candidates
+            .into_iter()
+            .map(|w| {
+                let verdict = filter.check_registry(&w);
+                (w, verdict)
+            })
+            .partition(|(_, verdict)| verdict.is_ok());
+        summary.rejected.extend(
+            registry_rejected
+                .into_iter()
+                .map(|(w, verdict)| (w, verdict.unwrap_err())),
+        );
+
+        // One fetch of the survivors covers the size, owner, and fee gates.
+        let targets: Vec<Pubkey> = registry_ok.iter().map(|(w, _)| w.target).collect();
+        let fetched = self.load_map(&targets).await?;
+        let admitted: Vec<Watch> = registry_ok
+            .into_iter()
+            .map(|(w, _)| w)
+            .filter(|w| {
+                let account = fetched.get(&w.target);
+                match filter
+                    .check_target(w, account)
+                    .and_then(|()| self.check_conditions(w, account))
+                {
+                    Ok(()) => true,
+                    Err(reason) => {
+                        summary.rejected.push((*w, reason));
+                        false
+                    }
+                }
+            })
+            .collect();
+
+        let (kept, over_capacity) = match self.config.filter.max_watches {
+            Some(max) if admitted.len() > max => admitted.split_at(max),
+            _ => (admitted.as_slice(), &[][..]),
+        };
+        summary.rejected.extend(
+            over_capacity
+                .iter()
+                .map(|w| (*w, crate::filter::RejectReason::OverCapacity)),
+        );
+        summary.admitted = kept.len();
+        self.watches = kept.to_vec();
+        // Forget state for watches we no longer track, so a re-admitted
+        // watch starts clean rather than inheriting a stale backoff.
+        let tracked: std::collections::HashSet<(Pubkey, u32)> =
+            self.watches.iter().map(|w| (w.target, w.offset)).collect();
+        self.state
+            .retain(|(target, offset, _), _| tracked.contains(&(*target, *offset)));
+        Ok(summary)
+    }
+
+    /// Fee gate: a watch earns its place only if some active condition pays
+    /// at least `min_crank_payment`.
+    fn check_conditions(
+        &self,
+        watch: &Watch,
+        account: Option<&Account>,
+    ) -> Result<(), crate::filter::RejectReason> {
+        let account = account.ok_or(crate::filter::RejectReason::TargetMissing)?;
+        let conditions = spec::read_conditions_unaligned(&account.data, watch.offset as usize)
+            .map_err(|_| crate::filter::RejectReason::Unparseable)?;
+        conditions
+            .iter()
+            .any(|c| c.is_active() && c.min_payment >= self.config.min_crank_payment)
+            .then_some(())
+            .ok_or(crate::filter::RejectReason::PaysTooLittle)
     }
 
     /// One pass over every known condition. Returns an outcome per

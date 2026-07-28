@@ -32,6 +32,15 @@ cd programs && cargo test      # program tests (litesvm, cross-program)
 
 ## Run the turner
 
+Scope a turner to your own programs so another protocol's watches cost you nothing (the allowlist is pushed down to the RPC/geyser provider, so they are never even transmitted):
+
+```bash
+--target-program <YOUR_PROGRAM>      # repeatable/comma-separated; default: everything
+--min-crank-payment 5000             # drops watches with nothing worth cranking
+--max-target-bytes 100000            # skip expensive-to-stream targets
+--max-watches 500                    # hard ceiling
+```
+
 ```bash
 # RPC polling (no extra infra)
 cargo run -p relay-crank-turner -- --rpc-url https://your-rpc --keypair ~/keeper.json

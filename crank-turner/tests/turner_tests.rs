@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use litesvm::LiteSVM;
 use relay_crank_turner::{
     feed_channel, AccountUpdate, CachedSource, CachedSourceConfig, ChainSource, ClockSnapshot,
-    Outcome, SimOutcome, SkipReason, Stage, Turner, TurnerConfig,
+    Outcome, RejectReason, SimOutcome, SkipReason, Stage, Turner, TurnerConfig, WatchFilter,
 };
 use relay_spec as spec;
 use sha2::{Digest, Sha256};
@@ -82,13 +82,24 @@ impl ChainSource for LiteSvmSource {
         Ok(pubkeys.iter().map(|pk| svm.get_account(pk)).collect())
     }
 
-    async fn get_watch_accounts(&self, program: &Pubkey) -> Result<Vec<(Pubkey, Account)>> {
+    async fn get_watch_accounts(
+        &self,
+        program: &Pubkey,
+        target_programs: &[Pubkey],
+    ) -> Result<Vec<(Pubkey, Account)>> {
         let svm = self.svm.lock().unwrap();
         let keys = self.watch_keys.lock().unwrap();
+        // Stands in for the provider-side memcmp on `target_program`.
+        let allowed: Vec<[u8; 32]> = target_programs.iter().map(|pk| pk.to_bytes()).collect();
         Ok(keys
             .iter()
             .filter_map(|pk| svm.get_account(pk).map(|acc| (*pk, acc)))
-            .filter(|(_, acc)| acc.owner == *program && acc.data.len() == relay_spec::WATCH_V0_LEN)
+            .filter(|(_, acc)| acc.owner == *program && acc.data.len() == spec::WATCH_V0_LEN)
+            .filter(|(_, acc)| {
+                allowed.is_empty()
+                    || spec::WatchV0::read_from_account(&acc.data)
+                        .is_ok_and(|w| allowed.contains(&w.target_program))
+            })
             .collect())
     }
 
@@ -391,7 +402,7 @@ impl Harness {
     }
 
     async fn refresh(&mut self) -> usize {
-        self.turner.refresh_watches().await.unwrap()
+        self.turner.refresh_watches().await.unwrap().admitted
     }
 
     async fn tick(&mut self) -> Vec<Outcome> {
@@ -562,17 +573,19 @@ async fn garbage_watch_is_ignored() {
     let junk = Pubkey::new_unique();
     h.svm.lock().unwrap().airdrop(&junk, 1_000_000).unwrap();
     h.register_watch(junk, 0);
-    assert_eq!(h.refresh().await, 2);
 
+    // A watch pointing at data that is not a condition block is dropped at
+    // refresh, so it never costs a fetch or a simulation afterwards.
+    let summary = h.turner.refresh_watches().await.unwrap();
+    assert_eq!(summary.admitted, 1);
+    assert_eq!(summary.rejected_for(RejectReason::Unparseable), 1);
+
+    // The real watch still works alongside the junk one.
+    let t0 = h.t0;
+    h.add_entry(t0 + 100);
+    h.warp(t0 + 200, 2);
     let outcomes = h.tick().await;
-    assert!(
-        outcomes
-            .iter()
-            .any(|o| matches!(o, Outcome::Skipped(_, SkipReason::ParseFailed))),
-        "{outcomes:?}"
-    );
-    // The real watch still evaluates alongside the junk one.
-    assert!(outcomes.len() > 1);
+    assert_eq!(sent(&outcomes).len(), 1, "{outcomes:?}");
 }
 
 #[tokio::test]
@@ -745,10 +758,214 @@ async fn turner_cranks_through_cached_source() {
         let mut svm = h.svm.lock().unwrap();
         svm.airdrop(&turner.keeper_pubkey(), 1_000_000_000).unwrap();
     }
-    assert_eq!(turner.refresh_watches().await.unwrap(), 1);
+    assert_eq!(turner.refresh_watches().await.unwrap().admitted, 1);
 
     h.warp(t0 + 200, 2);
     let outcomes = turner.tick().await.unwrap();
     assert_eq!(sent(&outcomes).len(), 1, "{outcomes:?}");
     assert_eq!(h.entry_count(), 0);
+}
+
+// --- watch filtering ---
+
+/// A turner scoped to its own program ignores another protocol's watches
+/// outright: they are never admitted, so their targets are never fetched,
+/// subscribed, parsed, or simulated.
+#[tokio::test]
+async fn filter_scopes_turner_to_its_own_programs() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    // A foreign protocol registers a watch on an account it owns.
+    let foreign_program = Pubkey::new_unique();
+    let foreign_target = Pubkey::new_unique();
+    {
+        let mut svm = h.svm.lock().unwrap();
+        svm.set_account(
+            foreign_target,
+            Account {
+                lamports: 1_000_000,
+                data: vec![0u8; 4096],
+                owner: foreign_program,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    }
+    h.register_watch(foreign_target, 0);
+
+    // Unfiltered: both watches are candidates (the foreign one is dropped
+    // only later, for being unparseable — after we paid to fetch it).
+    let summary = h.turner.refresh_watches().await.unwrap();
+    assert_eq!(summary.admitted, 1);
+    assert_eq!(summary.rejected_for(RejectReason::Unparseable), 1);
+
+    // Scoped to demo-book: the foreign watch is rejected from the registry
+    // alone, before its 4KB target is ever read.
+    h.turner = Turner::new(
+        LiteSvmSource {
+            svm: Arc::clone(&h.svm),
+            watch_keys: Arc::clone(&h.watch_keys),
+        },
+        Keypair::new(),
+        TurnerConfig {
+            filter: WatchFilter::for_programs([demo_id()]),
+            ..TurnerConfig::default()
+        },
+    );
+    let summary = h.turner.refresh_watches().await.unwrap();
+    assert_eq!(summary.admitted, 1);
+    assert!(
+        summary.rejected.is_empty(),
+        "the provider filtered the foreign watch out server-side, so the turner never saw it: \
+         {summary:?}"
+    );
+
+    // The same rule is enforced locally too, for providers that ignore
+    // filters (and for the subscription cache).
+    let scoped = WatchFilter::for_programs([demo_id()]);
+    let foreign_watch = relay_crank_turner::Watch {
+        target_program: foreign_program,
+        target: foreign_target,
+        registrar: Pubkey::new_unique(),
+        offset: 0,
+    };
+    assert_eq!(
+        scoped.check_registry(&foreign_watch),
+        Err(RejectReason::ProgramNotAllowed)
+    );
+
+    // Denylisting our own program empties the working set entirely.
+    h.turner = Turner::new(
+        LiteSvmSource {
+            svm: Arc::clone(&h.svm),
+            watch_keys: Arc::clone(&h.watch_keys),
+        },
+        Keypair::new(),
+        TurnerConfig {
+            filter: WatchFilter {
+                blocked_target_programs: [demo_id()].into_iter().collect(),
+                ..WatchFilter::default()
+            },
+            ..TurnerConfig::default()
+        },
+    );
+    let summary = h.turner.refresh_watches().await.unwrap();
+    assert_eq!(summary.admitted, 0);
+    assert_eq!(summary.rejected_for(RejectReason::ProgramBlocked), 1);
+    assert!(h.tick().await.is_empty(), "nothing tracked, nothing ticked");
+}
+
+/// The fee bar drops a whole watch, not just its conditions — a book that
+/// pays too little stops costing the turner anything.
+#[tokio::test]
+async fn filter_drops_watches_that_pay_too_little() {
+    let cheap = 10;
+    let mut h = setup(cheap, 100, TurnerConfig::default());
+    let t0 = h.t0;
+    h.add_entry(t0 + 100);
+
+    h.turner = Turner::new(
+        LiteSvmSource {
+            svm: Arc::clone(&h.svm),
+            watch_keys: Arc::clone(&h.watch_keys),
+        },
+        Keypair::new(),
+        TurnerConfig {
+            min_crank_payment: cheap + 1,
+            ..TurnerConfig::default()
+        },
+    );
+    let summary = h.turner.refresh_watches().await.unwrap();
+    assert_eq!(summary.admitted, 0);
+    assert_eq!(summary.rejected_for(RejectReason::PaysTooLittle), 1);
+
+    // Even with work waiting, an unadmitted watch is never even looked at.
+    h.warp(t0 + 200, 2);
+    assert!(h.tick().await.is_empty());
+    assert_eq!(h.entry_count(), 1, "nothing was cranked");
+}
+
+/// Size and count ceilings, for targets that are expensive to stream.
+#[tokio::test]
+async fn filter_enforces_size_and_count_ceilings() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+
+    h.turner = Turner::new(
+        LiteSvmSource {
+            svm: Arc::clone(&h.svm),
+            watch_keys: Arc::clone(&h.watch_keys),
+        },
+        Keypair::new(),
+        TurnerConfig {
+            filter: WatchFilter {
+                max_target_bytes: Some(BOOK_ACCOUNT_LEN - 1),
+                ..WatchFilter::default()
+            },
+            ..TurnerConfig::default()
+        },
+    );
+    let summary = h.turner.refresh_watches().await.unwrap();
+    assert_eq!(summary.admitted, 0);
+    assert_eq!(summary.rejected_for(RejectReason::TargetTooLarge), 1);
+
+    h.turner = Turner::new(
+        LiteSvmSource {
+            svm: Arc::clone(&h.svm),
+            watch_keys: Arc::clone(&h.watch_keys),
+        },
+        Keypair::new(),
+        TurnerConfig {
+            filter: WatchFilter {
+                max_watches: Some(0),
+                ..WatchFilter::default()
+            },
+            ..TurnerConfig::default()
+        },
+    );
+    let summary = h.turner.refresh_watches().await.unwrap();
+    assert_eq!(summary.admitted, 0);
+    assert_eq!(summary.rejected_for(RejectReason::OverCapacity), 1);
+}
+
+/// The program allowlist is pushed down to the provider, so a filtered
+/// turner never even receives the other watches.
+#[tokio::test]
+async fn program_allowlist_is_pushed_to_the_provider() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    let foreign_program = Pubkey::new_unique();
+    let foreign_target = Pubkey::new_unique();
+    {
+        let mut svm = h.svm.lock().unwrap();
+        svm.set_account(
+            foreign_target,
+            Account {
+                lamports: 1_000_000,
+                data: vec![0u8; 128],
+                owner: foreign_program,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    }
+    h.register_watch(foreign_target, 0);
+
+    let source = LiteSvmSource {
+        svm: Arc::clone(&h.svm),
+        watch_keys: Arc::clone(&h.watch_keys),
+    };
+    let all = source
+        .get_watch_accounts(&relay_id(), &[])
+        .await
+        .unwrap()
+        .len();
+    let scoped = source
+        .get_watch_accounts(&relay_id(), &[demo_id()])
+        .await
+        .unwrap();
+    assert_eq!(all, 2, "both watches exist in the registry");
+    assert_eq!(scoped.len(), 1, "provider filtered by target_program");
+    let parsed = spec::WatchV0::read_from_account(&scoped[0].1.data).unwrap();
+    assert_eq!(parsed.target_program, demo_id().to_bytes());
+    assert_eq!(parsed.target, h.book.to_bytes());
 }
