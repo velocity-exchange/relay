@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["relay", "demo-book"]
+
+# SEPARATE workspace from the client workspace at the repo root (which does
+# not include this directory). Hosts the Anchor v2-line programs so their
+# anchor-lang/pinocchio dependency tree never unifies with the client tree.
+# Own Cargo.lock, own target dir (see .cargo/config.toml). Build with:
+#   cargo-build-sbf --tools-version v1.52 --manifest-path relay/Cargo.toml
+#   cargo-build-sbf --tools-version v1.52 --manifest-path demo-book/Cargo.toml
+# (or `./scripts/build-programs.sh` at the repo root).
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

@@ -1,0 +1,14 @@
+[package]
+name = "relay-spec"
+description = "Wire format for relay condition blocks: the contract between target programs and crank turners"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# bytemuck is the ONLY dependency, deliberately: the condition block is
+# zero-copy pod state read in place on-chain, and bytemuck is no_std, tiny,
+# and already in every Solana program tree (Anchor 0.29/1.0/v2 alike).
+# Nothing else may be added here.
+[dependencies]
+bytemuck = { version = "1", features = ["derive", "min_const_generics"] }

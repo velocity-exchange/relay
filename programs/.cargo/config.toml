@@ -1,0 +1,4 @@
+# Build this workspace into programs/target so it never clobbers the client
+# workspace's ./target. Relative to this file's directory.
+[build]
+target-dir = "target"

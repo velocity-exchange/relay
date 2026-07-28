@@ -1,0 +1,3 @@
+target/
+**/*keypair*.json
+.DS_Store

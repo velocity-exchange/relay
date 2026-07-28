@@ -1,0 +1,35 @@
+[package]
+name = "demo-book"
+version = "0.1.0"
+description = "Reference relay target: an expiring-entries book embedding a condition block"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "demo_book"
+
+[features]
+default = []
+no-entrypoint = []
+cpi = ["no-entrypoint"]
+no-log-ix-name = []
+idl-build = []
+profile = ["anchor-v2-testing/profile"]
+
+[dependencies]
+anchor-lang-v2 = { git = "https://github.com/otter-sec/anchor.git", rev = "4fbe613b2dc739a849355889ce1f27eb6d03a148" }
+bytemuck = { version = "1", features = ["derive", "min_const_generics"] }
+static_assertions = "1.1.0"
+wincode = { version = "0.5", features = ["derive"] }
+relay-spec = { path = "../../spec" }
+
+[dev-dependencies]
+anchor-v2-testing = { git = "https://github.com/otter-sec/anchor.git", rev = "4fbe613b2dc739a849355889ce1f27eb6d03a148" }
+litesvm = "0.11.0"
+solana-account = "3.2.0"
+solana-clock = "3"
+solana-pubkey = "3.0"
+relay = { path = "../relay", features = ["no-entrypoint"] }
+
+[lints.rust.unexpected_cfgs]
+level = "allow"

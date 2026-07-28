@@ -1,0 +1,196 @@
+//! Book state. Fixed-capacity parallel arrays plus the condition block
+//! embedded as **typed pod fields** — the whole point of the zero-copy spec:
+//! a wake update is a single field store (`self.conditions[SWEEP].wake_ts =
+//! new_min`), never a serialization pass.
+
+use anchor_lang_v2::prelude::*;
+use relay_spec::{
+    AccountRefV0, ConditionBlockHeaderV0, ConditionV0, CrankSpecV0, KEEPER_PLACEHOLDER,
+};
+use static_assertions::const_assert_eq;
+
+use crate::error::DemoError;
+
+pub const MAX_ENTRIES: usize = 32;
+pub const NUM_CONDITIONS: usize = 2;
+
+/// Sweep batch bound per crank, so executor account lists and args stay
+/// small. The wake re-fires until the backlog drains.
+pub const MAX_SWEEP_IDS: usize = 8;
+
+#[account]
+pub struct BookV0 {
+    /// Admin able to add/cancel entries and reconfigure.
+    pub authority: Address,
+    /// Lamports paid to the keeper per successful crank, from this
+    /// account's balance (the book is its own treasury — fund it by
+    /// transferring lamports in).
+    pub payment_per_crank: u64,
+    /// Starts at 1 so id 0 never matches a live entry.
+    pub next_entry_id: u64,
+    /// Sweep wake hint: min over inserted expiries, NOT repaired on cancel
+    /// (only the sweep executor recomputes the true minimum). Only ever
+    /// early — an early hint costs a no-op simulation; a late one would be
+    /// a liveness bug. Mirrored into `conditions[SWEEP_CONDITION].wake_ts`.
+    pub next_expiry_ts: i64,
+    pub entry_count: u32,
+    /// Once `entry_count >= evict_threshold`, `evict_v0` may remove the
+    /// oldest entry for a reward (soft-cap pattern).
+    pub evict_threshold: u32,
+    pub entry_ids: [u64; MAX_ENTRIES],
+    pub entry_expiries: [i64; MAX_ENTRIES],
+    /// 1 = live, 0 = free.
+    pub entry_live: [u8; MAX_ENTRIES],
+    /// The condition block a `WatchV0` points at, embedded as typed pod
+    /// state. MUST stay contiguous and 8-aligned (`cond_header` then
+    /// `conditions`, nothing between).
+    pub cond_header: ConditionBlockHeaderV0,
+    pub conditions: [ConditionV0; NUM_CONDITIONS],
+}
+
+const_assert_eq!(core::mem::size_of::<BookV0>(), 1184);
+
+/// Account-data offset of the condition block (what to register the watch
+/// at). 8-aligned, as the zero-copy read path requires.
+pub const CONDITIONS_OFFSET: usize = 8 + core::mem::offset_of!(BookV0, cond_header);
+const_assert_eq!(CONDITIONS_OFFSET % 8, 0);
+const_assert_eq!(
+    core::mem::offset_of!(BookV0, conditions),
+    core::mem::offset_of!(BookV0, cond_header) + relay_spec::BLOCK_HEADER_LEN
+);
+
+/// Account-data offset of `entry_count` — the evict condition's dirty-watch
+/// range.
+pub const ENTRY_COUNT_OFFSET: usize = 8 + core::mem::offset_of!(BookV0, entry_count);
+
+pub const BOOK_ACCOUNT_LEN: usize = 8 + core::mem::size_of::<BookV0>();
+
+/// Sweep condition index in the block.
+pub const SWEEP_CONDITION: u8 = 0;
+/// Evict condition index in the block.
+pub const EVICT_CONDITION: u8 = 1;
+
+fn disc(d: &'static [u8]) -> [u8; 8] {
+    d.try_into().expect("anchor discriminators are 8 bytes")
+}
+
+impl BookV0 {
+    pub fn find_live(&self, id: u64) -> Option<usize> {
+        (0..MAX_ENTRIES).find(|&i| self.entry_live[i] == 1 && self.entry_ids[i] == id)
+    }
+
+    pub fn insert(&mut self, expiry_ts: i64) -> Result<u64> {
+        let slot = (0..MAX_ENTRIES)
+            .find(|&i| self.entry_live[i] == 0)
+            .ok_or(DemoError::BookFull)?;
+        let id = self.next_entry_id;
+        self.next_entry_id += 1;
+        self.entry_ids[slot] = id;
+        self.entry_expiries[slot] = expiry_ts;
+        self.entry_live[slot] = 1;
+        self.entry_count += 1;
+        if expiry_ts < self.next_expiry_ts {
+            self.next_expiry_ts = expiry_ts;
+            // The single-store wake update the pod layout exists for.
+            self.conditions[SWEEP_CONDITION as usize].wake_ts = expiry_ts;
+        }
+        Ok(id)
+    }
+
+    pub fn remove(&mut self, slot: usize) {
+        self.entry_live[slot] = 0;
+        self.entry_count -= 1;
+    }
+
+    /// True minimum expiry over live entries (`i64::MAX` when empty).
+    pub fn true_next_expiry(&self) -> i64 {
+        (0..MAX_ENTRIES)
+            .filter(|&i| self.entry_live[i] == 1)
+            .map(|i| self.entry_expiries[i])
+            .min()
+            .unwrap_or(i64::MAX)
+    }
+
+    /// Repair the sweep hint to the true minimum (executor-side).
+    pub fn repair_next_expiry(&mut self) {
+        self.next_expiry_ts = self.true_next_expiry();
+        self.conditions[SWEEP_CONDITION as usize].wake_ts = self.next_expiry_ts;
+    }
+
+    /// Live entry with the smallest id (the eviction victim).
+    pub fn oldest_live(&self) -> Option<(usize, u64)> {
+        (0..MAX_ENTRIES)
+            .filter(|&i| self.entry_live[i] == 1)
+            .map(|i| (i, self.entry_ids[i]))
+            .min_by_key(|&(_, id)| id)
+    }
+
+    /// One-time condition block initialization (wake inputs are updated in
+    /// place afterwards, never by rewriting the block).
+    pub fn init_conditions(&mut self, own_address: &Address) {
+        let program: [u8; 32] = *crate::ID.as_array();
+        let book: [u8; 32] = *own_address.as_array();
+        let resolver_accounts = [AccountRefV0::readonly(book)];
+        self.cond_header = ConditionBlockHeaderV0::new(NUM_CONDITIONS as u8);
+        self.conditions = [
+            // SWEEP_CONDITION
+            ConditionV0::at_timestamp(
+                self.next_expiry_ts,
+                CrankSpecV0 {
+                    resolver_program: program,
+                    resolver_disc: disc(crate::instruction::ResolveSweepV0::DISCRIMINATOR),
+                    executor_program: program,
+                    executor_disc: disc(crate::instruction::SweepV0::DISCRIMINATOR),
+                    min_payment: self.payment_per_crank,
+                },
+                &resolver_accounts,
+            ),
+            // EVICT_CONDITION
+            ConditionV0::on_account_dirty(
+                book,
+                ENTRY_COUNT_OFFSET as u32,
+                4,
+                CrankSpecV0 {
+                    resolver_program: program,
+                    resolver_disc: disc(crate::instruction::ResolveEvictV0::DISCRIMINATOR),
+                    executor_program: program,
+                    executor_disc: disc(crate::instruction::EvictV0::DISCRIMINATOR),
+                    min_payment: self.payment_per_crank,
+                },
+                &resolver_accounts,
+            ),
+        ];
+    }
+
+    /// Executor account list shared by both resolvers: keeper placeholder
+    /// (writable, receives payment) then the book (writable).
+    pub fn executor_accounts(own_address: &Address) -> Vec<AccountRefV0> {
+        vec![
+            AccountRefV0::writable(KEEPER_PLACEHOLDER),
+            AccountRefV0::writable(*own_address.as_array()),
+        ]
+    }
+}
+
+/// Pay the keeper from the book's lamports, keeping the book rent-exempt.
+pub fn pay_keeper(
+    book_view: &anchor_lang_v2::pinocchio::account::AccountView,
+    keeper_view: &anchor_lang_v2::pinocchio::account::AccountView,
+    amount: u64,
+) -> Result<()> {
+    use anchor_lang_v2::pinocchio::sysvars::{rent::Rent, Sysvar};
+    let min = Rent::get()?.try_minimum_balance(book_view.data_len())?;
+    let book_lamports = book_view.lamports();
+    require!(
+        book_lamports >= min.saturating_add(amount),
+        DemoError::InsufficientTreasury
+    );
+    // AccountView is a Copy handle over runtime memory; lamport writes go
+    // through regardless of which copy performs them (same pattern as
+    // anchor's own `close`).
+    let mut book = *book_view;
+    book.set_lamports(book_lamports - amount);
+    let mut keeper = *keeper_view;
+    keeper.set_lamports(keeper_view.lamports() + amount);
+    Ok(())
+}

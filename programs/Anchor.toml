@@ -1,0 +1,16 @@
+[toolchain]
+
+[programs.localnet]
+relay = "4D5tPhw9sqkdkR5CpmP427TH6y9p9AMuKUukUEHn3Mpu"
+demo_book = "6PqZZeykcFwncPxs5LjjxzQshdRV29mpsFtmT3QS9jRZ"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "Localnet"
+wallet = "~/.config/solana/id.json"
+
+# Tests are Rust litesvm (`cargo test` in this workspace), not ts-mocha.
+[scripts]
+test = "cargo test"

@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["spec", "crank-turner"]
+
+# The on-chain programs live in a SEPARATE workspace at `programs/` (anchor-v2
+# alpha + SBF toolchain, own lockfile + target dir) so its dependency tree
+# never unifies with the client tree here. `spec/` is a member of BOTH sides'
+# dependency graphs by design — it is zero-dep, so it cannot drag either tree
+# into the other.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/noahprince22/relay"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
