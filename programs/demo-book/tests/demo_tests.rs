@@ -11,11 +11,12 @@ use demo_book::anchor_lang_v2::solana_program::instruction::{AccountMeta, Instru
 use demo_book::anchor_lang_v2::Discriminator;
 use demo_book::state::{
     BookV0, BOOK_ACCOUNT_LEN, CONDITIONS_OFFSET, ENTRY_COUNT_OFFSET, EVICT_CONDITION,
-    SWEEP_CONDITION,
+    STAGING_OFFSET, SWEEP_CONDITION,
 };
 use demo_book::{accounts, instruction, AddEntryArgsV0, InitializeBookArgsV0, SetPaymentArgsV0};
 use litesvm::types::{FailedTransactionMetadata, TransactionMetadata};
 use relay_spec as spec;
+use solana_account::ReadableAccount;
 use solana_clock::Clock;
 use solana_pubkey::Pubkey;
 
@@ -172,9 +173,10 @@ fn sweep_wake_ts(conditions: &[spec::ConditionV0]) -> i64 {
     }
 }
 
-/// Run a resolver as a transaction and parse its return data — what a
-/// turner does via simulation.
-fn resolve(ctx: &mut Ctx, condition_index: u8) -> spec::ResolvedCrankV0 {
+/// Simulate a resolver and read its staged payload back out of the
+/// simulation post-execution account state — exactly what a turner does.
+/// Returns `None` when the resolver reports no work.
+fn resolve(ctx: &mut Ctx, condition_index: u8) -> Option<spec::ResolvedCrankV0> {
     let conditions = read_conditions(ctx);
     let condition = &conditions[condition_index as usize];
     assert_eq!(condition.resolver_program, demo_id().to_bytes());
@@ -192,8 +194,41 @@ fn resolve(ctx: &mut Ctx, condition_index: u8) -> spec::ResolvedCrankV0 {
         accounts: metas,
         data: condition.resolver_disc.to_vec(),
     };
-    let meta = send(ctx, ix).unwrap();
-    spec::ResolvedCrankV0::read(&meta.return_data.data).unwrap()
+    ctx.svm.expire_blockhash();
+    let blockhash = ctx.svm.latest_blockhash();
+    let msg = Message::new_with_blockhash(
+        std::slice::from_ref(&ix),
+        Some(&ctx.payer.pubkey()),
+        &blockhash,
+    );
+    let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(msg), &[&ctx.payer]).unwrap();
+    let info = ctx
+        .svm
+        .simulate_transaction(tx)
+        .expect("resolver simulates");
+
+    let pointer = spec::ResponsePointerV0::read(&info.meta.return_data.data).unwrap();
+    if !pointer.has_work() {
+        return None;
+    }
+    // The staged bytes live in post-simulation state, never on chain.
+    let staged = info
+        .post_accounts
+        .iter()
+        .find(|(address, _)| {
+            address.to_bytes()
+                == condition.resolver_accounts()[pointer.account_index as usize].address
+        })
+        .map(|(_, account)| account.data().to_vec())
+        .expect("staging account returned by simulation");
+    let start = pointer.offset() as usize;
+    let end = start + pointer.len() as usize;
+    Some(spec::ResolvedCrankV0::read(&staged[start..end]).unwrap())
+}
+
+/// First bytes of the staging region as committed on chain.
+fn staging_bytes_on_chain(ctx: &Ctx) -> Vec<u8> {
+    ctx.svm.get_account(&ctx.book).unwrap().data[STAGING_OFFSET..STAGING_OFFSET + 64].to_vec()
 }
 
 /// Build the executor account metas from a resolver's output, substituting
@@ -295,7 +330,7 @@ fn init_writes_valid_condition_block() {
     let evict = &conditions[EVICT_CONDITION as usize];
     assert!(evict.is_active());
     match evict.wake().unwrap() {
-        spec::WakeView::OnAccountDirty {
+        spec::WakeView::OnAccountChange {
             address,
             offset,
             len,
@@ -304,7 +339,7 @@ fn init_writes_valid_condition_block() {
             assert_eq!(offset as usize, ENTRY_COUNT_OFFSET);
             assert_eq!(len, 4);
         }
-        other => panic!("evict wake should be OnAccountDirty, got {other:?}"),
+        other => panic!("evict wake should be OnAccountChange, got {other:?}"),
     }
     assert_eq!(
         &evict.executor_disc[..],
@@ -336,9 +371,7 @@ fn resolve_sweep_no_work_when_nothing_expired() {
     let mut ctx = setup();
     let t = now(&ctx);
     add_entry(&mut ctx, t + 1000);
-    let resolved = resolve(&mut ctx, SWEEP_CONDITION);
-    assert!(!resolved.work);
-    assert!(resolved.accounts.is_empty());
+    assert!(resolve(&mut ctx, SWEEP_CONDITION).is_none());
 }
 
 #[test]
@@ -350,8 +383,7 @@ fn sweep_via_resolver_roundtrip() {
     add_entry(&mut ctx, t + 9000); // id 3 — stays
 
     warp_to(&mut ctx, t + 300);
-    let resolved = resolve(&mut ctx, SWEEP_CONDITION);
-    assert!(resolved.work);
+    let resolved = resolve(&mut ctx, SWEEP_CONDITION).expect("work");
 
     let before = keeper_balance(&ctx);
     let ix = executor_ix(&ctx, SWEEP_CONDITION, &resolved);
@@ -361,8 +393,10 @@ fn sweep_via_resolver_roundtrip() {
     // Entries 1 and 2 gone; hint repaired to the true minimum (t + 9000 —
     // not stuck at the swept t + 100).
     assert_eq!(sweep_wake_ts(&read_conditions(&ctx)), t + 9000);
-    let resolved = resolve(&mut ctx, SWEEP_CONDITION);
-    assert!(!resolved.work, "backlog should be drained");
+    assert!(
+        resolve(&mut ctx, SWEEP_CONDITION).is_none(),
+        "backlog should be drained"
+    );
 }
 
 #[test]
@@ -376,7 +410,6 @@ fn sweep_rejects_bad_ids() {
         &ctx,
         SWEEP_CONDITION,
         &spec::ResolvedCrankV0 {
-            work: true,
             accounts: demo_book::state::BookV0::executor_accounts(&addr(ctx.book)),
             data: sweep_args_wire(&[1]),
         },
@@ -390,7 +423,6 @@ fn sweep_rejects_bad_ids() {
         &ctx,
         SWEEP_CONDITION,
         &spec::ResolvedCrankV0 {
-            work: true,
             accounts: BookV0::executor_accounts(&addr(ctx.book)),
             data: sweep_args_wire(&[42]),
         },
@@ -403,7 +435,6 @@ fn sweep_rejects_bad_ids() {
         &ctx,
         SWEEP_CONDITION,
         &spec::ResolvedCrankV0 {
-            work: true,
             accounts: BookV0::executor_accounts(&addr(ctx.book)),
             data: sweep_args_wire(&[]),
         },
@@ -442,8 +473,7 @@ fn cancel_leaves_hint_early_and_sweep_noops() {
     // Past the stale hint the resolver says no-work — the turner's
     // simulation filters the wake, no transaction lands.
     warp_to(&mut ctx, t + 200);
-    let resolved = resolve(&mut ctx, SWEEP_CONDITION);
-    assert!(!resolved.work);
+    assert!(resolve(&mut ctx, SWEEP_CONDITION).is_none());
 }
 
 // --- crank_v0 wrapper ---
@@ -455,8 +485,7 @@ fn crank_v0_happy_path() {
     add_entry(&mut ctx, t + 100);
     warp_to(&mut ctx, t + 200);
 
-    let resolved = resolve(&mut ctx, SWEEP_CONDITION);
-    assert!(resolved.work);
+    let resolved = resolve(&mut ctx, SWEEP_CONDITION).expect("work");
 
     let before = keeper_balance(&ctx);
     let ix = crank_ix(&ctx, SWEEP_CONDITION, &resolved);
@@ -484,7 +513,7 @@ fn crank_v0_rejects_underpayment() {
     });
     send(&mut ctx, ix).unwrap();
 
-    let resolved = resolve(&mut ctx, SWEEP_CONDITION);
+    let resolved = resolve(&mut ctx, SWEEP_CONDITION).expect("work");
     let ix = crank_ix(&ctx, SWEEP_CONDITION, &resolved);
     let failed = send(&mut ctx, ix).unwrap_err();
     assert_eq!(
@@ -508,7 +537,7 @@ fn crank_v0_rejects_inactive_condition() {
     let t = now(&ctx);
     add_entry(&mut ctx, t + 100);
     warp_to(&mut ctx, t + 200);
-    let resolved = resolve(&mut ctx, SWEEP_CONDITION);
+    let resolved = resolve(&mut ctx, SWEEP_CONDITION).expect("work");
 
     let mut conditions = read_conditions(&ctx);
     conditions[SWEEP_CONDITION as usize].active = 0;
@@ -525,7 +554,7 @@ fn crank_v0_rejects_executor_program_mismatch() {
     let t = now(&ctx);
     add_entry(&mut ctx, t + 100);
     warp_to(&mut ctx, t + 200);
-    let resolved = resolve(&mut ctx, SWEEP_CONDITION);
+    let resolved = resolve(&mut ctx, SWEEP_CONDITION).expect("work");
 
     // Pass relay itself as executor_program; the block says demo-book.
     let mut ix = crank_ix(&ctx, SWEEP_CONDITION, &resolved);
@@ -540,7 +569,7 @@ fn crank_v0_rejects_self_reentry() {
     let t = now(&ctx);
     add_entry(&mut ctx, t + 100);
     warp_to(&mut ctx, t + 200);
-    let resolved = resolve(&mut ctx, SWEEP_CONDITION);
+    let resolved = resolve(&mut ctx, SWEEP_CONDITION).expect("work");
 
     // Craft a block whose executor is relay itself.
     let mut conditions = read_conditions(&ctx);
@@ -559,7 +588,7 @@ fn crank_v0_rejects_garbage_offset_and_bad_indices() {
     let t = now(&ctx);
     add_entry(&mut ctx, t + 100);
     warp_to(&mut ctx, t + 200);
-    let resolved = resolve(&mut ctx, SWEEP_CONDITION);
+    let resolved = resolve(&mut ctx, SWEEP_CONDITION).expect("work");
 
     // Offset pointing at entry data, not the block.
     let mut ix = crank_ix(&ctx, SWEEP_CONDITION, &resolved);
@@ -581,7 +610,7 @@ fn crank_v0_rejects_garbage_offset_and_bad_indices() {
     assert_eq!(custom_error_code(&failed), Some(6005)); // KeeperIndexOutOfBounds
 }
 
-// --- evict: dirty condition ---
+// --- evict: change condition ---
 
 #[test]
 fn evict_flow() {
@@ -591,14 +620,12 @@ fn evict_flow() {
     // Below threshold: resolver reports no work, direct evict fails.
     add_entry(&mut ctx, t + 100); // id 1 (oldest)
     add_entry(&mut ctx, t + 200); // id 2
-    let resolved = resolve(&mut ctx, EVICT_CONDITION);
-    assert!(!resolved.work);
+    assert!(resolve(&mut ctx, EVICT_CONDITION).is_none());
 
     let ix = executor_ix(
         &ctx,
         EVICT_CONDITION,
         &spec::ResolvedCrankV0 {
-            work: true,
             accounts: BookV0::executor_accounts(&addr(ctx.book)),
             data: 1u64.to_le_bytes().to_vec(),
         },
@@ -608,8 +635,7 @@ fn evict_flow() {
 
     // At threshold: resolver picks the oldest entry; crank it wrapped.
     add_entry(&mut ctx, t + 300); // id 3 — entry_count hits EVICT_THRESHOLD
-    let resolved = resolve(&mut ctx, EVICT_CONDITION);
-    assert!(resolved.work);
+    let resolved = resolve(&mut ctx, EVICT_CONDITION).expect("work");
     assert_eq!(&resolved.data, &1u64.to_le_bytes()); // victim = oldest id
 
     let before = keeper_balance(&ctx);
@@ -618,8 +644,7 @@ fn evict_flow() {
     assert_eq!(keeper_balance(&ctx), before + PAYMENT);
 
     // Back below threshold.
-    let resolved = resolve(&mut ctx, EVICT_CONDITION);
-    assert!(!resolved.work);
+    assert!(resolve(&mut ctx, EVICT_CONDITION).is_none());
 }
 
 // --- treasury floor ---
@@ -631,8 +656,66 @@ fn sweep_fails_when_book_cannot_pay() {
     add_entry(&mut ctx, t + 100);
     warp_to(&mut ctx, t + 200);
 
-    let resolved = resolve(&mut ctx, SWEEP_CONDITION);
+    let resolved = resolve(&mut ctx, SWEEP_CONDITION).expect("work");
     let ix = executor_ix(&ctx, SWEEP_CONDITION, &resolved);
     let failed = send(&mut ctx, ix).unwrap_err();
     assert_eq!(custom_error_code(&failed), Some(6005)); // InsufficientTreasury
+}
+
+// --- staging ---
+
+/// The whole point of staging over return data: the payload can exceed the
+/// 1024-byte return-data cap, while what actually rides return data is a
+/// 10-byte pointer.
+#[test]
+fn staged_payload_can_exceed_return_data_cap() {
+    let mut ctx = setup();
+    let t = now(&ctx);
+    // A full sweep batch: 8 ids plus the executor account list.
+    (0..demo_book::state::MAX_SWEEP_IDS).for_each(|i| add_entry(&mut ctx, t + i as i64));
+    warp_to(&mut ctx, t + 1000);
+
+    let resolved = resolve(&mut ctx, SWEEP_CONDITION).expect("work");
+    assert_eq!(resolved.data.len(), 4 + 8 * demo_book::state::MAX_SWEEP_IDS);
+    assert_eq!(
+        spec::ResponsePointerV0::new(0, 0, 0).to_bytes().len(),
+        spec::RESPONSE_POINTER_LEN,
+        "the pointer stays tiny no matter how large the payload is"
+    );
+
+    // And the batch actually cranks.
+    let before = keeper_balance(&ctx);
+    let ix = crank_ix(&ctx, SWEEP_CONDITION, &resolved);
+    send(&mut ctx, ix).unwrap();
+    assert_eq!(keeper_balance(&ctx), before + PAYMENT);
+    assert_eq!(entry_count(&ctx), 0);
+}
+
+/// Resolvers are only ever simulated, so their staging writes must never
+/// reach chain state.
+#[test]
+fn staging_write_never_lands_on_chain() {
+    let mut ctx = setup();
+    let t = now(&ctx);
+    add_entry(&mut ctx, t + 100);
+    warp_to(&mut ctx, t + 200);
+
+    let before = staging_bytes_on_chain(&ctx);
+    assert!(before.iter().all(|b| *b == 0), "staging starts zeroed");
+    let resolved = resolve(&mut ctx, SWEEP_CONDITION).expect("work");
+    assert!(!resolved.accounts.is_empty());
+    assert_eq!(
+        staging_bytes_on_chain(&ctx),
+        before,
+        "simulation must not mutate committed state"
+    );
+}
+
+fn entry_count(ctx: &Ctx) -> u32 {
+    let data = ctx.svm.get_account(&ctx.book).unwrap().data;
+    u32::from_le_bytes(
+        data[ENTRY_COUNT_OFFSET..ENTRY_COUNT_OFFSET + 4]
+            .try_into()
+            .unwrap(),
+    )
 }

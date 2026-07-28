@@ -1,12 +1,27 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::Parser;
-use relay_crank_turner::{Outcome, RpcSource, Turner, TurnerConfig};
+use clap::{Parser, ValueEnum};
+use relay_crank_turner::{
+    derive_ws_url, feed_channel, spawn_grpc_feed, spawn_ws_feed, CachedSource, CachedSourceConfig,
+    ChainSource, GrpcFeedConfig, Outcome, RpcSource, Turner, TurnerConfig,
+};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::EncodableKey;
 use tracing::{info, warn};
+
+/// How the turner learns about account state. Simulation and submission
+/// always go over RPC regardless.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum Transport {
+    /// Poll RPC for every read (no extra infra).
+    Rpc,
+    /// `programSubscribe`/`accountSubscribe` over websocket.
+    Ws,
+    /// Yellowstone/geyser gRPC.
+    Grpc,
+}
 
 #[derive(Parser)]
 #[command(about = "relay crank turner: watch conditions, discover work via simulation, crank")]
@@ -16,6 +31,18 @@ struct Args {
     /// Path to the keeper keypair (fee payer + payment recipient).
     #[arg(long, env = "RELAY_KEEPER_KEYPAIR")]
     keypair: String,
+    #[arg(long, env = "RELAY_TRANSPORT", value_enum, default_value_t = Transport::Rpc)]
+    transport: Transport,
+    /// Websocket endpoint (ws transport). Defaults to `rpc_url` with the
+    /// scheme/port swapped, like the Solana CLI.
+    #[arg(long, env = "RELAY_WS_URL")]
+    ws_url: Option<String>,
+    /// Yellowstone gRPC endpoint (grpc transport).
+    #[arg(long, env = "RELAY_GRPC_ENDPOINT")]
+    grpc_endpoint: Option<String>,
+    /// Yellowstone auth token, if the provider requires one.
+    #[arg(long, env = "RELAY_GRPC_X_TOKEN")]
+    grpc_x_token: Option<String>,
     /// relay program id.
     #[arg(long, env = "RELAY_PROGRAM_ID", default_value_t = TurnerConfig::default().relay_program)]
     program_id: Pubkey,
@@ -28,6 +55,10 @@ struct Args {
     /// Re-scan the watch registry every N ticks.
     #[arg(long, env = "RELAY_REFRESH_TICKS", default_value_t = 30)]
     refresh_ticks: u64,
+    /// Refetch a subscription-cached account through RPC every N reads
+    /// (0 = never) — insurance against a silently dead subscription.
+    #[arg(long, env = "RELAY_REPOLL_EVERY", default_value_t = 32)]
+    repoll_every: u64,
 }
 
 #[tokio::main]
@@ -46,9 +77,51 @@ async fn main() -> Result<()> {
         min_crank_payment: args.min_crank_payment,
         ..TurnerConfig::default()
     };
-    let mut turner = Turner::new(RpcSource::new(args.rpc_url), keeper, config);
-    info!(keeper = %turner.keeper_pubkey(), program = %args.program_id, "starting");
+    let rpc = RpcSource::new(args.rpc_url.clone());
 
+    match args.transport {
+        Transport::Rpc => run(Turner::new(rpc, keeper, config), &args).await,
+        Transport::Ws => {
+            let ws_url = args
+                .ws_url
+                .clone()
+                .unwrap_or_else(|| derive_ws_url(&args.rpc_url));
+            let (sender, receiver) = feed_channel();
+            spawn_ws_feed(ws_url.clone(), args.program_id, sender);
+            info!(%ws_url, "websocket subscriptions enabled");
+            let source = CachedSource::new(rpc, receiver, cached_config(&args));
+            run(Turner::new(source, keeper, config), &args).await
+        }
+        Transport::Grpc => {
+            let endpoint = args
+                .grpc_endpoint
+                .clone()
+                .context("--grpc-endpoint is required for the grpc transport")?;
+            let (sender, receiver) = feed_channel();
+            spawn_grpc_feed(
+                GrpcFeedConfig {
+                    endpoint: endpoint.clone(),
+                    x_token: args.grpc_x_token.clone(),
+                },
+                args.program_id,
+                sender,
+            );
+            info!(%endpoint, "yellowstone gRPC subscriptions enabled");
+            let source = CachedSource::new(rpc, receiver, cached_config(&args));
+            run(Turner::new(source, keeper, config), &args).await
+        }
+    }
+}
+
+fn cached_config(args: &Args) -> CachedSourceConfig {
+    CachedSourceConfig {
+        relay_program: args.program_id,
+        repoll_every: args.repoll_every,
+    }
+}
+
+async fn run<S: ChainSource>(mut turner: Turner<S>, args: &Args) -> Result<()> {
+    info!(keeper = %turner.keeper_pubkey(), program = %args.program_id, "starting");
     let mut interval = tokio::time::interval(Duration::from_millis(args.tick_ms));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut ticks: u64 = 0;

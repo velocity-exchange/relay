@@ -20,7 +20,7 @@ pub struct EvictArgsV0 {
 /// Executor for the evict condition. Fails below the threshold, so it can
 /// never shrink a book that isn't at its soft cap. Does not repair the sweep
 /// hint (eviction can only push the true minimum later — stale-early is
-/// allowed); `entry_count` changing re-fires the dirty wake by itself.
+/// allowed); `entry_count` changing re-fires the change wake by itself.
 pub fn handle_evict_v0(ctx: &mut Context<EvictV0>, args: EvictArgsV0) -> Result<()> {
     {
         let book = &mut *ctx.accounts.book;

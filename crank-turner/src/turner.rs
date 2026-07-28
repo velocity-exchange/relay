@@ -1,7 +1,8 @@
-//! The condition loop: wake evaluation → resolver simulation → executor
-//! build → simulation → send. Deliberately a pull-style `tick()` state
-//! machine so tests (and alternative runtimes) drive it deterministically;
-//! `main.rs` wraps it in a timer.
+//! The condition loop: wake evaluation → resolver simulation → read the
+//! staged payload out of post-simulation account state → executor build →
+//! simulation → send. Deliberately a pull-style `tick()` state machine so
+//! tests (and alternative runtimes) drive it deterministically; `main.rs`
+//! wraps it in a timer.
 
 use std::collections::HashMap;
 
@@ -81,12 +82,13 @@ pub struct TurnerConfig {
     pub failure_backoff_slots: u64,
 }
 
+/// Default relay program id (`declare_id!` in `programs/relay`).
+pub const RELAY_PROGRAM_ID: &str = "4D5tPhw9sqkdkR5CpmP427TH6y9p9AMuKUukUEHn3Mpu";
+
 impl Default for TurnerConfig {
     fn default() -> Self {
         Self {
-            relay_program: "4D5tPhw9sqkdkR5CpmP427TH6y9p9AMuKUukUEHn3Mpu"
-                .parse()
-                .unwrap(),
+            relay_program: RELAY_PROGRAM_ID.parse().unwrap(),
             min_crank_payment: 0,
             no_work_backoff_slots: 8,
             failure_backoff_slots: 16,
@@ -96,9 +98,9 @@ impl Default for TurnerConfig {
 
 #[derive(Debug, Default)]
 struct CondState {
-    /// Last-seen bytes of a dirty-wake's watched range. `None` = never
-    /// evaluated (counts as dirty).
-    last_dirty: Option<Vec<u8>>,
+    /// Last-seen bytes of a change-wake's watched range. `None` = never
+    /// evaluated (counts as changed).
+    last_seen: Option<Vec<u8>>,
     /// Slot before which this condition is not re-evaluated.
     suppress_until: u64,
     /// Consecutive failures (drives exponential backoff).
@@ -174,21 +176,21 @@ impl<S: ChainSource> Turner<S> {
             })
             .collect();
 
-        // Dirty wakes may watch accounts other than the target; fetch those
-        // too (deduped, skipping ones already loaded).
-        let dirty_extras: Vec<Pubkey> = parsed
+        // Change wakes may watch accounts other than the target; fetch
+        // those too (deduped, skipping ones already loaded).
+        let watched_extras: Vec<Pubkey> = parsed
             .iter()
             .filter_map(|(_, conditions)| conditions.as_ref())
             .flat_map(|conditions| conditions.iter())
             .filter_map(|c| match c.wake() {
-                Ok(spec::WakeView::OnAccountDirty { address, .. }) => {
+                Ok(spec::WakeView::OnAccountChange { address, .. }) => {
                     let pk = Pubkey::from(address);
                     (!target_accounts.contains_key(&pk)).then_some(pk)
                 }
                 _ => None,
             })
             .collect();
-        let extra_accounts = self.load_map(&dirty_extras).await?;
+        let extra_accounts = self.load_map(&watched_extras).await?;
         let account_of = |pk: &Pubkey| -> Option<&Account> {
             target_accounts.get(pk).or_else(|| extra_accounts.get(pk))
         };
@@ -204,26 +206,22 @@ impl<S: ChainSource> Turner<S> {
             };
             for (index, condition) in conditions.iter().enumerate() {
                 let key: CondKey = (watch.target, watch.offset, index as u8);
-                // Dirty-wake current bytes, read before the mutable state
+                // Change-wake current bytes, read before the mutable state
                 // borrow inside evaluate_condition.
-                let dirty_now: Option<Vec<u8>> = match condition.wake() {
-                    Ok(spec::WakeView::OnAccountDirty {
+                let watched_now: Option<Vec<u8>> = match condition.wake() {
+                    Ok(spec::WakeView::OnAccountChange {
                         address,
                         offset,
                         len,
                     }) => Some(
                         account_of(&Pubkey::from(address))
-                            .map(|acc| {
-                                let start = (offset as usize).min(acc.data.len());
-                                let end = (offset as usize + len as usize).min(acc.data.len());
-                                acc.data[start..end].to_vec()
-                            })
+                            .map(|acc| slice_or_empty(&acc.data, offset, len))
                             .unwrap_or_default(),
                     ),
                     _ => None,
                 };
                 let outcome = self
-                    .evaluate_condition(key, condition, &clock, dirty_now)
+                    .evaluate_condition(key, condition, &clock, watched_now)
                     .await;
                 outcomes.push(outcome);
             }
@@ -236,7 +234,7 @@ impl<S: ChainSource> Turner<S> {
         key: CondKey,
         condition: &spec::ConditionV0,
         clock: &ClockSnapshot,
-        dirty_now: Option<Vec<u8>>,
+        watched_now: Option<Vec<u8>>,
     ) -> Outcome {
         if !condition.is_active() {
             return Outcome::Skipped(key, SkipReason::Inactive);
@@ -253,18 +251,19 @@ impl<S: ChainSource> Turner<S> {
         }
         let due = match wake {
             spec::WakeView::AtTimestamp { unix_ts } => unix_ts <= clock.unix_timestamp,
+            spec::WakeView::AtSlot { slot } => slot <= clock.slot,
             spec::WakeView::EverySlots { slots } => state
                 .last_fired
                 .is_none_or(|last| clock.slot >= last.saturating_add(slots)),
-            spec::WakeView::OnAccountDirty { .. } => {
-                state.last_dirty.as_deref() != dirty_now.as_deref()
+            spec::WakeView::OnAccountChange { .. } => {
+                state.last_seen.as_deref() != watched_now.as_deref()
             }
         };
         if !due {
             return Outcome::Skipped(key, SkipReason::NotDue);
         }
 
-        match self.crank(key, condition, clock, dirty_now).await {
+        match self.crank(key, condition, clock, watched_now).await {
             Ok(outcome) => outcome,
             Err(err) => {
                 self.record_failure(key, clock);
@@ -283,9 +282,15 @@ impl<S: ChainSource> Turner<S> {
         key: CondKey,
         condition: &spec::ConditionV0,
         clock: &ClockSnapshot,
-        dirty_now: Option<Vec<u8>>,
+        watched_now: Option<Vec<u8>>,
     ) -> Result<Outcome> {
-        // Simulate the resolver.
+        // Simulate the resolver, asking for its accounts back so the staged
+        // payload can be read out of post-execution state.
+        let resolver_accounts: Vec<Pubkey> = condition
+            .resolver_accounts()
+            .iter()
+            .map(|a| Pubkey::from(a.address))
+            .collect();
         let resolver_ix = Instruction {
             program_id: Pubkey::from(condition.resolver_program),
             accounts: condition
@@ -297,7 +302,9 @@ impl<S: ChainSource> Turner<S> {
         };
         let sim = {
             let tx = self.signed_tx(&[resolver_ix]).await?;
-            self.source.simulate_transaction(&tx).await?
+            self.source
+                .simulate_transaction(&tx, &resolver_accounts)
+                .await?
         };
         if let Some(err) = sim.err {
             self.record_failure(key, clock);
@@ -307,19 +314,20 @@ impl<S: ChainSource> Turner<S> {
                 error: err,
             });
         }
-        let resolved = parse_resolved(sim.return_data.as_deref().unwrap_or_default())
-            .context("resolver return data")?;
 
-        if !resolved.work {
+        let pointer = spec::ResponsePointerV0::read(sim.return_data.as_deref().unwrap_or_default())
+            .map_err(|e| anyhow::anyhow!("resolver return data: {e:?}"))?;
+        if !pointer.has_work() {
             // The wake was evaluated: settle its state so a stale-early hint
             // doesn't re-simulate every tick.
             let state = self.state.entry(key).or_default();
-            state.last_dirty = dirty_now;
+            state.last_seen = watched_now;
             state.last_fired = Some(clock.slot);
             state.suppress_until = clock.slot + self.config.no_work_backoff_slots;
             state.failures = 0;
             return Ok(Outcome::NoWork(key));
         }
+        let resolved = read_staged(&sim.accounts, &pointer).context("staged resolver payload")?;
 
         // Build the crank_v0-wrapped executor.
         let keeper = self.keeper.pubkey();
@@ -352,7 +360,7 @@ impl<S: ChainSource> Turner<S> {
         // Simulate, then fire. `crank_v0` asserts the keeper payment, so a
         // successful simulation is also the payment check.
         let tx = self.signed_tx(&[crank_ix]).await?;
-        let sim = self.source.simulate_transaction(&tx).await?;
+        let sim = self.source.simulate_transaction(&tx, &[]).await?;
         if let Some(err) = sim.err {
             self.record_failure(key, clock);
             return Ok(Outcome::Failed {
@@ -364,9 +372,9 @@ impl<S: ChainSource> Turner<S> {
         let signature = self.source.send_transaction(&tx).await?;
 
         let state = self.state.entry(key).or_default();
-        // The crank mutates watched state; force a fresh dirty evaluation
+        // The crank mutates watched state; force a fresh change evaluation
         // next tick rather than diffing against a pre-crank snapshot.
-        state.last_dirty = None;
+        state.last_seen = None;
         state.last_fired = Some(clock.slot);
         state.suppress_until = clock.slot + 1;
         state.failures = 0;
@@ -415,17 +423,40 @@ fn account_ref_meta(a: &spec::AccountRefV0) -> AccountMeta {
     }
 }
 
-/// Parse a resolver's return data. RPC transports strip trailing zero bytes
-/// from return data, so on truncation retry with a zero-extended buffer —
-/// safe because only zeros can have been stripped.
-fn parse_resolved(data: &[u8]) -> Result<spec::ResolvedCrankV0> {
-    spec::ResolvedCrankV0::read(data).or_else(|first_err| {
-        let padded: Vec<u8> = data
-            .iter()
-            .copied()
-            .chain(std::iter::repeat_n(0u8, 1024 + 16))
-            .collect();
-        spec::ResolvedCrankV0::read(&padded)
-            .map_err(|_| anyhow::anyhow!("unparseable resolver return data: {first_err:?}"))
-    })
+/// Clamped slice, so a hostile/garbled offset can't panic the turner.
+fn slice_or_empty(data: &[u8], offset: u32, len: u32) -> Vec<u8> {
+    let start = (offset as usize).min(data.len());
+    let end = (offset as usize)
+        .saturating_add(len as usize)
+        .min(data.len());
+    data[start..end].to_vec()
+}
+
+/// Read a resolver's staged payload out of post-simulation account state.
+fn read_staged(
+    accounts: &[Option<Account>],
+    pointer: &spec::ResponsePointerV0,
+) -> Result<spec::ResolvedCrankV0> {
+    let account = accounts
+        .get(pointer.account_index as usize)
+        .and_then(|maybe| maybe.as_ref())
+        .with_context(|| {
+            format!(
+                "simulation returned no account at index {} (staging account must be in the \
+                 resolver's account list)",
+                pointer.account_index
+            )
+        })?;
+    let start = pointer.offset() as usize;
+    let end = start
+        .checked_add(pointer.len() as usize)
+        .context("staging range overflows")?;
+    if end > account.data.len() {
+        anyhow::bail!(
+            "staging range {start}..{end} outside account data ({} bytes)",
+            account.data.len()
+        );
+    }
+    spec::ResolvedCrankV0::read(&account.data[start..end])
+        .map_err(|e| anyhow::anyhow!("unparseable staged payload: {e:?}"))
 }

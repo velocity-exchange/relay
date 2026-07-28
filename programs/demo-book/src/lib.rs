@@ -11,7 +11,7 @@
 //!   entries and returns the executor's account list + args;
 //!   `sweep_v0` frees them and pays the keeper from the book's own
 //!   lamports.
-//! - **Evict** ([`WakeV0::OnAccountDirty`] on `entry_count`): once the book
+//! - **Evict** ([`WakeV0::OnAccountChange`] on `entry_count`): once the book
 //!   holds at least `evict_threshold` entries, the oldest entry can be
 //!   evicted for a reward — the CLOB soft-cap pattern.
 //!
@@ -21,7 +21,7 @@
 //! no-ops).
 //!
 //! [`WakeV0::AtTimestamp`]: relay_spec::WakeV0::AtTimestamp
-//! [`WakeV0::OnAccountDirty`]: relay_spec::WakeV0::OnAccountDirty
+//! [`WakeV0::OnAccountChange`]: relay_spec::WakeV0::OnAccountChange
 
 use anchor_lang_v2::prelude::*;
 
@@ -60,7 +60,9 @@ pub mod demo_book {
         instructions::set_payment_v0::handle_set_payment_v0(ctx, args)
     }
 
-    pub fn resolve_sweep_v0(ctx: &mut Context<ResolveSweepV0>) -> Result<()> {
+    pub fn resolve_sweep_v0(
+        ctx: &mut Context<ResolveSweepV0>,
+    ) -> Result<[u8; relay_spec::RESPONSE_POINTER_LEN]> {
         instructions::resolve_sweep_v0::handle_resolve_sweep_v0(ctx)
     }
 
@@ -68,7 +70,9 @@ pub mod demo_book {
         instructions::sweep_v0::handle_sweep_v0(ctx, args)
     }
 
-    pub fn resolve_evict_v0(ctx: &mut Context<ResolveEvictV0>) -> Result<()> {
+    pub fn resolve_evict_v0(
+        ctx: &mut Context<ResolveEvictV0>,
+    ) -> Result<[u8; relay_spec::RESPONSE_POINTER_LEN]> {
         instructions::resolve_evict_v0::handle_resolve_evict_v0(ctx)
     }
 

@@ -1,15 +1,19 @@
-//! Chain access behind a trait so transports are pluggable. The production
-//! implementation is RPC polling; a geyser/websocket source implements the
-//! same trait with a local cache; tests use a litesvm-backed source.
+//! Chain access behind a trait so transports are pluggable. `RpcSource` is
+//! the reference implementation (polling); [`crate::cached::CachedSource`]
+//! wraps it with a subscription-fed cache for the websocket and gRPC paths;
+//! tests use a litesvm-backed source.
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use base64::Engine as _;
+use solana_account_decoder::{UiAccountData, UiAccountEncoding};
 use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_client::rpc_config::{
-    RpcAccountInfoConfig, RpcProgramAccountsConfig, RpcSimulateTransactionConfig,
-};
-use solana_client::rpc_filter::{Memcmp, RpcFilterType};
 use solana_commitment_config::CommitmentConfig;
+use solana_rpc_client_api::config::{
+    RpcAccountInfoConfig, RpcProgramAccountsConfig, RpcSendTransactionConfig,
+    RpcSimulateTransactionAccountsConfig, RpcSimulateTransactionConfig,
+};
+use solana_rpc_client_api::filter::{Memcmp, RpcFilterType};
 use solana_sdk::account::Account;
 use solana_sdk::clock::Clock;
 use solana_sdk::hash::Hash;
@@ -20,7 +24,7 @@ use solana_sdk::transaction::Transaction;
 
 /// Chain time, as the scheduler's single notion of "now" — always the
 /// on-chain clock, never wall time, so wakes can't fire early relative to
-/// what the executor's `Clock::get()` will see.
+/// what an executor's `Clock::get()` will see.
 #[derive(Debug, Clone, Copy)]
 pub struct ClockSnapshot {
     pub slot: u64,
@@ -28,12 +32,16 @@ pub struct ClockSnapshot {
 }
 
 /// Simulation result, reduced to what the turner decides on.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SimOutcome {
     /// None = simulation succeeded.
     pub err: Option<String>,
     pub logs: Vec<String>,
     pub return_data: Option<Vec<u8>>,
+    /// Post-execution state of the accounts the caller asked for, in the
+    /// order requested. This is how a resolver's staged payload gets read
+    /// without ever landing a transaction.
+    pub accounts: Vec<Option<Account>>,
 }
 
 #[async_trait]
@@ -48,7 +56,13 @@ pub trait ChainSource: Send + Sync {
 
     async fn latest_blockhash(&self) -> Result<Hash>;
 
-    async fn simulate_transaction(&self, tx: &Transaction) -> Result<SimOutcome>;
+    /// Simulate, returning post-execution data for `return_accounts` (in
+    /// order) alongside logs and return data.
+    async fn simulate_transaction(
+        &self,
+        tx: &Transaction,
+        return_accounts: &[Pubkey],
+    ) -> Result<SimOutcome>;
 
     async fn send_transaction(&self, tx: &Transaction) -> Result<Signature>;
 }
@@ -66,6 +80,24 @@ impl RpcSource {
             client: RpcClient::new_with_commitment(url, CommitmentConfig::processed()),
         }
     }
+}
+
+fn decode_ui_account(ui: solana_account_decoder::UiAccount) -> Option<Account> {
+    let data = match &ui.data {
+        UiAccountData::Binary(blob, UiAccountEncoding::Base64) => {
+            base64::engine::general_purpose::STANDARD
+                .decode(blob)
+                .ok()?
+        }
+        _ => ui.decode::<Account>().map(|a| a.data)?,
+    };
+    Some(Account {
+        lamports: ui.lamports,
+        data,
+        owner: ui.owner.parse().ok()?,
+        executable: ui.executable,
+        rent_epoch: ui.rent_epoch,
+    })
 }
 
 #[async_trait]
@@ -93,7 +125,7 @@ impl ChainSource for RpcSource {
                         )),
                     ]),
                     account_config: RpcAccountInfoConfig {
-                        encoding: Some(solana_client::rpc_config::UiAccountEncoding::Base64),
+                        encoding: Some(UiAccountEncoding::Base64),
                         ..Default::default()
                     },
                     ..Default::default()
@@ -123,7 +155,16 @@ impl ChainSource for RpcSource {
             .context("get_latest_blockhash")
     }
 
-    async fn simulate_transaction(&self, tx: &Transaction) -> Result<SimOutcome> {
+    async fn simulate_transaction(
+        &self,
+        tx: &Transaction,
+        return_accounts: &[Pubkey],
+    ) -> Result<SimOutcome> {
+        let accounts_config =
+            (!return_accounts.is_empty()).then(|| RpcSimulateTransactionAccountsConfig {
+                encoding: Some(UiAccountEncoding::Base64),
+                addresses: return_accounts.iter().map(|pk| pk.to_string()).collect(),
+            });
         let response = self
             .client
             .simulate_transaction_with_config(
@@ -132,6 +173,7 @@ impl ChainSource for RpcSource {
                     sig_verify: false,
                     replace_recent_blockhash: true,
                     commitment: Some(CommitmentConfig::processed()),
+                    accounts: accounts_config,
                     ..Default::default()
                 },
             )
@@ -141,7 +183,6 @@ impl ChainSource for RpcSource {
         let return_data = value
             .return_data
             .map(|rd| {
-                use base64::Engine as _;
                 base64::engine::general_purpose::STANDARD
                     .decode(rd.data.0)
                     .map_err(|e| anyhow!("bad return data base64: {e}"))
@@ -151,6 +192,12 @@ impl ChainSource for RpcSource {
             err: value.err.map(|e| e.to_string()),
             logs: value.logs.unwrap_or_default(),
             return_data,
+            accounts: value
+                .accounts
+                .unwrap_or_default()
+                .into_iter()
+                .map(|maybe| maybe.and_then(decode_ui_account))
+                .collect(),
         })
     }
 
@@ -160,7 +207,7 @@ impl ChainSource for RpcSource {
         self.client
             .send_transaction_with_config(
                 tx,
-                solana_client::rpc_config::RpcSendTransactionConfig {
+                RpcSendTransactionConfig {
                     skip_preflight: true,
                     ..Default::default()
                 },

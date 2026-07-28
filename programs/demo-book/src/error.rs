@@ -14,8 +14,8 @@ pub enum DemoError {
     BelowEvictThreshold,
     #[msg("Book cannot pay the keeper and stay rent-exempt")]
     InsufficientTreasury,
-    #[msg("Condition block does not fit the region")]
-    ConditionRegionOverflow,
+    #[msg("Resolver payload does not fit the staging region")]
+    StagingOverflow,
     #[msg("Signer does not match the book authority")]
     InvalidAuthority,
 }

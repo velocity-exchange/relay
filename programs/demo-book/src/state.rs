@@ -1,11 +1,12 @@
-//! Book state. Fixed-capacity parallel arrays plus the condition block
-//! embedded as **typed pod fields** — the whole point of the zero-copy spec:
-//! a wake update is a single field store (`self.conditions[SWEEP].wake_ts =
-//! new_min`), never a serialization pass.
+//! Book state. Fixed-capacity parallel arrays, the condition block embedded
+//! as **typed pod fields** (a wake update is a single field store —
+//! `self.conditions[SWEEP].wake_ts = new_min` — never a serialization
+//! pass), and a scratch region resolvers stage their payloads in.
 
 use anchor_lang_v2::prelude::*;
 use relay_spec::{
-    AccountRefV0, ConditionBlockHeaderV0, ConditionV0, CrankSpecV0, KEEPER_PLACEHOLDER,
+    AccountRefV0, ConditionBlockHeaderV0, ConditionV0, CrankSpecV0, ResolvedCrankV0,
+    ResponsePointerV0, KEEPER_PLACEHOLDER, RESPONSE_POINTER_LEN,
 };
 use static_assertions::const_assert_eq;
 
@@ -14,8 +15,15 @@ use crate::error::DemoError;
 pub const MAX_ENTRIES: usize = 32;
 pub const NUM_CONDITIONS: usize = 2;
 
-/// Sweep batch bound per crank, so executor account lists and args stay
-/// small. The wake re-fires until the backlog drains.
+/// Scratch bytes resolvers stage payloads in. Sized for the worst-case
+/// sweep batch with room to spare; the pointer's `len` says how much of it
+/// is meaningful. Only ever written during simulation, so this costs rent
+/// but never chain writes.
+pub const STAGING_BYTES: usize = 1024;
+
+/// Sweep batch bound per crank. Bounded by the transaction account budget
+/// (each swept entry could name its own owner in a real program), not by
+/// the staging region — the wake re-fires until the backlog drains.
 pub const MAX_SWEEP_IDS: usize = 8;
 
 #[account]
@@ -46,9 +54,11 @@ pub struct BookV0 {
     /// `conditions`, nothing between).
     pub cond_header: ConditionBlockHeaderV0,
     pub conditions: [ConditionV0; NUM_CONDITIONS],
+    /// Resolver staging region (see [`STAGING_BYTES`]).
+    pub staging: [u8; STAGING_BYTES],
 }
 
-const_assert_eq!(core::mem::size_of::<BookV0>(), 1184);
+const_assert_eq!(core::mem::size_of::<BookV0>(), 2208);
 
 /// Account-data offset of the condition block (what to register the watch
 /// at). 8-aligned, as the zero-copy read path requires.
@@ -59,8 +69,12 @@ const_assert_eq!(
     core::mem::offset_of!(BookV0, cond_header) + relay_spec::BLOCK_HEADER_LEN
 );
 
-/// Account-data offset of `entry_count` — the evict condition's dirty-watch
-/// range.
+/// Account-data offset of the staging region — the `offset` a resolver's
+/// [`ResponsePointerV0`] carries.
+pub const STAGING_OFFSET: usize = 8 + core::mem::offset_of!(BookV0, staging);
+
+/// Account-data offset of `entry_count` — the evict condition's
+/// change-watch range.
 pub const ENTRY_COUNT_OFFSET: usize = 8 + core::mem::offset_of!(BookV0, entry_count);
 
 pub const BOOK_ACCOUNT_LEN: usize = 8 + core::mem::size_of::<BookV0>();
@@ -69,6 +83,10 @@ pub const BOOK_ACCOUNT_LEN: usize = 8 + core::mem::size_of::<BookV0>();
 pub const SWEEP_CONDITION: u8 = 0;
 /// Evict condition index in the block.
 pub const EVICT_CONDITION: u8 = 1;
+
+/// The book is the only account either resolver takes, so a staged payload
+/// always points at resolver account 0.
+pub const STAGING_ACCOUNT_INDEX: u8 = 0;
 
 fn disc(d: &'static [u8]) -> [u8; 8] {
     d.try_into().expect("anchor discriminators are 8 bytes")
@@ -125,12 +143,26 @@ impl BookV0 {
             .min_by_key(|&(_, id)| id)
     }
 
+    /// Stage a resolver payload and return the pointer to it. The turner
+    /// reads `staging[..len]` out of the simulation's post-execution
+    /// account state.
+    pub fn stage(&mut self, resolved: &ResolvedCrankV0) -> Result<[u8; RESPONSE_POINTER_LEN]> {
+        let len = resolved
+            .write_into(&mut self.staging)
+            .map_err(|_| DemoError::StagingOverflow)?;
+        Ok(
+            ResponsePointerV0::new(STAGING_ACCOUNT_INDEX, STAGING_OFFSET as u32, len as u32)
+                .to_bytes(),
+        )
+    }
+
     /// One-time condition block initialization (wake inputs are updated in
     /// place afterwards, never by rewriting the block).
     pub fn init_conditions(&mut self, own_address: &Address) {
         let program: [u8; 32] = *crate::ID.as_array();
         let book: [u8; 32] = *own_address.as_array();
-        let resolver_accounts = [AccountRefV0::readonly(book)];
+        // Writable: resolvers stage their payload into the book itself.
+        let resolver_accounts = [AccountRefV0::writable(book)];
         self.cond_header = ConditionBlockHeaderV0::new(NUM_CONDITIONS as u8);
         self.conditions = [
             // SWEEP_CONDITION
@@ -146,7 +178,7 @@ impl BookV0 {
                 &resolver_accounts,
             ),
             // EVICT_CONDITION
-            ConditionV0::on_account_dirty(
+            ConditionV0::on_account_change(
                 book,
                 ENTRY_COUNT_OFFSET as u32,
                 4,

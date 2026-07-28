@@ -15,10 +15,12 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use litesvm::LiteSVM;
 use relay_crank_turner::{
-    ChainSource, ClockSnapshot, Outcome, SimOutcome, SkipReason, Stage, Turner, TurnerConfig,
+    feed_channel, AccountUpdate, CachedSource, CachedSourceConfig, ChainSource, ClockSnapshot,
+    Outcome, SimOutcome, SkipReason, Stage, Turner, TurnerConfig,
 };
 use relay_spec as spec;
 use sha2::{Digest, Sha256};
+use solana_account::ReadableAccount;
 use solana_sdk::account::Account;
 use solana_sdk::clock::Clock;
 use solana_sdk::hash::Hash;
@@ -38,10 +40,11 @@ const DEMO_SO: &str = concat!(
 );
 
 // Mirrors of demo-book layout constants, hand-pinned (see module docs).
-const BOOK_ACCOUNT_LEN: usize = 1192;
+const BOOK_ACCOUNT_LEN: usize = 2216;
 const CONDITIONS_OFFSET: u32 = 616;
 const ENTRY_COUNT_OFFSET: usize = 64;
 const NEXT_EXPIRY_OFFSET: usize = 56;
+const STAGING_OFFSET: usize = 1192;
 
 const PAYMENT: u64 = 50_000;
 const TREASURY: u64 = 1_000_000;
@@ -103,18 +106,43 @@ impl ChainSource for LiteSvmSource {
         Ok(svm.latest_blockhash())
     }
 
-    async fn simulate_transaction(&self, tx: &Transaction) -> Result<SimOutcome> {
+    async fn simulate_transaction(
+        &self,
+        tx: &Transaction,
+        return_accounts: &[Pubkey],
+    ) -> Result<SimOutcome> {
         let svm = self.svm.lock().unwrap();
         Ok(match svm.simulate_transaction(tx.clone()) {
-            Ok(info) => SimOutcome {
-                err: None,
-                logs: info.meta.logs,
-                return_data: Some(info.meta.return_data.data),
-            },
+            Ok(info) => {
+                // Post-execution state, in the order asked for — the RPC
+                // `accounts` config equivalent.
+                let accounts = return_accounts
+                    .iter()
+                    .map(|wanted| {
+                        info.post_accounts
+                            .iter()
+                            .find(|(address, _)| address.to_bytes() == wanted.to_bytes())
+                            .map(|(_, account)| Account {
+                                lamports: account.lamports(),
+                                data: account.data().to_vec(),
+                                owner: Pubkey::new_from_array(account.owner().to_bytes()),
+                                executable: account.executable(),
+                                rent_epoch: account.rent_epoch(),
+                            })
+                    })
+                    .collect();
+                SimOutcome {
+                    err: None,
+                    logs: info.meta.logs,
+                    return_data: Some(info.meta.return_data.data),
+                    accounts,
+                }
+            }
             Err(failed) => SimOutcome {
                 err: Some(format!("{:?}", failed.err)),
                 logs: failed.meta.logs,
                 return_data: Some(failed.meta.return_data.data),
+                accounts: Vec::new(),
             },
         })
     }
@@ -317,6 +345,26 @@ impl Harness {
         self.svm.lock().unwrap().get_balance(&keeper).unwrap()
     }
 
+    fn conditions(&self) -> Vec<spec::ConditionV0> {
+        spec::read_conditions_unaligned(&self.book_data(), CONDITIONS_OFFSET as usize).unwrap()
+    }
+
+    fn write_conditions(&mut self, conditions: &[spec::ConditionV0]) {
+        let mut svm = self.svm.lock().unwrap();
+        let mut account = svm.get_account(&self.book).unwrap();
+        spec::write_block(&mut account.data[CONDITIONS_OFFSET as usize..], conditions).unwrap();
+        svm.set_account(self.book, account).unwrap();
+    }
+
+    fn slot(&self) -> u64 {
+        let clock: Clock = self.svm.lock().unwrap().get_sysvar();
+        clock.slot
+    }
+
+    fn staging_bytes(&self) -> Vec<u8> {
+        self.book_data()[STAGING_OFFSET..STAGING_OFFSET + 64].to_vec()
+    }
+
     fn book_data(&self) -> Vec<u8> {
         self.svm
             .lock()
@@ -375,7 +423,7 @@ async fn sweep_end_to_end() {
     h.add_entry(t0 + 100); // id 1
     h.add_entry(t0 + 9000); // id 2
 
-    // Nothing due: sweep wake is t0+100; evict dirty-wake first-evaluates to
+    // Nothing due: sweep wake is t0+100; evict change-wake first-evaluates to
     // no-work. No transaction may land.
     let outcomes = h.tick().await;
     assert!(sent(&outcomes).is_empty(), "{outcomes:?}");
@@ -423,19 +471,19 @@ async fn stale_early_hint_resolves_to_no_work() {
 }
 
 #[tokio::test]
-async fn evict_fires_on_dirty_count() {
+async fn evict_fires_on_changed_count() {
     let mut h = setup(PAYMENT, 2, TurnerConfig::default());
     h.refresh().await;
     let t0 = h.t0;
     h.add_entry(t0 + 5000); // id 1 (oldest)
     h.add_entry(t0 + 6000); // id 2 — count hits the threshold
 
-    // First evaluation of the dirty wake sees work immediately.
+    // First evaluation of the change wake sees work immediately.
     let outcomes = h.tick().await;
     assert_eq!(sent(&outcomes).len(), 1, "{outcomes:?}");
     assert_eq!(h.entry_count(), 1);
 
-    // Count changed again (2 → 1): dirty re-fires, resolver reports
+    // Count changed again (2 → 1): change wake re-fires, resolver reports
     // below-threshold, nothing lands.
     h.warp(t0, 2);
     let outcomes = h.tick().await;
@@ -525,4 +573,182 @@ async fn garbage_watch_is_ignored() {
     );
     // The real watch still evaluates alongside the junk one.
     assert!(outcomes.len() > 1);
+}
+
+#[tokio::test]
+async fn turner_resolves_without_committing_staging() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    h.refresh().await;
+    let t0 = h.t0;
+    h.add_entry(t0 + 100);
+    h.cancel_entry(1); // stale-early hint: resolver will report no work
+
+    let staging_before = h.staging_bytes();
+    h.warp(t0 + 200, 2);
+    let outcomes = h.tick().await;
+    assert!(sent(&outcomes).is_empty(), "{outcomes:?}");
+    assert_eq!(
+        h.staging_bytes(),
+        staging_before,
+        "resolver simulation must not commit staging bytes"
+    );
+}
+
+/// A full sweep batch stages more than the executor could have carried in
+/// return data, and still cranks end to end.
+#[tokio::test]
+async fn turner_cranks_large_staged_batch() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    h.refresh().await;
+    let t0 = h.t0;
+    (0..8).for_each(|i| h.add_entry(t0 + 10 + i));
+
+    let before = h.keeper_balance();
+    h.warp(t0 + 1000, 2);
+    let outcomes = h.tick().await;
+    assert_eq!(sent(&outcomes).len(), 1, "{outcomes:?}");
+    assert!(h.keeper_balance() > before);
+    assert_eq!(h.entry_count(), 0, "whole batch swept in one crank");
+}
+
+// --- AtSlot wake ---
+
+/// The slot-denominated sibling of AtTimestamp: not due before the target
+/// slot, due at/after it. Crafted directly into the block (demo-book uses
+/// timestamps), which also exercises reading a wake kind the target program
+/// never writes itself.
+#[tokio::test]
+async fn at_slot_wake_fires_at_target_slot() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    h.refresh().await;
+    let t0 = h.t0;
+    h.add_entry(t0 - 10); // already expired: work exists whenever the wake fires
+
+    let target_slot = h.slot() + 50;
+    let mut conditions = h.conditions();
+    conditions[0].wake_kind = spec::WakeKind::AtSlot as u8;
+    conditions[0].wake_slot = target_slot;
+    conditions[0].wake_ts = 0;
+    h.write_conditions(&conditions);
+    assert_eq!(
+        h.conditions()[0].wake(),
+        Ok(spec::WakeView::AtSlot { slot: target_slot })
+    );
+
+    // Before the slot: not due, despite work being available.
+    let outcomes = h.tick().await;
+    assert!(sent(&outcomes).is_empty(), "{outcomes:?}");
+    assert!(
+        outcomes
+            .iter()
+            .any(|o| matches!(o, Outcome::Skipped((_, _, 0), SkipReason::NotDue))),
+        "{outcomes:?}"
+    );
+
+    // At the slot: fires.
+    h.warp(t0, 60);
+    let outcomes = h.tick().await;
+    assert_eq!(sent(&outcomes).len(), 1, "{outcomes:?}");
+    assert_eq!(h.entry_count(), 0);
+}
+
+// --- subscription cache (shared by the ws and gRPC transports) ---
+
+/// `CachedSource` serves reads from feed updates instead of the inner
+/// source, and publishes the interest set backends subscribe to.
+#[tokio::test]
+async fn cached_source_serves_feed_updates_and_publishes_interest() {
+    let h = setup(PAYMENT, 100, TurnerConfig::default());
+    let inner = LiteSvmSource {
+        svm: Arc::clone(&h.svm),
+        watch_keys: Arc::clone(&h.watch_keys),
+    };
+    let (sender, receiver) = feed_channel();
+    let cached = CachedSource::new(
+        inner,
+        receiver,
+        CachedSourceConfig {
+            relay_program: relay_id(),
+            repoll_every: 0, // never fall back: prove the cache is doing the work
+        },
+    );
+
+    // Cold read falls through to the inner source and seeds the cache; the
+    // pubkey shows up in the interest set a backend would subscribe to.
+    let first = cached.get_multiple_accounts(&[h.book]).await.unwrap();
+    assert!(first[0].is_some());
+    let interest = sender.interest.borrow().clone();
+    assert!(interest.contains(&h.book), "book should be watched");
+    assert!(
+        interest.contains(&solana_sdk::sysvar::clock::id()),
+        "clock rides the feed too"
+    );
+
+    // A pushed update wins over the cached snapshot.
+    let mut mutated = h.svm.lock().unwrap().get_account(&h.book).unwrap();
+    mutated.data[STAGING_OFFSET] = 0xEE;
+    sender
+        .updates
+        .send(AccountUpdate {
+            pubkey: h.book,
+            account: Some(mutated),
+            slot: 42,
+        })
+        .unwrap();
+    let served = cached.get_multiple_accounts(&[h.book]).await.unwrap();
+    assert_eq!(served[0].as_ref().unwrap().data[STAGING_OFFSET], 0xEE);
+
+    // Older-slot updates are dropped rather than rewinding the cache.
+    let mut stale = served[0].clone().unwrap();
+    stale.data[STAGING_OFFSET] = 0x11;
+    sender
+        .updates
+        .send(AccountUpdate {
+            pubkey: h.book,
+            account: Some(stale),
+            slot: 41,
+        })
+        .unwrap();
+    let served = cached.get_multiple_accounts(&[h.book]).await.unwrap();
+    assert_eq!(
+        served[0].as_ref().unwrap().data[STAGING_OFFSET],
+        0xEE,
+        "stale-slot update must not overwrite newer state"
+    );
+}
+
+/// The turner drives identically through a subscription-fed cache — the
+/// transport swap is invisible above `ChainSource`.
+#[tokio::test]
+async fn turner_cranks_through_cached_source() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    let t0 = h.t0;
+    h.add_entry(t0 + 100);
+
+    let inner = LiteSvmSource {
+        svm: Arc::clone(&h.svm),
+        watch_keys: Arc::clone(&h.watch_keys),
+    };
+    let (_sender, receiver) = feed_channel();
+    let cached = CachedSource::new(
+        inner,
+        receiver,
+        CachedSourceConfig {
+            relay_program: relay_id(),
+            // No live backend in this test, so repoll every read keeps the
+            // cache honest against the inner source.
+            repoll_every: 1,
+        },
+    );
+    let mut turner = Turner::new(cached, Keypair::new(), TurnerConfig::default());
+    {
+        let mut svm = h.svm.lock().unwrap();
+        svm.airdrop(&turner.keeper_pubkey(), 1_000_000_000).unwrap();
+    }
+    assert_eq!(turner.refresh_watches().await.unwrap(), 1);
+
+    h.warp(t0 + 200, 2);
+    let outcomes = turner.tick().await.unwrap();
+    assert_eq!(sent(&outcomes).len(), 1, "{outcomes:?}");
+    assert_eq!(h.entry_count(), 0);
 }

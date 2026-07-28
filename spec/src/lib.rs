@@ -5,16 +5,26 @@
 //! offset in one of its accounts, and registers `(account, offset)` with the
 //! relay program as a `WatchV0`. A crank turner finds watches, reads the
 //! conditions, and for each due condition simulates the **resolver**
-//! instruction; the resolver returns a resolved-crank payload
-//! ([`ResolvedCrankV0`]) in return data naming the **executor**'s account
-//! list and args. The turner then submits the executor (usually wrapped in
-//! relay's `crank_v0`, which asserts the keeper got paid `min_payment`).
+//! instruction; the resolver stages a [`ResolvedCrankV0`] payload in one of
+//! its own writable accounts and returns a [`ResponsePointerV0`] locating
+//! it. The turner reads the staged bytes out of the simulation's
+//! post-execution account state, then submits the **executor** (usually
+//! wrapped in relay's `crank_v0`, which asserts the keeper got paid
+//! `min_payment`).
+//!
+//! **Why staging instead of raw return data:** return data is capped at
+//! 1024 bytes, which bounds how many accounts/args a resolver could name —
+//! exactly the wrong thing to bound, since batch cranks (sweep every
+//! expired order, each with its own owner) grow with the work. The pointer
+//! is 10 bytes; the payload can be as large as the staging region. The
+//! resolver is only ever *simulated*, so the staging write never lands on
+//! chain: no state bloat, no rent, and no write contention between
+//! competing turners.
 //!
 //! Everything on the evaluation path is **zero-copy pod**: fixed-size
 //! `#[repr(C)]` structs with natural alignment and no interior padding, so
 //! programs read conditions in place (`bytemuck::from_bytes`) and update a
-//! wake with a single field store — no serialization pass, no heap. The
-//! resolver return payload is align-1 (parses from any buffer).
+//! wake with a single field store — no serialization pass, no heap.
 //!
 //! Design notes live in the repo's DESIGN.md. Two properties matter here:
 //!
@@ -44,13 +54,14 @@ pub const MAGIC: [u8; 8] = *b"RELAY-V0";
 /// Current wire version.
 pub const SPEC_VERSION: u8 = 0;
 
-/// Sentinel address in a resolver's returned account list that the turner
+/// Sentinel address in a resolver's staged account list that the turner
 /// replaces with its keeper (payment recipient) before submitting.
 pub const KEEPER_PLACEHOLDER: [u8; 32] = *b"relay/keeper/placeholder\0\0\0\0\0\0\0\0";
 
-/// Fixed slots for a resolver's account list. Resolvers read the condition
-/// account (and little else) — their job is to *output* the executor's
-/// accounts, not to take many themselves.
+/// Fixed slots for a resolver's account list. A resolver reads the
+/// condition account and stages its payload there (or in a sibling
+/// scratch account) — its job is to *output* the executor's accounts, not
+/// to take many itself.
 pub const MAX_RESOLVER_ACCOUNTS: usize = 4;
 
 /// Anchor instruction discriminator of relay's `crank_v0`
@@ -80,7 +91,8 @@ pub enum SpecError {
     /// Block offset (or buffer base) is not 8-aligned — zero-copy reads
     /// require the block to start on an 8-byte boundary.
     Misaligned,
-    /// A count field exceeds its fixed capacity.
+    /// A count field exceeds its fixed capacity, or a payload exceeds the
+    /// region it must fit in.
     TooLarge,
     /// Account discriminator mismatch.
     BadDiscriminator,
@@ -168,9 +180,14 @@ pub enum WakeKind {
     /// Due when `wake_account.data[wake_offset..wake_offset + wake_len]`
     /// differs from the turner's last-seen copy. The watched account may be
     /// the condition account itself or any other (e.g. an oracle).
-    OnAccountDirty = 1,
-    /// Due every `wake_slots` slots — the fallback / pure-poll hint.
+    OnAccountChange = 1,
+    /// Due every `wake_slot` slots — the fallback / pure-poll hint.
     EverySlots = 2,
+    /// Due once the chain reaches slot `wake_slot` (absolute). The
+    /// slot-denominated sibling of [`WakeKind::AtTimestamp`], updated in
+    /// place the same way — for deadlines a program tracks in slots
+    /// (activation delays, auction ends) rather than wall time.
+    AtSlot = 3,
 }
 
 /// Copied, alloc-free view of a condition's wake for evaluation.
@@ -179,7 +196,7 @@ pub enum WakeView {
     AtTimestamp {
         unix_ts: i64,
     },
-    OnAccountDirty {
+    OnAccountChange {
         address: [u8; 32],
         offset: u32,
         len: u32,
@@ -187,10 +204,13 @@ pub enum WakeView {
     EverySlots {
         slots: u64,
     },
+    AtSlot {
+        slot: u64,
+    },
 }
 
 /// Everything about a condition except its wake — the arguments shared by
-/// all three constructors.
+/// all the constructors.
 #[derive(Debug, Clone, Copy)]
 pub struct CrankSpecV0 {
     pub resolver_program: [u8; 32],
@@ -214,22 +234,25 @@ pub struct ConditionV0 {
     pub min_payment: u64,
     /// [`WakeKind::AtTimestamp`] input.
     pub wake_ts: i64,
-    /// [`WakeKind::EverySlots`] input.
-    pub wake_slots: u64,
-    /// [`WakeKind::OnAccountDirty`] inputs.
+    /// [`WakeKind::EverySlots`] input (interval) or [`WakeKind::AtSlot`]
+    /// input (absolute slot) — selected by `wake_kind`.
+    pub wake_slot: u64,
+    /// [`WakeKind::OnAccountChange`] inputs.
     pub wake_account: [u8; 32],
     pub wake_offset: u32,
     pub wake_len: u32,
-    /// Read-only instruction the turner simulates to discover work. Must
-    /// write a resolved-crank payload to return data.
+    /// Instruction the turner simulates to discover work. Stages its
+    /// payload in one of `resolver_accounts` and returns a
+    /// [`ResponsePointerV0`].
     pub resolver_program: [u8; 32],
     pub resolver_disc: [u8; 8],
     /// Instruction that does the work and pays the keeper. Its account list
-    /// and trailing args come from the resolver's output.
+    /// and trailing args come from the resolver's staged payload.
     pub executor_program: [u8; 32],
     pub executor_disc: [u8; 8],
     /// The resolver's own (fixed) account list; first
-    /// `num_resolver_accounts` entries are live.
+    /// `num_resolver_accounts` entries are live. The staging account must
+    /// be among them and marked writable.
     pub resolver_accounts: [AccountRefV0; MAX_RESOLVER_ACCOUNTS],
     pub num_resolver_accounts: u8,
     /// A [`WakeKind`] value.
@@ -250,7 +273,7 @@ impl ConditionV0 {
         Self {
             min_payment: spec.min_payment,
             wake_ts: 0,
-            wake_slots: 0,
+            wake_slot: 0,
             wake_account: [0; 32],
             wake_offset: 0,
             wake_len: 0,
@@ -277,7 +300,7 @@ impl ConditionV0 {
         c
     }
 
-    pub fn on_account_dirty(
+    pub fn on_account_change(
         watched: [u8; 32],
         offset: u32,
         len: u32,
@@ -285,7 +308,7 @@ impl ConditionV0 {
         resolver_accounts: &[AccountRefV0],
     ) -> Self {
         let mut c = Self::base(spec, resolver_accounts);
-        c.wake_kind = WakeKind::OnAccountDirty as u8;
+        c.wake_kind = WakeKind::OnAccountChange as u8;
         c.wake_account = watched;
         c.wake_offset = offset;
         c.wake_len = len;
@@ -295,7 +318,14 @@ impl ConditionV0 {
     pub fn every_slots(slots: u64, spec: CrankSpecV0, resolver_accounts: &[AccountRefV0]) -> Self {
         let mut c = Self::base(spec, resolver_accounts);
         c.wake_kind = WakeKind::EverySlots as u8;
-        c.wake_slots = slots;
+        c.wake_slot = slots;
+        c
+    }
+
+    pub fn at_slot(slot: u64, spec: CrankSpecV0, resolver_accounts: &[AccountRefV0]) -> Self {
+        let mut c = Self::base(spec, resolver_accounts);
+        c.wake_kind = WakeKind::AtSlot as u8;
+        c.wake_slot = slot;
         c
     }
 
@@ -308,13 +338,16 @@ impl ConditionV0 {
             0 => Ok(WakeView::AtTimestamp {
                 unix_ts: self.wake_ts,
             }),
-            1 => Ok(WakeView::OnAccountDirty {
+            1 => Ok(WakeView::OnAccountChange {
                 address: self.wake_account,
                 offset: self.wake_offset,
                 len: self.wake_len,
             }),
             2 => Ok(WakeView::EverySlots {
-                slots: self.wake_slots,
+                slots: self.wake_slot,
+            }),
+            3 => Ok(WakeView::AtSlot {
+                slot: self.wake_slot,
             }),
             _ => Err(SpecError::BadWakeKind),
         }
@@ -419,14 +452,82 @@ pub fn read_conditions_unaligned(
 
 // --- resolver output ---
 
-/// What a resolver writes to return data, decoded. The wire is align-1
-/// (parses from any buffer):
-/// `[work: u8][num_accounts: u8][data_len: u16 LE][AccountRefV0; num][data bytes]`
+/// A resolver's return data: whether there is work, and where the payload
+/// was staged. Align-1 pod, 10 bytes — well inside the return-data cap no
+/// matter how large the payload is.
+///
+/// `account_index` indexes the condition's `resolver_accounts`; `offset`
+/// and `len` are a byte range in that account's **post-simulation** data.
+/// A no-work result needs no staging write at all.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
+pub struct ResponsePointerV0 {
+    /// 0 = nothing to do right now.
+    pub work: u8,
+    pub account_index: u8,
+    /// LE byte arrays: keeps the struct align-1 so it reads out of return
+    /// data (or any buffer) without alignment games.
+    pub offset: [u8; 4],
+    pub len: [u8; 4],
+}
+
+pub const RESPONSE_POINTER_LEN: usize = core::mem::size_of::<ResponsePointerV0>();
+const _: () = assert!(RESPONSE_POINTER_LEN == 10);
+const _: () = assert!(core::mem::align_of::<ResponsePointerV0>() == 1);
+
+impl ResponsePointerV0 {
+    pub fn no_work() -> Self {
+        Self::zeroed()
+    }
+
+    pub fn new(account_index: u8, offset: u32, len: u32) -> Self {
+        Self {
+            work: 1,
+            account_index,
+            offset: offset.to_le_bytes(),
+            len: len.to_le_bytes(),
+        }
+    }
+
+    pub fn has_work(&self) -> bool {
+        self.work != 0
+    }
+
+    pub fn offset(&self) -> u32 {
+        u32::from_le_bytes(self.offset)
+    }
+
+    pub fn len(&self) -> u32 {
+        u32::from_le_bytes(self.len)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn to_bytes(&self) -> [u8; RESPONSE_POINTER_LEN] {
+        let mut out = [0u8; RESPONSE_POINTER_LEN];
+        out.copy_from_slice(bytemuck::bytes_of(self));
+        out
+    }
+
+    /// Parse from return data. Trailing bytes are ignored; RPC transports
+    /// that strip trailing zeros are handled by zero-extending short input.
+    pub fn read(bytes: &[u8]) -> Result<Self, SpecError> {
+        if bytes.is_empty() {
+            return Err(SpecError::Truncated);
+        }
+        let mut buf = [0u8; RESPONSE_POINTER_LEN];
+        let n = bytes.len().min(RESPONSE_POINTER_LEN);
+        buf[..n].copy_from_slice(&bytes[..n]);
+        Ok(bytemuck::pod_read_unaligned(&buf))
+    }
+}
+
+/// The staged payload a [`ResponsePointerV0`] points at. Align-1 wire:
+/// `[num_accounts: u8][data_len: u16 LE][AccountRefV0; num][data bytes]`
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ResolvedCrankV0 {
-    /// False = nothing to do right now; the turner records the wake as
-    /// evaluated and moves on. No accounts/data expected.
-    pub work: bool,
     /// Full executor account list, in order. [`KEEPER_PLACEHOLDER`] entries
     /// are replaced with the turner's keeper.
     pub accounts: Vec<AccountRefV0>,
@@ -434,20 +535,20 @@ pub struct ResolvedCrankV0 {
     pub data: Vec<u8>,
 }
 
-pub const RESOLVED_HEADER_LEN: usize = 4;
+pub const RESOLVED_HEADER_LEN: usize = 3;
 
 impl ResolvedCrankV0 {
-    pub fn no_work() -> Self {
-        Self::default()
+    /// Bytes this payload needs when staged.
+    pub fn encoded_len(&self) -> usize {
+        RESOLVED_HEADER_LEN + self.accounts.len() * ACCOUNT_REF_LEN + self.data.len()
     }
 
     pub fn read(bytes: &[u8]) -> Result<Self, SpecError> {
         if bytes.len() < RESOLVED_HEADER_LEN {
             return Err(SpecError::Truncated);
         }
-        let work = bytes[0] != 0;
-        let n = bytes[1] as usize;
-        let data_len = u16::from_le_bytes([bytes[2], bytes[3]]) as usize;
+        let n = bytes[0] as usize;
+        let data_len = u16::from_le_bytes([bytes[1], bytes[2]]) as usize;
         let accounts_end = RESOLVED_HEADER_LEN + n * ACCOUNT_REF_LEN;
         let end = accounts_end + data_len;
         if end > bytes.len() {
@@ -460,42 +561,35 @@ impl ResolvedCrankV0 {
             })
             .collect();
         Ok(Self {
-            work,
             accounts,
             data: bytes[accounts_end..end].to_vec(),
         })
     }
 
-    /// Serialize into a caller-provided buffer (no alloc — resolvers write
-    /// into a stack array and `set_return_data` the used prefix). Returns
-    /// the used length.
-    pub fn write_into(&self, buf: &mut [u8]) -> Result<usize, SpecError> {
+    /// Stage into a program-owned region (no alloc). Returns the used
+    /// length, which becomes the pointer's `len`.
+    pub fn write_into(&self, region: &mut [u8]) -> Result<usize, SpecError> {
         if self.accounts.len() > u8::MAX as usize || self.data.len() > u16::MAX as usize {
             return Err(SpecError::TooLarge);
         }
         let accounts_end = RESOLVED_HEADER_LEN + self.accounts.len() * ACCOUNT_REF_LEN;
         let end = accounts_end + self.data.len();
-        if end > buf.len() {
+        if end > region.len() {
             return Err(SpecError::TooLarge);
         }
-        buf[0] = self.work as u8;
-        buf[1] = self.accounts.len() as u8;
-        buf[2..4].copy_from_slice(&(self.data.len() as u16).to_le_bytes());
+        region[0] = self.accounts.len() as u8;
+        region[1..3].copy_from_slice(&(self.data.len() as u16).to_le_bytes());
         self.accounts.iter().enumerate().for_each(|(i, a)| {
             let start = RESOLVED_HEADER_LEN + i * ACCOUNT_REF_LEN;
-            buf[start..start + ACCOUNT_REF_LEN].copy_from_slice(bytemuck::bytes_of(a));
+            region[start..start + ACCOUNT_REF_LEN].copy_from_slice(bytemuck::bytes_of(a));
         });
-        buf[accounts_end..end].copy_from_slice(&self.data);
+        region[accounts_end..end].copy_from_slice(&self.data);
         Ok(end)
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = alloc::vec![
-            0u8;
-            RESOLVED_HEADER_LEN + self.accounts.len() * ACCOUNT_REF_LEN + self.data.len()
-        ];
-        let n = self.write_into(&mut buf).expect("sized to fit");
-        buf.truncate(n);
+        let mut buf = alloc::vec![0u8; self.encoded_len()];
+        self.write_into(&mut buf).expect("sized to fit");
         buf
     }
 }
@@ -531,7 +625,7 @@ impl WatchV0 {
 /// `[CRANK_V0_DISCRIMINATOR][offset: u32][condition_index: u8][keeper_index: u8][data: Vec<u8>]`
 /// — the borsh wire of the program's `CrankArgsV0`. `keeper_index` is the
 /// position of the keeper (payment recipient) within the executor account
-/// list — i.e. where [`KEEPER_PLACEHOLDER`] sat in the resolver's output.
+/// list — i.e. where [`KEEPER_PLACEHOLDER`] sat in the staged payload.
 pub fn encode_crank_v0_data(
     offset: u32,
     condition_index: u8,
@@ -564,8 +658,8 @@ mod tests {
 
     fn sample_conditions() -> Vec<ConditionV0> {
         vec![
-            ConditionV0::at_timestamp(i64::MAX, spec(5000), &[AccountRefV0::readonly([2; 32])]),
-            ConditionV0::on_account_dirty(
+            ConditionV0::at_timestamp(i64::MAX, spec(5000), &[AccountRefV0::writable([2; 32])]),
+            ConditionV0::on_account_change(
                 [3; 32],
                 48,
                 4,
@@ -581,6 +675,7 @@ mod tests {
         assert_eq!(CONDITION_LEN, 280);
         assert_eq!(BLOCK_HEADER_LEN, 16);
         assert_eq!(ACCOUNT_REF_LEN, 33);
+        assert_eq!(RESPONSE_POINTER_LEN, 10);
         assert_eq!(block_space(2), 576);
     }
 
@@ -623,7 +718,7 @@ mod tests {
         );
         assert_eq!(
             conditions[1].wake(),
-            Ok(WakeView::OnAccountDirty {
+            Ok(WakeView::OnAccountChange {
                 address: [3; 32],
                 offset: 48,
                 len: 4
@@ -632,6 +727,10 @@ mod tests {
         assert_eq!(
             conditions[2].wake(),
             Ok(WakeView::EverySlots { slots: 300 })
+        );
+        assert_eq!(
+            ConditionV0::at_slot(500, spec(0), &[]).wake(),
+            Ok(WakeView::AtSlot { slot: 500 })
         );
         let mut bad = conditions[0];
         bad.wake_kind = 9;
@@ -644,15 +743,15 @@ mod tests {
             0,
             spec(0),
             &[
-                AccountRefV0::readonly([2; 32]),
-                AccountRefV0::writable([3; 32]),
+                AccountRefV0::writable([2; 32]),
+                AccountRefV0::readonly([3; 32]),
             ],
         );
         assert_eq!(
             c.resolver_accounts(),
             &[
-                AccountRefV0::readonly([2; 32]),
-                AccountRefV0::writable([3; 32]),
+                AccountRefV0::writable([2; 32]),
+                AccountRefV0::readonly([3; 32]),
             ]
         );
     }
@@ -692,39 +791,82 @@ mod tests {
     }
 
     #[test]
-    fn resolved_round_trip() {
+    fn pointer_round_trip() {
+        let pointer = ResponsePointerV0::new(1, 640, 77);
+        let parsed = ResponsePointerV0::read(&pointer.to_bytes()).unwrap();
+        assert_eq!(parsed, pointer);
+        assert!(parsed.has_work());
+        assert_eq!(parsed.account_index, 1);
+        assert_eq!(parsed.offset(), 640);
+        assert_eq!(parsed.len(), 77);
+
+        let none = ResponsePointerV0::no_work();
+        assert!(!ResponsePointerV0::read(&none.to_bytes())
+            .unwrap()
+            .has_work());
+    }
+
+    #[test]
+    fn pointer_tolerates_stripped_trailing_zeros() {
+        // RPC return data drops trailing zero bytes; a no-work pointer is
+        // all zeros and can arrive as a single byte (or the whole thing
+        // stripped down to one).
+        assert!(!ResponsePointerV0::read(&[0]).unwrap().has_work());
+        let pointer = ResponsePointerV0::new(0, 16, 3);
+        let full = pointer.to_bytes();
+        let trimmed = &full[..full.iter().rposition(|b| *b != 0).unwrap() + 1];
+        assert_eq!(ResponsePointerV0::read(trimmed).unwrap(), pointer);
+        assert_eq!(ResponsePointerV0::read(&[]), Err(SpecError::Truncated));
+    }
+
+    #[test]
+    fn staged_payload_round_trip() {
         let resolved = ResolvedCrankV0 {
-            work: true,
             accounts: vec![
                 AccountRefV0::writable(KEEPER_PLACEHOLDER),
                 AccountRefV0::writable([5; 32]),
             ],
             data: vec![1, 2, 3, 4],
         };
-        assert_eq!(
-            ResolvedCrankV0::read(&resolved.to_bytes()).unwrap(),
-            resolved
-        );
-
-        let none = ResolvedCrankV0::no_work();
-        let bytes = none.to_bytes();
-        assert_eq!(bytes.len(), RESOLVED_HEADER_LEN);
-        assert_eq!(ResolvedCrankV0::read(&bytes).unwrap(), none);
+        let bytes = resolved.to_bytes();
+        assert_eq!(bytes.len(), resolved.encoded_len());
+        assert_eq!(ResolvedCrankV0::read(&bytes).unwrap(), resolved);
     }
 
     #[test]
-    fn resolved_write_into_stack_buffer() {
+    fn staged_payload_write_into_region() {
         let resolved = ResolvedCrankV0 {
-            work: true,
             accounts: vec![AccountRefV0::writable(KEEPER_PLACEHOLDER)],
             data: vec![7; 10],
         };
-        let mut buf = [0u8; 128];
-        let n = resolved.write_into(&mut buf).unwrap();
-        assert_eq!(ResolvedCrankV0::read(&buf[..n]).unwrap(), resolved);
+        // A region much larger than the payload: only the used prefix is
+        // meaningful, and the pointer's `len` says how much.
+        let mut region = [0xAAu8; 512];
+        let n = resolved.write_into(&mut region).unwrap();
+        assert_eq!(ResolvedCrankV0::read(&region[..n]).unwrap(), resolved);
+        assert_eq!(region[n], 0xAA, "write must not clobber past len");
 
         let mut tiny = [0u8; 8];
         assert_eq!(resolved.write_into(&mut tiny), Err(SpecError::TooLarge));
+    }
+
+    /// The size argument for staging: a batch payload that would blow the
+    /// 1024-byte return-data cap stages fine.
+    #[test]
+    fn staged_payload_exceeds_return_data_cap() {
+        let resolved = ResolvedCrankV0 {
+            accounts: (0..40u8).map(|i| AccountRefV0::writable([i; 32])).collect(),
+            data: vec![9; 400],
+        };
+        assert!(resolved.encoded_len() > 1024);
+        let mut region = vec![0u8; 4096];
+        let n = resolved.write_into(&mut region).unwrap();
+        assert_eq!(ResolvedCrankV0::read(&region[..n]).unwrap(), resolved);
+        // ...while the thing that actually rides return data stays tiny.
+        assert_eq!(
+            ResponsePointerV0::new(0, 0, n as u32).to_bytes().len(),
+            RESPONSE_POINTER_LEN
+        );
     }
 
     #[test]
