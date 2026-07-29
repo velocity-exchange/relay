@@ -1920,7 +1920,7 @@ async fn untrusted_programs_run_with_a_separate_payout() {
 /// there is no way to make it emit a hostile list without adding a
 /// deliberately malicious second program.
 #[test]
-fn executor_naming_a_signer_is_detected() {
+fn naming_the_payee_is_fine_naming_a_signer_is_not() {
     let fee_payer = Pubkey::new_unique();
     let payout = Pubkey::new_unique();
     let book = Pubkey::new_unique();
@@ -1934,8 +1934,9 @@ fn executor_naming_a_signer_is_detected() {
         data: vec![],
     };
     assert!(
-        !relay_crank_turner::names_signer(&honest, &fee_payer),
-        "an honest executor never names the fee payer"
+        !relay_crank_turner::names_transaction_signer(&honest, &[fee_payer]),
+        "an executor naming the account it pays is expected and fine — a \
+         non-signing account can only be credited"
     );
 
     // The attack: the resolver slips the fee payer into the account list.
@@ -1954,7 +1955,10 @@ fn executor_naming_a_signer_is_detected() {
         ],
         data: vec![],
     };
-    assert!(relay_crank_turner::names_signer(&hostile, &fee_payer));
+    assert!(relay_crank_turner::names_transaction_signer(
+        &hostile,
+        &[fee_payer]
+    ));
 }
 
 /// Trusted programs skip the guards: the transaction is the executor
@@ -2067,6 +2071,16 @@ async fn signer_leak_gate_refuses_only_what_it_should() {
     assert_eq!(h.turner.signer_leak(&[naming_fee_payer(relay_id())]), None);
     // Allowed: a program the operator declared trusted.
     assert_eq!(h.turner.signer_leak(&[naming_fee_payer(demo_id())]), None);
-    // Allowed: nothing names the fee payer.
+    // Allowed: the executor names the payout, which is how it gets paid.
+    // The payout never signs, so it can only be credited.
     assert_eq!(h.turner.signer_leak(&[clean]), None);
+
+    // Allowed even when the untrusted program names the payout writable
+    // and nothing else — that is the normal, correct shape.
+    let paying = Instruction {
+        program_id: untrusted,
+        accounts: vec![AccountMeta::new(payout, false)],
+        data: vec![],
+    };
+    assert_eq!(h.turner.signer_leak(&[paying]), None);
 }

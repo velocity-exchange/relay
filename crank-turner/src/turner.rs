@@ -21,6 +21,7 @@ use relay_spec as spec;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_sdk::account::Account;
 use solana_sdk::instruction::{AccountMeta, Instruction};
+use solana_sdk::message::Message;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature};
 use solana_sdk::signer::Signer;
@@ -728,7 +729,8 @@ impl<S: ChainSource> Turner<S> {
         // Braces: an untrusted executor must not name any account that
         // signs this transaction, because signer status is
         // transaction-global — see `names_signer`.
-        if !self.trusts(&program) && names_signer(&executor_ix, &self.keeper.pubkey()) {
+        if !self.trusts(&program) && names_transaction_signer(&executor_ix, &[self.keeper.pubkey()])
+        {
             warn!(
                 %program,
                 "untrusted executor named the fee payer; refusing to submit"
@@ -1061,7 +1063,10 @@ impl<S: ChainSource> Turner<S> {
     /// and concatenated into packs after that point; putting the binding
     /// check here means no later transformation can reintroduce a leak.
     pub fn signer_leak(&self, ixs: &[Instruction]) -> Option<Pubkey> {
-        let fee_payer = self.keeper.pubkey();
+        // Compile to learn which accounts this transaction will actually
+        // present as signers, rather than assuming it is just the payer.
+        let message = Message::new(ixs, Some(&self.keeper.pubkey()));
+        let signers = &message.account_keys[..message.header.num_required_signatures as usize];
         ixs.iter()
             .filter(|ix| {
                 // Our own instructions legitimately take the fee payer:
@@ -1070,7 +1075,7 @@ impl<S: ChainSource> Turner<S> {
                     && ix.program_id != *COMPUTE_BUDGET_PROGRAM_ID
                     && !self.trusts(&ix.program_id)
             })
-            .find(|ix| names_signer(ix, &fee_payer))
+            .find(|ix| names_transaction_signer(ix, signers))
             .map(|ix| ix.program_id)
     }
 
@@ -1086,15 +1091,7 @@ impl<S: ChainSource> Turner<S> {
                  which signs this transaction"
             );
         }
-        let (tx, expiry) = self.signed_tx(ixs).await?;
-        // The leak check above compares against one key, which is only
-        // sufficient while the turner signs with exactly one.
-        debug_assert_eq!(
-            tx.signatures.len(),
-            1,
-            "signer_leak assumes a single-signer transaction"
-        );
-        Ok((tx, expiry))
+        self.signed_tx(ixs).await
     }
 
     /// Sign against the shared blockhash the submitter keeps refreshed,
@@ -1129,19 +1126,25 @@ impl<S: ChainSource> Turner<S> {
     }
 }
 
-/// Would this instruction hand an executor an account that signs the
-/// transaction?
+/// Does this instruction name any account from `signers`?
 ///
-/// Public because it is the whole safety argument for running untrusted
-/// executors, and worth asserting directly: signer status on Solana is
-/// transaction-global, so an account that signs the message is a signer
-/// inside *every* instruction of it, whatever the per-instruction
-/// `AccountMeta` says. An executor handed a signing account can CPI a
-/// System transfer and drain it. The turner therefore signs with exactly
-/// one key — its fee payer — and refuses to build any untrusted executor
-/// that names it.
-pub fn names_signer(ix: &Instruction, signer: &Pubkey) -> bool {
-    ix.accounts.iter().any(|meta| meta.pubkey == *signer)
+/// The distinction that matters: an executor **must** name the account it
+/// pays, and that is fine — a non-signing account can only be credited.
+/// What it must never name is an account that signs the transaction,
+/// because signer status on Solana is transaction-global. A compiled
+/// message has no per-instruction signer flag at all: `is_signer` is
+/// decided by an account's position in the message's signer section, so
+/// setting `AccountMeta { is_signer: false }` on an account that signs
+/// elsewhere in the transaction demotes nothing. The executor receives it
+/// as a signer and can CPI a System transfer to drain it.
+///
+/// So the rule is not "don't name the payee", it is "don't name a
+/// signer" — which, since the turner's only signer is its fee payer, is
+/// why payment goes to a separate non-signing payout account.
+pub fn names_transaction_signer(ix: &Instruction, signers: &[Pubkey]) -> bool {
+    ix.accounts
+        .iter()
+        .any(|meta| signers.contains(&meta.pubkey))
 }
 
 /// Executors must name the payout placeholder somewhere, or there is
