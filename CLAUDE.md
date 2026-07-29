@@ -16,7 +16,8 @@ Relay: generic condition-cranking for Solana programs — see [DESIGN.md](./DESI
 ./scripts/build-programs.sh          # SBF build both programs (cargo-build-sbf --tools-version v1.52)
 cd programs && cargo test            # program litesvm tests (need the SBF build first)
 cargo test                           # root workspace: spec + crank-turner (turner tests also need the SBF build)
-./scripts/e2e.sh                     # end-to-end on a real validator (needs solana-test-validator)
+./scripts/e2e.sh                     # end-to-end on a real validator (needs solana-test-validator);
+                                     # includes a scenario that spawns the shipped binary over websocket
 cargo fmt && cargo clippy            # run in BOTH workspaces before declaring work done
 ```
 

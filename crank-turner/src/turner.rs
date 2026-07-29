@@ -108,6 +108,17 @@ pub struct TurnerConfig {
     /// Base for exponential failure backoff (doubles per consecutive
     /// failure, capped at 2^6).
     pub failure_backoff_slots: u64,
+    /// Slots to hold a condition after submitting a crank for it.
+    ///
+    /// A submitted crank is not a confirmed one: for a slot or two the
+    /// chain still shows the old state, so the resolver still reports work
+    /// and the turner re-sends. The duplicate is harmless — identical
+    /// instructions over the same blockhash produce an identical
+    /// signature, which the cluster dedups — but it burns an RPC call per
+    /// tick until the first one lands. Keep this short enough that a
+    /// batched crank (a sweep that only clears part of its backlog) still
+    /// re-fires promptly.
+    pub sent_backoff_slots: u64,
     /// Where executors pay. **Must not be the fee payer**: signer status
     /// is transaction-global on Solana, so any account that signs the
     /// transaction is a signer inside every instruction of it — including
@@ -214,6 +225,7 @@ impl Default for TurnerConfig {
             min_crank_payment: 0,
             no_work_backoff_slots: 8,
             failure_backoff_slots: 16,
+            sent_backoff_slots: 2,
             payout: None,
             sync_native_payout: false,
             trusted_programs: HashSet::new(),
@@ -604,13 +616,14 @@ impl<S: ChainSource> Turner<S> {
                 state.failures = 0;
             }
             StateUpdate::Sent => {
+                let backoff = self.config.sent_backoff_slots;
                 let state = self.state.entry(key).or_default();
                 // The crank mutates watched state; force a fresh change
                 // evaluation next tick rather than diffing against a
                 // pre-crank snapshot.
                 state.last_seen = None;
                 state.last_fired = Some(clock.slot);
-                state.suppress_until = clock.slot + 1;
+                state.suppress_until = clock.slot + backoff;
                 state.failures = 0;
             }
             StateUpdate::Failed => {

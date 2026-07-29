@@ -32,6 +32,7 @@ use solana_commitment_config::CommitmentConfig;
 use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature, Signer};
+use solana_sdk::signer::EncodableKey;
 use solana_sdk::transaction::Transaction;
 
 const RPC_PORT: u16 = 8999;
@@ -632,4 +633,193 @@ async fn wrapped_sol_payout_is_paid_and_synced() {
         "fee payer should only have paid fees: {payer_before} -> {payer_after}"
     );
     drop(validator);
+}
+
+// --- the shipped binary, running as a daemon ---
+
+/// The real `relay-crank-turner` process, killed on drop.
+struct Daemon {
+    child: Child,
+    log: String,
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Daemon {
+    /// Spawn the binary the way an operator would: websocket transport,
+    /// its own timer, its own submitter, its own metrics server.
+    fn start(rpc_url: &str, keypair_path: &str, metrics_port: u16, log: String) -> Self {
+        let out = std::fs::File::create(&log).expect("log file");
+        let err = out.try_clone().expect("log file");
+        let child = Command::new(env!("CARGO_BIN_EXE_relay-crank-turner"))
+            .args([
+                "--rpc-url",
+                rpc_url,
+                // The validator serves pubsub on the RPC port + 1.
+                "--ws-url",
+                &format!("ws://127.0.0.1:{}", RPC_PORT + 1),
+                "--transport",
+                "ws",
+                "--keypair",
+                keypair_path,
+                "--program-id",
+                &relay_id().to_string(),
+                "--target-program",
+                &demo_id().to_string(),
+                "--trusted-program",
+                &demo_id().to_string(),
+                // Everything owned by demo-book is streamed, so local
+                // simulation runs off the subscription.
+                "--watch-program",
+                &demo_id().to_string(),
+                "--tick-ms",
+                "300",
+                "--refresh-ticks",
+                "3",
+                "--metrics-port",
+                &metrics_port.to_string(),
+            ])
+            .env("RUST_LOG", "info")
+            .stdout(Stdio::from(out))
+            .stderr(Stdio::from(err))
+            .spawn()
+            .expect("crank turner binary");
+        Self { child, log }
+    }
+
+    fn logs(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+}
+
+/// Scrape the daemon's own metrics endpoint.
+async fn scrape(port: u16) -> Option<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .ok()?;
+    socket
+        .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .ok()?;
+    let mut body = String::new();
+    socket.read_to_string(&mut body).await.ok()?;
+    Some(body)
+}
+
+/// The turner as it actually ships: a separate process, subscribed over
+/// websocket, running its own loop.
+///
+/// The other scenarios drive `tick()` by hand over RPC, which exercises
+/// the library but bypasses everything the binary adds — the timer, the
+/// subscription feed and its cache, the submitter, the metrics server, and
+/// CLI wiring. Here the test only creates a book and posts orders; if the
+/// cranks happen, the shipped daemon works.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs solana-test-validator; run scripts/e2e.sh"]
+async fn shipped_daemon_cranks_over_websocket() {
+    let validator = Validator::start().await;
+    let client = Client::new(validator.url()).await;
+
+    // The keeper the daemon will load from disk.
+    let keeper = Keypair::new();
+    client.fund(&keeper.pubkey(), 10_000_000_000).await;
+    let dir = std::env::temp_dir().join(format!("relay-daemon-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let keypair_path = dir.join("keeper.json").to_string_lossy().into_owned();
+    keeper
+        .write_to_file(&keypair_path)
+        .expect("write keeper keypair");
+
+    // Book and watch exist before the daemon starts, so its first
+    // registry scan finds them.
+    let book = client.create_book(6).await;
+    let metrics_port = 9977;
+    let daemon = Daemon::start(
+        &validator.url(),
+        &keypair_path,
+        metrics_port,
+        dir.join("turner.log").to_string_lossy().into_owned(),
+    );
+
+    // From here the test only acts as the order-posting bot. Nothing
+    // drives the turner.
+    let now = client.unix_timestamp().await;
+    let far = now + 3600;
+    client.post_quote(&book, now + 2, 100, SIDE_BID).await;
+    client.post_quote(&book, now + 2, 101, SIDE_BID).await;
+    client.post_quote(&book, far, 90, SIDE_BID).await;
+
+    let expired_swept = wait_for(Duration::from_secs(90), || async {
+        client.entry_count(&book).await == 1
+    })
+    .await;
+    assert!(
+        expired_swept,
+        "daemon never swept the expired quotes.\nlogs:\n{}",
+        daemon.logs()
+    );
+
+    // A crossing ask: proves the change-wake reached it over the
+    // subscription, not just the timestamp wake.
+    client.post_quote(&book, far, 1, SIDE_ASK).await;
+    let crossed = wait_for(Duration::from_secs(90), || async {
+        client.entry_count(&book).await == 0
+    })
+    .await;
+    assert!(
+        crossed,
+        "daemon never matched the cross.\nlogs:\n{}",
+        daemon.logs()
+    );
+
+    // Its own metrics endpoint confirms the daemon, not the test, did it.
+    // It really used the websocket path, rather than quietly falling back.
+    let logs = daemon.logs();
+    assert!(
+        logs.contains("websocket subscriptions enabled"),
+        "daemon did not enable websocket subscriptions:\n{logs}"
+    );
+
+    let metrics = scrape(metrics_port).await.unwrap_or_default();
+    // And served its reads from the subscription rather than polling.
+    assert!(
+        metrics.contains(r#"relay_cache_reads_total{coverage="covered"}"#),
+        "no covered cache reads, so the feed was not doing the work:\n{metrics}"
+    );
+    assert!(
+        metrics.contains("relay_cranks_total"),
+        "no metrics served on {metrics_port}; logs:\n{}",
+        daemon.logs()
+    );
+    assert!(
+        metrics
+            .lines()
+            .any(|line| line.starts_with("relay_cranks_total") && line.contains("sent")),
+        "metrics show no sent cranks:\n{metrics}"
+    );
+    drop(daemon);
+    drop(validator);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Poll a condition until it holds or the deadline passes.
+async fn wait_for<F, Fut>(timeout: Duration, mut check: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if check().await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    false
 }
