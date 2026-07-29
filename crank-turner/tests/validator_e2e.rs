@@ -206,6 +206,33 @@ impl Client {
             .unwrap_or_else(|err| panic!("transaction failed: {err}"));
     }
 
+    /// Put one already-expired quote on each of `books`, batched.
+    async fn post_expired_quotes(&self, books: &[Pubkey]) {
+        // Twelve per transaction: each contributes a 32-byte book key plus
+        // its instruction, and twenty overflows the packet limit.
+        const PER_TX: usize = 12;
+        let now = self.unix_timestamp().await;
+        for chunk in books.chunks(PER_TX) {
+            let ixs: Vec<Instruction> = chunk
+                .iter()
+                .map(|book| Instruction {
+                    program_id: demo_id(),
+                    accounts: vec![
+                        AccountMeta::new(*book, false),
+                        AccountMeta::new_readonly(self.payer.pubkey(), true),
+                    ],
+                    data: disc("add_entry_v0")
+                        .into_iter()
+                        .chain((now - 1).to_le_bytes())
+                        .chain(100u64.to_le_bytes())
+                        .chain([SIDE_BID])
+                        .collect(),
+                })
+                .collect();
+            self.send(&ixs, &[]).await;
+        }
+    }
+
     async fn account(&self, pubkey: &Pubkey) -> Vec<u8> {
         self.rpc.get_account(pubkey).await.unwrap().data
     }
@@ -1149,4 +1176,391 @@ async fn daemon_survives_losing_its_subscription() {
     drop(daemon);
     drop(validator);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- scale ---
+
+impl Client {
+    /// Create `count` books with watches, batching several per transaction
+    /// and sending batches concurrently — otherwise the setup dominates
+    /// the test.
+    async fn create_books(&self, count: usize, evict_threshold: u32) -> Vec<Pubkey> {
+        // Two books per transaction: three overflows the 1232-byte packet
+        // limit once every new account's signature is counted.
+        const PER_TX: usize = 2;
+        let book_rent = self
+            .rpc
+            .get_minimum_balance_for_rent_exemption(BOOK_ACCOUNT_LEN)
+            .await
+            .unwrap();
+        let watch_rent = self
+            .rpc
+            .get_minimum_balance_for_rent_exemption(WATCH_V0_LEN)
+            .await
+            .unwrap();
+
+        let batches: Vec<Vec<(Keypair, Keypair)>> = (0..count)
+            .map(|_| (Keypair::new(), Keypair::new()))
+            .collect::<Vec<_>>()
+            .chunks(PER_TX)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .map(|(b, w)| (b.insecure_clone(), w.insecure_clone()))
+                    .collect()
+            })
+            .collect();
+
+        let mut created = Vec::new();
+        let mut pending = Vec::new();
+        for batch in &batches {
+            let mut ixs = Vec::new();
+            for (book, watch) in batch {
+                ixs.push(solana_system_interface::instruction::create_account(
+                    &self.payer.pubkey(),
+                    &book.pubkey(),
+                    book_rent + 50_000_000,
+                    BOOK_ACCOUNT_LEN as u64,
+                    &demo_id(),
+                ));
+                ixs.push(Instruction {
+                    program_id: demo_id(),
+                    accounts: vec![
+                        AccountMeta::new_readonly(self.payer.pubkey(), true),
+                        AccountMeta::new(book.pubkey(), false),
+                    ],
+                    data: disc("initialize_book_v0")
+                        .into_iter()
+                        .chain(PAYMENT.to_le_bytes())
+                        .chain(evict_threshold.to_le_bytes())
+                        .collect(),
+                });
+                ixs.push(solana_system_interface::instruction::create_account(
+                    &self.payer.pubkey(),
+                    &watch.pubkey(),
+                    watch_rent,
+                    WATCH_V0_LEN as u64,
+                    &relay_id(),
+                ));
+                ixs.push(Instruction {
+                    program_id: relay_id(),
+                    accounts: vec![
+                        AccountMeta::new_readonly(self.payer.pubkey(), true),
+                        AccountMeta::new_readonly(book.pubkey(), false),
+                        AccountMeta::new(watch.pubkey(), false),
+                    ],
+                    data: disc("register_watch_v0")
+                        .into_iter()
+                        .chain(CONDITIONS_OFFSET.to_le_bytes())
+                        .collect(),
+                });
+                created.push(book.pubkey());
+            }
+            pending.push((ixs, batch));
+        }
+        // Send batches concurrently; sequential setup dominates the test.
+        let prepared: Vec<(Vec<Instruction>, Vec<&Keypair>)> = pending
+            .into_iter()
+            .map(|(ixs, batch)| (ixs, batch.iter().flat_map(|(b, w)| [b, w]).collect()))
+            .collect();
+        for group in prepared.chunks(8) {
+            futures_util::future::join_all(
+                group.iter().map(|(ixs, signers)| self.send(ixs, signers)),
+            )
+            .await;
+        }
+        created
+    }
+}
+
+/// Average seconds per tick, from the daemon's own histogram.
+/// Sum every sample of a labelled counter whose label set contains
+/// `contains`. Prometheus text format, one sample per line.
+fn counter_sum(metrics: &str, name: &str, contains: &str) -> u64 {
+    metrics
+        .lines()
+        .filter(|line| line.starts_with(name) && line.contains(contains))
+        .filter_map(|line| line.rsplit_once(' '))
+        .filter_map(|(_, value)| value.trim().parse::<f64>().ok())
+        .map(|value| value as u64)
+        .sum()
+}
+
+fn mean_tick_seconds(metrics: &str, phase: &str) -> Option<f64> {
+    let sum = metrics
+        .lines()
+        .find(|l| l.starts_with(&format!(r#"relay_tick_seconds_sum{{phase="{phase}"}}"#)))?
+        .rsplit(' ')
+        .next()?
+        .parse::<f64>()
+        .ok()?;
+    let count = metrics
+        .lines()
+        .find(|l| l.starts_with(&format!(r#"relay_tick_seconds_count{{phase="{phase}"}}"#)))?
+        .rsplit(' ')
+        .next()?
+        .parse::<f64>()
+        .ok()?;
+    (count > 0.0).then_some(sum / count)
+}
+
+/// A registry far larger than one `getMultipleAccounts` call, cranked by
+/// the shipped daemon.
+///
+/// The unchunked-read bug lived exactly here: everything worked at three
+/// books and broke at a hundred. This is the regression net for that whole
+/// class — anything that silently assumes a small registry.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs solana-test-validator; run scripts/e2e.sh"]
+async fn daemon_handles_a_registry_larger_than_one_rpc_call() {
+    const BOOKS: usize = 120;
+
+    let validator = Validator::start().await;
+    let client = Client::new(validator.url()).await;
+    let keeper = Keypair::new();
+    client.fund(&keeper.pubkey(), 20_000_000_000).await;
+    let dir = std::env::temp_dir().join(format!("relay-scale-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let keypair_path = dir.join("keeper.json").to_string_lossy().into_owned();
+    keeper.write_to_file(&keypair_path).expect("write keypair");
+
+    // Well past the 100-key ceiling on a single account read.
+    let books = client.create_books(BOOKS, 100).await;
+    assert_eq!(books.len(), BOOKS);
+
+    let metrics_port = 9979;
+    let daemon = Daemon::start(
+        &validator.url(),
+        &keypair_path,
+        metrics_port,
+        dir.join("turner.log").to_string_lossy().into_owned(),
+    );
+
+    // One already-expired quote on every book: BOOKS cranks to get through.
+    client.post_expired_quotes(&books).await;
+
+    let swept = wait_for(Duration::from_secs(180), || async {
+        let mut remaining = 0;
+        for book in books.iter() {
+            remaining += client.entry_count(book).await;
+            if remaining > 0 {
+                return false;
+            }
+        }
+        true
+    })
+    .await;
+    let metrics = scrape(metrics_port).await.unwrap_or_default();
+    assert!(
+        swept,
+        "not every book was swept.\nmetrics:\n{}\nlogs (tail):\n{}",
+        metrics
+            .lines()
+            .filter(|l| l.starts_with("relay_cranks") || l.starts_with("relay_crank_failures"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        daemon
+            .logs()
+            .lines()
+            .rev()
+            .take(20)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // Nothing should be failing at this scale, at either stage: a read
+    // that blew a limit shows up as a crank-stage failure, and a
+    // transaction that was built too large or went stale shows up as an
+    // on-chain one. With a single turner there is no contention to excuse
+    // either.
+    assert!(
+        !metrics
+            .lines()
+            .any(|l| l.starts_with("relay_crank_failures_total")),
+        "cranks failed at scale:\n{metrics}"
+    );
+    assert_eq!(
+        counter_sum(&metrics, "relay_transactions_total", "result=\"failed\""),
+        0,
+        "transactions failed on chain at scale:\n{metrics}"
+    );
+
+    // And a tick should still complete in a sane time with 120 watches
+    // and 360 conditions to evaluate.
+    let mean = mean_tick_seconds(&metrics, "total").unwrap_or(f64::MAX);
+    assert!(
+        mean < 10.0,
+        "mean tick took {mean:.2}s with {BOOKS} books; something is superlinear"
+    );
+    println!("scale: {BOOKS} books, mean tick {mean:.3}s");
+    drop(daemon);
+    drop(validator);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Two turners, one registry — the realistic keeper-fleet shape.
+///
+/// Nothing coordinates them: both see the same watches, both decide the
+/// same conditions are ready, and both race to land the same crank. Only
+/// one can win, because the executor's own state check fails once the work
+/// is done. The question this answers is what the loser does with that: a
+/// clean per-condition failure and a retry on the next tick is fine, but a
+/// turner that treats a lost race as a fatal error, or that backs off
+/// without bound, would stall a fleet.
+///
+/// Proven by a second round of work after the collisions: if either daemon
+/// had wedged, the round would not finish, and if both had wedged it would
+/// not finish at all.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs solana-test-validator; run scripts/e2e.sh"]
+async fn two_turners_share_one_registry_without_wedging() {
+    const BOOKS: usize = 24;
+
+    let validator = Validator::start().await;
+    let client = Client::new(validator.url()).await;
+    let dir = std::env::temp_dir().join(format!("relay-fleet-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let books = client.create_books(BOOKS, 100).await;
+
+    // Two independent keepers, each with its own keypair, submitter, and
+    // metrics endpoint — as separate as two hosts would be.
+    let ports = [9977u16, 9978];
+    let mut daemons = Vec::new();
+    for (i, port) in ports.iter().enumerate() {
+        let keeper = Keypair::new();
+        let path = dir.join(format!("keeper-{i}.json"));
+        keeper.write_to_file(&path).expect("write keypair");
+        // Funding has to land before the daemon starts, or its first ticks
+        // fail on an empty fee payer.
+        client.fund(&keeper.pubkey(), 10_000_000_000).await;
+        daemons.push(Daemon::start(
+            &validator.url(),
+            &path.to_string_lossy(),
+            *port,
+            dir.join(format!("turner-{port}.log"))
+                .to_string_lossy()
+                .into_owned(),
+        ));
+    }
+
+    // Round one: BOOKS cranks, two turners contending for every one.
+    client.post_expired_quotes(&books).await;
+    assert!(
+        wait_for(Duration::from_secs(120), || async {
+            all_books_swept(&client, &books).await
+        })
+        .await,
+        "round one never finished\n{}",
+        fleet_report(&ports, &daemons).await
+    );
+
+    // Both turners must be doing work, not one starving the other out.
+    let sent: Vec<u64> = futures_util::future::join_all(ports.iter().map(|port| async move {
+        counter_sum(
+            &scrape(*port).await.unwrap_or_default(),
+            "relay_cranks_total",
+            "outcome=\"sent\"",
+        )
+    }))
+    .await;
+    assert!(
+        sent.iter().all(|&n| n > 0),
+        "one turner landed nothing: {sent:?}\n{}",
+        fleet_report(&ports, &daemons).await
+    );
+
+    // Round two is the real assertion: whatever the collisions did to the
+    // losers, both are still turning.
+    client.post_expired_quotes(&books).await;
+    assert!(
+        wait_for(Duration::from_secs(120), || async {
+            all_books_swept(&client, &books).await
+        })
+        .await,
+        "round two never finished — a turner wedged on lost races\n{}",
+        fleet_report(&ports, &daemons).await
+    );
+
+    let after: Vec<u64> = futures_util::future::join_all(ports.iter().map(|port| async move {
+        counter_sum(
+            &scrape(*port).await.unwrap_or_default(),
+            "relay_cranks_total",
+            "outcome=\"sent\"",
+        )
+    }))
+    .await;
+    assert!(
+        after.iter().zip(&sent).all(|(now, before)| now > before),
+        "a turner stopped landing cranks after the first round: {sent:?} -> {after:?}\n{}",
+        fleet_report(&ports, &daemons).await
+    );
+    // Finally, prove the test exercised what it claims. Two uncoordinated
+    // turners both crank everything, so roughly half of all submissions
+    // should be losses — and a loss lands on chain and reverts, which is
+    // `relay_transactions_total{outcome="failed"}`, not a crank-stage
+    // failure. Zero here would mean the two never actually contended and
+    // the rest of this test proved nothing.
+    let (mut lost, mut landed) = (0, 0);
+    for port in ports {
+        let metrics = scrape(port).await.unwrap_or_default();
+        lost += counter_sum(&metrics, "relay_transactions_total", "result=\"failed\"");
+        landed += counter_sum(&metrics, "relay_transactions_total", "result=\"landed\"");
+    }
+    assert!(
+        lost > 0,
+        "the two turners never collided, so nothing about contention was tested\n{}",
+        fleet_report(&ports, &daemons).await
+    );
+    // And the losses are bounded by the work itself. Losing is supposed to
+    // be self-limiting: the next tick re-reads the book, finds the winner
+    // already swept it, and resolves to no-work instead of resubmitting. So
+    // across both rounds there can be at most one lost transaction per unit
+    // of work — and rather fewer, since each transaction packs several
+    // cranks. A turner that answered a lost race by retrying blind would
+    // sail past this.
+    let work = (BOOKS * 2) as u64;
+    assert!(
+        lost <= work,
+        "{lost} lost transactions for {work} units of work ({landed} landed) — \
+         losing is not self-limiting\n{}",
+        fleet_report(&ports, &daemons).await
+    );
+}
+
+async fn all_books_swept(client: &Client, books: &[Pubkey]) -> bool {
+    for book in books {
+        if client.entry_count(book).await > 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Metrics and log tails from every daemon, for failure messages.
+async fn fleet_report(ports: &[u16], daemons: &[Daemon]) -> String {
+    let mut report = String::new();
+    for (port, daemon) in ports.iter().zip(daemons) {
+        let metrics = scrape(*port).await.unwrap_or_default();
+        let counters: Vec<&str> = metrics
+            .lines()
+            .filter(|l| {
+                l.starts_with("relay_cranks_total")
+                    || l.starts_with("relay_crank_failures_total")
+                    || l.starts_with("relay_transactions_total")
+            })
+            .collect();
+        report.push_str(&format!(
+            "--- turner :{port} ---\n{}\nlogs (tail):\n{}\n",
+            counters.join("\n"),
+            daemon
+                .logs()
+                .lines()
+                .rev()
+                .take(15)
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    report
 }
