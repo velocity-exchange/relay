@@ -285,30 +285,36 @@ fn guard_address(keeper: Pubkey, nonce: u8) -> Pubkey {
 
 /// A guarded crank, built the way the turner builds it: the executor goes
 /// in directly (no CPI), bracketed by relay's payment guards.
+///
+/// `payer` signs and funds the guard account; `payout` receives the
+/// payment and never signs — the separation that keeps a hostile executor
+/// away from the signing key.
 fn guarded_crank(
     ctx: &Ctx,
-    keeper: Pubkey,
+    payer: Pubkey,
+    payout: Pubkey,
     condition_index: u8,
     resolved: &spec::ResolvedCrankV0,
     min_payment: u64,
 ) -> Vec<Instruction> {
     let nonce = 0u8;
-    let guard = guard_address(keeper, nonce);
+    let guard = guard_address(payout, nonce);
     vec![
         Instruction {
             program_id: relay_id(),
             accounts: vec![
-                AccountMeta::new(keeper, true),
+                AccountMeta::new(payer, true),
+                AccountMeta::new_readonly(payout, false),
                 AccountMeta::new(guard, false),
                 AccountMeta::new_readonly(Pubkey::new_from_array([0u8; 32]), false),
             ],
             data: spec::encode_begin_guard_v0_data(nonce).to_vec(),
         },
-        executor_ix_for(ctx, condition_index, resolved, keeper),
+        executor_ix_for(ctx, condition_index, resolved, payout),
         Instruction {
             program_id: relay_id(),
             accounts: vec![
-                AccountMeta::new_readonly(keeper, false),
+                AccountMeta::new_readonly(payout, false),
                 AccountMeta::new(guard, false),
             ],
             data: spec::encode_assert_paid_v0_data(min_payment, nonce).to_vec(),
@@ -521,14 +527,14 @@ fn guarded_crank_happy_path() {
     add_entry(&mut ctx, t + 100);
     warp_to(&mut ctx, t + 200);
 
-    // The payer is the keeper here: the guard requires the keeper to sign,
-    // and a turner's keeper is always its fee payer.
-    let keeper = ctx.payer.pubkey();
+    // Payer signs; payout is a separate account that never does.
+    let payer = ctx.payer.pubkey();
+    let keeper = ctx.keeper;
 
     // First guarded crank also creates the guard account, so the keeper
     // pays its (one-time) rent on top of the fee.
     let resolved = resolve(&mut ctx, SWEEP_CONDITION).expect("work");
-    let ixs = guarded_crank(&ctx, keeper, SWEEP_CONDITION, &resolved, PAYMENT);
+    let ixs = guarded_crank(&ctx, payer, keeper, SWEEP_CONDITION, &resolved, PAYMENT);
     send_all(&mut ctx, &ixs).unwrap();
     assert_eq!(entry_count(&ctx), 0);
 
@@ -538,7 +544,7 @@ fn guarded_crank_happy_path() {
     warp_to(&mut ctx, t + 400);
     let resolved = resolve(&mut ctx, SWEEP_CONDITION).expect("work");
     let before = ctx.svm.get_balance(&keeper).unwrap();
-    let ixs = guarded_crank(&ctx, keeper, SWEEP_CONDITION, &resolved, PAYMENT);
+    let ixs = guarded_crank(&ctx, payer, keeper, SWEEP_CONDITION, &resolved, PAYMENT);
     send_all(&mut ctx, &ixs).unwrap();
     let after = ctx.svm.get_balance(&keeper).unwrap();
     assert!(
@@ -555,11 +561,12 @@ fn guard_reverts_underpayment() {
     let t = now(&ctx);
     add_entry(&mut ctx, t + 100);
     warp_to(&mut ctx, t + 200);
-    let keeper = ctx.payer.pubkey();
+    let payer = ctx.payer.pubkey();
+    let keeper = ctx.keeper;
 
     // Arm the guard account once so its rent is not part of this test.
     let resolved = resolve(&mut ctx, SWEEP_CONDITION).expect("work");
-    let ixs = guarded_crank(&ctx, keeper, SWEEP_CONDITION, &resolved, PAYMENT);
+    let ixs = guarded_crank(&ctx, payer, keeper, SWEEP_CONDITION, &resolved, PAYMENT);
     send_all(&mut ctx, &ixs).unwrap();
 
     // Now the book pays less than the turner asserts.
@@ -578,7 +585,7 @@ fn guard_reverts_underpayment() {
 
     let resolved = resolve(&mut ctx, SWEEP_CONDITION).expect("work");
     let entries_before = entry_count(&ctx);
-    let ixs = guarded_crank(&ctx, keeper, SWEEP_CONDITION, &resolved, PAYMENT);
+    let ixs = guarded_crank(&ctx, payer, keeper, SWEEP_CONDITION, &resolved, PAYMENT);
     let failed = send_all(&mut ctx, &ixs).unwrap_err();
     assert_eq!(
         custom_error_code(&failed),
@@ -601,16 +608,17 @@ fn assert_paid_requires_an_armed_guard() {
     let t = now(&ctx);
     add_entry(&mut ctx, t + 100);
     warp_to(&mut ctx, t + 200);
-    let keeper = ctx.payer.pubkey();
+    let payer = ctx.payer.pubkey();
+    let keeper = ctx.keeper;
 
     // Arm and consume a guard so the account exists but is disarmed.
     let resolved = resolve(&mut ctx, SWEEP_CONDITION).expect("work");
-    let ixs = guarded_crank(&ctx, keeper, SWEEP_CONDITION, &resolved, PAYMENT);
+    let ixs = guarded_crank(&ctx, payer, keeper, SWEEP_CONDITION, &resolved, PAYMENT);
     send_all(&mut ctx, &ixs).unwrap();
 
     // A trailing guard with no matching arm must fail rather than measure
     // against stale state.
-    let ixs = guarded_crank(&ctx, keeper, SWEEP_CONDITION, &resolved, PAYMENT);
+    let ixs = guarded_crank(&ctx, payer, keeper, SWEEP_CONDITION, &resolved, PAYMENT);
     let trailing_only = vec![ixs[2].clone()];
     let failed = send_all(&mut ctx, &trailing_only).unwrap_err();
     assert_eq!(custom_error_code(&failed), Some(6001)); // GuardNotArmed
@@ -622,14 +630,17 @@ fn guard_measures_only_this_transaction() {
     let t = now(&ctx);
     add_entry(&mut ctx, t + 100);
     warp_to(&mut ctx, t + 200);
-    let keeper = ctx.payer.pubkey();
+    let payer = ctx.payer.pubkey();
+    let keeper = ctx.keeper;
 
     // Asserting more than the book pays fails even though the keeper's
     // absolute balance is enormous — the guard measures the delta, not the
     // balance.
     let resolved = resolve(&mut ctx, SWEEP_CONDITION).expect("work");
+    // Make the payout rich, so only a delta measurement can fail.
+    ctx.svm.airdrop(&keeper, 100_000_000_000).unwrap();
     assert!(ctx.svm.get_balance(&keeper).unwrap() > PAYMENT * 1000);
-    let ixs = guarded_crank(&ctx, keeper, SWEEP_CONDITION, &resolved, PAYMENT + 1);
+    let ixs = guarded_crank(&ctx, payer, keeper, SWEEP_CONDITION, &resolved, PAYMENT + 1);
     let failed = send_all(&mut ctx, &ixs).unwrap_err();
     assert_eq!(custom_error_code(&failed), Some(6000));
 }

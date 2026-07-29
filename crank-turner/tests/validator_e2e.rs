@@ -313,6 +313,10 @@ fn build_turner(url: String, keeper: Keypair) -> Turner<Arc<dyn ChainSource>> {
         keeper,
         TurnerConfig {
             filter: WatchFilter::for_programs([demo_id()]),
+            // The operator wrote demo-book, so run it the way they would:
+            // trusted, meaning no guard instructions and payment straight
+            // to the fee payer.
+            trusted_programs: [demo_id()].into_iter().collect(),
             // The validator's clock moves in real time, so let wakes
             // re-fire promptly rather than sitting in backoff.
             no_work_backoff_slots: 1,

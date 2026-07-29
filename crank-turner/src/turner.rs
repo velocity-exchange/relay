@@ -12,7 +12,7 @@
 //! call stack (a velocity crank that calls into the CLOB needs them) and
 //! costs two ~1k-CU instructions instead of an invoke.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -25,6 +25,8 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature};
 use solana_sdk::signer::Signer;
 use solana_sdk::transaction::Transaction;
+
+use tracing::warn;
 
 use crate::filter::{RefreshSummary, WatchFilter};
 use crate::metrics;
@@ -59,6 +61,12 @@ pub enum SkipReason {
     ParseFailed,
     /// The target program's recent cranks have cost more than they paid.
     Unprofitable,
+    /// The program is untrusted and no non-signing payout account is
+    /// configured, so there is nowhere safe for it to pay.
+    NoSafePayout,
+    /// The resolver named the fee payer (or another transaction signer) in
+    /// an untrusted executor's account list — a drain attempt.
+    ExecutorNamedSigner,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,9 +107,24 @@ pub struct TurnerConfig {
     /// Base for exponential failure backoff (doubles per consecutive
     /// failure, capped at 2^6).
     pub failure_backoff_slots: u64,
-    /// Bracket executors with relay's payment guards. Off means trusting
-    /// simulation alone: cheaper, but nothing catches a payment that
-    /// shrinks between simulating and landing.
+    /// Where executors pay. **Must not be the fee payer**: signer status
+    /// is transaction-global on Solana, so any account that signs the
+    /// transaction is a signer inside every instruction of it — including
+    /// an untrusted executor's, which could then CPI a System transfer and
+    /// drain it. A payout account that never signs cannot be touched.
+    ///
+    /// `None` means "pay the fee payer", which is only allowed for
+    /// programs on `trusted_programs`.
+    pub payout: Option<Pubkey>,
+    /// Programs whose executors are run without payment guards and may be
+    /// paid directly to the fee payer. This is the "I wrote this program,
+    /// I do not need a condom" setting: it saves two instructions, their
+    /// compute, and ~100 bytes of transaction, at the cost of every
+    /// protection below. Only ever list programs you control.
+    pub trusted_programs: HashSet<Pubkey>,
+    /// Bracket untrusted executors with relay's payment guards. Off means
+    /// trusting simulation alone: cheaper, but nothing catches a payment
+    /// that shrinks between simulating and landing.
     pub guard_payments: bool,
     /// Which of the keeper's guard accounts to use. Turners running cranks
     /// concurrently should vary this per in-flight transaction so they
@@ -162,6 +185,8 @@ impl Default for TurnerConfig {
             min_crank_payment: 0,
             no_work_backoff_slots: 8,
             failure_backoff_slots: 16,
+            payout: None,
+            trusted_programs: HashSet::new(),
             guard_payments: true,
             guard_nonce: 0,
             filter: WatchFilter::default(),
@@ -660,21 +685,28 @@ impl<S: ChainSource> Turner<S> {
         let resolved = read_staged(&sim.accounts, &pointer).context("staged resolver payload")?;
 
         // Build the executor itself — no CPI wrapper.
-        let keeper = self.keeper.pubkey();
+        let program = Pubkey::from(condition.executor_program);
+        let Some(payout) = self.payout_for(&program) else {
+            return Ok(CrankResult::Done(
+                Outcome::Skipped(key, SkipReason::NoSafePayout),
+                StateUpdate::Failed,
+            ));
+        };
         require_keeper_placeholder(&resolved)?;
         let executor_ix = Instruction {
-            program_id: Pubkey::from(condition.executor_program),
+            program_id: program,
             accounts: resolved
                 .accounts
                 .iter()
                 .map(|a| AccountMeta {
                     pubkey: if a.address == spec::KEEPER_PLACEHOLDER {
-                        keeper
+                        payout
                     } else {
                         Pubkey::from(a.address)
                     },
-                    // Executors are permissionless by contract; a turner
-                    // never lends its signature to one.
+                    // Belt: marking this false is right for every account
+                    // that is not already a transaction signer. It is not
+                    // sufficient on its own — see `names_a_signer`.
                     is_signer: false,
                     is_writable: a.is_writable(),
                 })
@@ -686,7 +718,20 @@ impl<S: ChainSource> Turner<S> {
                 .chain(resolved.data.iter().copied())
                 .collect(),
         };
-        let ixs = self.guarded(executor_ix, condition.min_payment);
+        // Braces: an untrusted executor must not name any account that
+        // signs this transaction, because signer status is
+        // transaction-global — see `names_signer`.
+        if !self.trusts(&program) && names_signer(&executor_ix, &self.keeper.pubkey()) {
+            warn!(
+                %program,
+                "untrusted executor named the fee payer; refusing to submit"
+            );
+            return Ok(CrankResult::Done(
+                Outcome::Skipped(key, SkipReason::ExecutorNamedSigner),
+                StateUpdate::Failed,
+            ));
+        }
+        let ixs = self.guarded(executor_ix, payout, &program, condition.min_payment);
 
         // Simulate with a generous budget to learn the real cost, then let
         // the packing phase re-sign with a tight limit — the fee is charged
@@ -900,18 +945,27 @@ impl<S: ChainSource> Turner<S> {
 
     /// Bracket an executor with the payment guards (or pass it through
     /// untouched when guarding is disabled).
-    fn guarded(&self, executor: Instruction, min_payment: u64) -> Vec<Instruction> {
-        if !self.config.guard_payments {
+    fn guarded(
+        &self,
+        executor: Instruction,
+        payout: Pubkey,
+        program: &Pubkey,
+        min_payment: u64,
+    ) -> Vec<Instruction> {
+        // Trusted programs skip the guards entirely: two fewer
+        // instructions, their compute, and their bytes.
+        if !self.config.guard_payments || self.trusts(program) {
             return vec![executor];
         }
-        let keeper = self.keeper.pubkey();
+        let payer = self.keeper.pubkey();
         let nonce = self.config.guard_nonce;
-        let guard = self.guard_address(nonce);
+        let guard = self.guard_address(payout, nonce);
         vec![
             Instruction {
                 program_id: self.config.relay_program,
                 accounts: vec![
-                    AccountMeta::new(keeper, true),
+                    AccountMeta::new(payer, true),
+                    AccountMeta::new_readonly(payout, false),
                     AccountMeta::new(guard, false),
                     AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
                 ],
@@ -921,7 +975,7 @@ impl<S: ChainSource> Turner<S> {
             Instruction {
                 program_id: self.config.relay_program,
                 accounts: vec![
-                    AccountMeta::new_readonly(keeper, false),
+                    AccountMeta::new_readonly(payout, false),
                     AccountMeta::new(guard, false),
                 ],
                 data: spec::encode_assert_paid_v0_data(min_payment, nonce).to_vec(),
@@ -929,10 +983,10 @@ impl<S: ChainSource> Turner<S> {
         ]
     }
 
-    /// The keeper's guard PDA for a given nonce.
-    pub fn guard_address(&self, nonce: u8) -> Pubkey {
+    /// A payout account's guard PDA for a given nonce.
+    pub fn guard_address(&self, payout: Pubkey, nonce: u8) -> Pubkey {
         Pubkey::find_program_address(
-            &[spec::GUARD_SEED, self.keeper.pubkey().as_ref(), &[nonce]],
+            &[spec::GUARD_SEED, payout.as_ref(), &[nonce]],
             &self.config.relay_program,
         )
         .0
@@ -955,6 +1009,23 @@ impl<S: ChainSource> Turner<S> {
         .into_iter()
         .chain(ixs)
         .collect()
+    }
+
+    /// Is this program exempt from guards and payout separation?
+    fn trusts(&self, program: &Pubkey) -> bool {
+        self.config.trusted_programs.contains(program)
+    }
+
+    /// Where a given program's executor should pay.
+    ///
+    /// Trusted programs may pay the fee payer directly. Untrusted ones
+    /// must pay a configured account that never signs — otherwise there is
+    /// no safe answer and the condition is skipped.
+    fn payout_for(&self, program: &Pubkey) -> Option<Pubkey> {
+        match self.config.payout {
+            Some(payout) => Some(payout),
+            None => self.trusts(program).then(|| self.keeper.pubkey()),
+        }
     }
 
     /// Priority fee the submitter observed, clamped to the configured
@@ -999,8 +1070,24 @@ impl<S: ChainSource> Turner<S> {
     }
 }
 
-/// Executors must name the keeper somewhere, or there is nothing to be
-/// paid into and the guard would assert against a stranger's balance.
+/// Would this instruction hand an executor an account that signs the
+/// transaction?
+///
+/// Public because it is the whole safety argument for running untrusted
+/// executors, and worth asserting directly: signer status on Solana is
+/// transaction-global, so an account that signs the message is a signer
+/// inside *every* instruction of it, whatever the per-instruction
+/// `AccountMeta` says. An executor handed a signing account can CPI a
+/// System transfer and drain it. The turner therefore signs with exactly
+/// one key — its fee payer — and refuses to build any untrusted executor
+/// that names it.
+pub fn names_signer(ix: &Instruction, signer: &Pubkey) -> bool {
+    ix.accounts.iter().any(|meta| meta.pubkey == *signer)
+}
+
+/// Executors must name the payout placeholder somewhere, or there is
+/// nothing to be paid into and the guard would assert against a
+/// stranger's balance.
 fn require_keeper_placeholder(resolved: &spec::ResolvedCrankV0) -> Result<()> {
     resolved
         .accounts

@@ -120,6 +120,17 @@ struct Args {
     /// Pack up to this many cranks into one transaction (1 = never pack).
     #[arg(long, env = "RELAY_MAX_CRANKS_PER_TX", default_value_t = 3)]
     max_cranks_per_tx: usize,
+    /// Where executors pay. MUST NOT be the fee payer: signer status is
+    /// transaction-global, so an untrusted executor handed the fee payer
+    /// could sign a transfer draining it. Untrusted programs are skipped
+    /// entirely without this.
+    #[arg(long, env = "RELAY_PAYOUT_ADDRESS")]
+    payout_address: Option<Pubkey>,
+    /// Programs you wrote and trust: their executors run without payment
+    /// guards (two fewer instructions, less compute, smaller
+    /// transactions) and may be paid straight to the fee payer.
+    #[arg(long, env = "RELAY_TRUSTED_PROGRAMS", value_delimiter = ',')]
+    trusted_program: Vec<Pubkey>,
     /// Ceiling on the priority fee, micro-lamports per compute unit.
     #[arg(long, env = "RELAY_MAX_PRIORITY_FEE", default_value_t = 1_000_000)]
     max_priority_fee: u64,
@@ -144,6 +155,12 @@ async fn main() -> Result<()> {
         max_target_bytes: args.max_target_bytes,
         max_watches: args.max_watches,
     };
+    if args.payout_address.is_none() && !args.trusted_program.is_empty() {
+        warn!(
+            "no --payout-address: trusted programs will be paid to the fee payer, and untrusted \
+             ones will be skipped"
+        );
+    }
     if filter.allowed_target_programs.is_empty() {
         warn!(
             "no --target-program allowlist: this turner will track every watch in the registry, \
@@ -153,6 +170,8 @@ async fn main() -> Result<()> {
     let config = TurnerConfig {
         relay_program: args.program_id,
         min_crank_payment: args.min_crank_payment,
+        payout: args.payout_address,
+        trusted_programs: args.trusted_program.iter().copied().collect(),
         guard_payments: !args.no_guard,
         guard_nonce: args.guard_nonce,
         concurrency: args.concurrency,

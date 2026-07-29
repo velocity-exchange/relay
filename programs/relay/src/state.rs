@@ -36,8 +36,8 @@ const_assert_eq!(
 /// PDA seed prefix for [`GuardV0`].
 pub const GUARD_SEED: &[u8] = relay_spec::GUARD_SEED;
 
-/// Scratch account bracketing a crank: `begin_guard_v0` records the
-/// keeper's balance here, `assert_paid_v0` measures the delta against it.
+/// Scratch account bracketing a crank: `begin_guard_v0` records the payout
+/// account's balance here, `assert_paid_v0` measures the delta against it.
 ///
 /// Nothing here survives a failed transaction (all state reverts), and a
 /// successful one disarms it — so a guard is pure scratch that happens to
@@ -45,9 +45,9 @@ pub const GUARD_SEED: &[u8] = relay_spec::GUARD_SEED;
 /// concurrent cranks without serializing on a single write lock.
 #[account]
 pub struct GuardV0 {
-    pub keeper: Address,
-    /// Keeper lamports at arm time (post-fee, since it is read during
-    /// execution).
+    /// The account being paid — never a transaction signer.
+    pub payout: Address,
+    /// Payout lamports at arm time.
     pub snapshot: u64,
     /// 0 = disarmed. A trailing guard with no matching arm fails.
     pub armed: u8,

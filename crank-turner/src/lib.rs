@@ -55,6 +55,7 @@ pub use source::{
 };
 pub use submit::{spawn as spawn_submitter, PendingTx, SubmitterConfig, SubmitterHandle, TxResult};
 pub use turner::{
-    CondKey, Outcome, SkipReason, Stage, Turner, TurnerConfig, Watch, RELAY_PROGRAM_ID,
+    names_signer, CondKey, Outcome, SkipReason, Stage, Turner, TurnerConfig, Watch,
+    RELAY_PROGRAM_ID,
 };
 pub use ws::{derive_ws_url, spawn_ws_feed};

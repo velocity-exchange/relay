@@ -267,6 +267,8 @@ impl ChainSource for NoRemoteSimSource {
 
 struct Harness {
     turner: Turner<LiteSvmSource>,
+    /// Configured payout, when the test set one.
+    payout: Option<Pubkey>,
     svm: Arc<Mutex<LiteSVM>>,
     watch_keys: Arc<Mutex<Vec<Pubkey>>>,
     authority: Keypair,
@@ -276,6 +278,25 @@ struct Harness {
 
 fn setup(payment: u64, evict_threshold: u32, config: TurnerConfig) -> Harness {
     setup_with_treasury(payment, evict_threshold, TREASURY, config)
+}
+
+/// Most tests are about crank mechanics, not the trust model, so they run
+/// with demo-book trusted (payout may be the fee payer, guards skipped).
+/// The trust model itself is covered by the security tests at the bottom.
+fn trusting(config: TurnerConfig) -> TurnerConfig {
+    TurnerConfig {
+        trusted_programs: [demo_id()].into_iter().collect(),
+        ..config
+    }
+}
+
+/// The opposite: untrusted, so guards run, with a payout account that
+/// never signs (which untrusted programs require).
+fn guarded_config(payout: Pubkey) -> TurnerConfig {
+    TurnerConfig {
+        payout: Some(payout),
+        ..TurnerConfig::default()
+    }
 }
 
 fn setup_with_treasury(
@@ -316,8 +337,16 @@ fn setup_with_treasury(
     let svm = Arc::new(Mutex::new(svm));
     let watch_keys = Arc::new(Mutex::new(Vec::new()));
     let source = LiteSvmSource::new(&svm, &watch_keys);
+    let payout = config.payout;
+    // Configuring a payout means the test wants the untrusted, guarded
+    // path; everything else runs trusted so it can focus on mechanics.
+    let config = match payout {
+        Some(_) => config,
+        None => trusting(config),
+    };
     let mut harness = Harness {
         turner: Turner::new(source, keeper, config),
+        payout,
         svm,
         watch_keys,
         authority,
@@ -519,7 +548,8 @@ impl Harness {
     }
 
     fn guard_exists(&self) -> bool {
-        let guard = self.turner.guard_address(0);
+        let payout = self.payout.unwrap_or_else(|| self.turner.keeper_pubkey());
+        let guard = self.turner.guard_address(payout, 0);
         self.svm
             .lock()
             .unwrap()
@@ -680,8 +710,10 @@ async fn min_payment_filter_skips_cheap_conditions() {
 }
 
 #[tokio::test]
-async fn underpaying_executor_is_blocked_by_crank_wrapper() {
-    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+async fn underpaying_executor_is_blocked_by_guards() {
+    let payout = Pubkey::new_unique();
+    let mut h = setup(PAYMENT, 100, guarded_config(payout));
+    h.svm.lock().unwrap().airdrop(&payout, 1_000_000).unwrap();
     h.refresh().await;
     let t0 = h.t0;
     h.add_entry(t0 + 100);
@@ -903,7 +935,7 @@ async fn turner_cranks_through_cached_source() {
             watch_programs: Vec::new(),
         },
     );
-    let mut turner = Turner::new(cached, Keypair::new(), TurnerConfig::default());
+    let mut turner = Turner::new(cached, Keypair::new(), trusting(TurnerConfig::default()));
     {
         let mut svm = h.svm.lock().unwrap();
         svm.airdrop(&turner.keeper_pubkey(), 1_000_000_000).unwrap();
@@ -954,10 +986,10 @@ async fn filter_scopes_turner_to_its_own_programs() {
     h.turner = Turner::new(
         LiteSvmSource::new(&h.svm, &h.watch_keys),
         Keypair::new(),
-        TurnerConfig {
+        trusting(TurnerConfig {
             filter: WatchFilter::for_programs([demo_id()]),
             ..TurnerConfig::default()
-        },
+        }),
     );
     let summary = h.turner.refresh_watches().await.unwrap();
     assert_eq!(summary.admitted, 1);
@@ -985,13 +1017,13 @@ async fn filter_scopes_turner_to_its_own_programs() {
     h.turner = Turner::new(
         LiteSvmSource::new(&h.svm, &h.watch_keys),
         Keypair::new(),
-        TurnerConfig {
+        trusting(TurnerConfig {
             filter: WatchFilter {
                 blocked_target_programs: [demo_id()].into_iter().collect(),
                 ..WatchFilter::default()
             },
             ..TurnerConfig::default()
-        },
+        }),
     );
     let summary = h.turner.refresh_watches().await.unwrap();
     assert_eq!(summary.admitted, 0);
@@ -1011,10 +1043,10 @@ async fn filter_drops_watches_that_pay_too_little() {
     h.turner = Turner::new(
         LiteSvmSource::new(&h.svm, &h.watch_keys),
         Keypair::new(),
-        TurnerConfig {
+        trusting(TurnerConfig {
             min_crank_payment: cheap + 1,
             ..TurnerConfig::default()
-        },
+        }),
     );
     let summary = h.turner.refresh_watches().await.unwrap();
     assert_eq!(summary.admitted, 0);
@@ -1034,13 +1066,13 @@ async fn filter_enforces_size_and_count_ceilings() {
     h.turner = Turner::new(
         LiteSvmSource::new(&h.svm, &h.watch_keys),
         Keypair::new(),
-        TurnerConfig {
+        trusting(TurnerConfig {
             filter: WatchFilter {
                 max_target_bytes: Some(BOOK_ACCOUNT_LEN - 1),
                 ..WatchFilter::default()
             },
             ..TurnerConfig::default()
-        },
+        }),
     );
     let summary = h.turner.refresh_watches().await.unwrap();
     assert_eq!(summary.admitted, 0);
@@ -1049,13 +1081,13 @@ async fn filter_enforces_size_and_count_ceilings() {
     h.turner = Turner::new(
         LiteSvmSource::new(&h.svm, &h.watch_keys),
         Keypair::new(),
-        TurnerConfig {
+        trusting(TurnerConfig {
             filter: WatchFilter {
                 max_watches: Some(0),
                 ..WatchFilter::default()
             },
             ..TurnerConfig::default()
-        },
+        }),
     );
     let summary = h.turner.refresh_watches().await.unwrap();
     assert_eq!(summary.admitted, 0);
@@ -1104,36 +1136,44 @@ async fn program_allowlist_is_pushed_to_the_provider() {
 
 // --- guarded execution ---
 
-/// Steady-state economics: the executor goes in directly (no CPI) and the
-/// keeper nets the payment minus the fee. The first guarded crank also
-/// creates the keeper's guard account, so its rent shows up once.
+/// Steady-state economics for an untrusted program: the executor goes in
+/// directly (no CPI), guards bracket it, and the payout account nets the
+/// full payment — it pays no transaction fee, unlike the fee payer. The
+/// first guarded crank also creates the guard account, so its rent shows
+/// up once, on the payer.
 #[tokio::test]
-async fn guarded_cranks_pay_the_keeper() {
-    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+async fn guarded_cranks_pay_the_payout() {
+    let payout = Pubkey::new_unique();
+    let mut h = setup(PAYMENT, 100, guarded_config(payout));
+    h.svm.lock().unwrap().airdrop(&payout, 1_000_000).unwrap();
     h.refresh().await;
     let t0 = h.t0;
 
-    // First crank: pays for the guard account as well.
+    let payout_balance = |h: &Harness| h.svm.lock().unwrap().get_balance(&payout).unwrap();
+    let payer_balance = |h: &Harness| h.keeper_balance();
+
     h.add_entry(t0 + 100);
     h.warp(t0 + 200, 2);
-    let before = h.keeper_balance();
+    let payer_before = payer_balance(&h);
+    let payout_before = payout_balance(&h);
     assert_eq!(sent(&h.tick().await).len(), 1);
+    assert_eq!(
+        payout_balance(&h) - payout_before,
+        PAYMENT,
+        "the payout nets the whole payment"
+    );
     assert!(
-        h.keeper_balance() < before,
-        "one-time guard rent exceeds one payment"
+        payer_balance(&h) < payer_before,
+        "the payer covered the fee and the one-time guard rent"
     );
     assert!(h.guard_exists(), "guard account created on first use");
 
-    // Every crank after that is pure profit minus the fee.
+    // Steady state: still exactly the payment, no rent this time.
     h.add_entry(t0 + 300);
     h.warp(t0 + 400, 2);
-    let before = h.keeper_balance();
+    let payout_before = payout_balance(&h);
     assert_eq!(sent(&h.tick().await).len(), 1);
-    let delta = h.keeper_balance() as i64 - before as i64;
-    assert!(
-        delta > 0 && delta <= PAYMENT as i64,
-        "keeper delta {delta} should be payment minus fee"
-    );
+    assert_eq!(payout_balance(&h) - payout_before, PAYMENT);
 }
 
 /// With guards off the turner submits the bare executor — one instruction,
@@ -1143,10 +1183,10 @@ async fn unguarded_cranks_skip_relay_entirely() {
     let mut h = setup(
         PAYMENT,
         100,
-        TurnerConfig {
+        trusting(TurnerConfig {
             guard_payments: false,
             ..TurnerConfig::default()
-        },
+        }),
     );
     h.refresh().await;
     let t0 = h.t0;
@@ -1165,7 +1205,9 @@ async fn unguarded_cranks_skip_relay_entirely() {
 /// simulation and landing.
 #[tokio::test]
 async fn guard_reverts_a_crank_that_underpays() {
-    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    let payout = Pubkey::new_unique();
+    let mut h = setup(PAYMENT, 100, guarded_config(payout));
+    h.svm.lock().unwrap().airdrop(&payout, 1_000_000).unwrap();
     h.refresh().await;
     let t0 = h.t0;
     h.add_entry(t0 + 100);
@@ -1276,7 +1318,7 @@ async fn conditions_are_cranked_concurrently() {
         peak_concurrent: Arc::clone(&peak),
         live: Arc::new(Mutex::new(0)),
     };
-    let mut turner = Turner::new(slow, Keypair::new(), TurnerConfig::default());
+    let mut turner = Turner::new(slow, Keypair::new(), trusting(TurnerConfig::default()));
     {
         let mut svm = h.svm.lock().unwrap();
         svm.airdrop(&turner.keeper_pubkey(), 1_000_000_000).unwrap();
@@ -1313,8 +1355,12 @@ async fn submitter_lands_transactions_off_the_decision_loop() {
             ..Default::default()
         },
     );
-    let mut turner = Turner::new(Arc::clone(&source), Keypair::new(), TurnerConfig::default())
-        .with_submitter(submitter.clone());
+    let mut turner = Turner::new(
+        Arc::clone(&source),
+        Keypair::new(),
+        trusting(TurnerConfig::default()),
+    )
+    .with_submitter(submitter.clone());
     {
         let mut svm = h.svm.lock().unwrap();
         svm.airdrop(&turner.keeper_pubkey(), 1_000_000_000).unwrap();
@@ -1361,10 +1407,10 @@ async fn unprofitable_programs_are_skipped() {
     let mut turner = Turner::new(
         Arc::clone(&source),
         Keypair::new(),
-        TurnerConfig {
+        trusting(TurnerConfig {
             min_program_profit: 1_000_000,
             ..TurnerConfig::default()
-        },
+        }),
     )
     .with_submitter(submitter);
     {
@@ -1431,7 +1477,7 @@ async fn all_simulation_happens_locally() {
         guarded,
         relay_crank_turner::LocalSimConfig { pool_size: 2 },
     );
-    let mut turner = Turner::new(local, Keypair::new(), TurnerConfig::default());
+    let mut turner = Turner::new(local, Keypair::new(), trusting(TurnerConfig::default()));
     {
         let mut svm = h.svm.lock().unwrap();
         svm.airdrop(&turner.keeper_pubkey(), 1_000_000_000).unwrap();
@@ -1465,7 +1511,7 @@ async fn no_work_resolves_cost_nothing_remote() {
         fetches: Arc::new(Mutex::new(0)),
     };
     let local = relay_crank_turner::LocalSimSource::new(guarded, Default::default());
-    let mut turner = Turner::new(local, Keypair::new(), TurnerConfig::default());
+    let mut turner = Turner::new(local, Keypair::new(), trusting(TurnerConfig::default()));
     {
         let mut svm = h.svm.lock().unwrap();
         svm.airdrop(&turner.keeper_pubkey(), 1_000_000_000).unwrap();
@@ -1568,10 +1614,10 @@ async fn cranks_pack_into_one_transaction() {
     let mut turner = Turner::new(
         LiteSvmSource::new(&h.svm, &h.watch_keys),
         Keypair::new(),
-        TurnerConfig {
+        trusting(TurnerConfig {
             max_cranks_per_tx: 3,
             ..TurnerConfig::default()
-        },
+        }),
     );
     {
         let mut svm = h.svm.lock().unwrap();
@@ -1620,10 +1666,10 @@ async fn packing_can_be_disabled() {
     let mut turner = Turner::new(
         LiteSvmSource::new(&h.svm, &h.watch_keys),
         Keypair::new(),
-        TurnerConfig {
+        trusting(TurnerConfig {
             max_cranks_per_tx: 1,
             ..TurnerConfig::default()
-        },
+        }),
     );
     {
         let mut svm = h.svm.lock().unwrap();
@@ -1785,5 +1831,154 @@ async fn dropped_subscription_revokes_coverage() {
         *fetches.lock().unwrap(),
         while_covered + 1,
         "revoked coverage must force revalidation"
+    );
+}
+
+// --- trust model ---
+
+/// The exploit this guards against: signer status on Solana is
+/// transaction-global, so an account that signs the transaction is a
+/// signer inside *every* instruction of it. An untrusted executor handed
+/// the fee payer would see `is_signer: true` no matter what the
+/// `AccountMeta` said, and could CPI a System transfer to drain it.
+/// Without a separate payout account there is nowhere safe to be paid, so
+/// the condition is skipped rather than risked.
+#[tokio::test]
+async fn untrusted_programs_need_a_non_signing_payout() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    let t0 = h.t0;
+    h.add_entry(t0 + 100);
+
+    // Untrusted, and no payout configured.
+    let mut turner = Turner::new(
+        LiteSvmSource::new(&h.svm, &h.watch_keys),
+        Keypair::new(),
+        TurnerConfig::default(),
+    );
+    {
+        let mut svm = h.svm.lock().unwrap();
+        svm.airdrop(&turner.keeper_pubkey(), 1_000_000_000).unwrap();
+    }
+    turner.refresh_watches().await.unwrap();
+
+    h.warp(t0 + 200, 2);
+    let outcomes = turner.tick().await.unwrap();
+    assert!(sent(&outcomes).is_empty(), "{outcomes:?}");
+    assert!(
+        outcomes
+            .iter()
+            .any(|o| matches!(o, Outcome::Skipped(_, SkipReason::NoSafePayout))),
+        "{outcomes:?}"
+    );
+    assert_eq!(h.entry_count(), 1, "nothing was cranked");
+}
+
+/// With a payout account that never signs, an untrusted program is safe to
+/// crank: the fee payer is not in the executor's account list at all, so
+/// there is nothing for a hostile executor to sign with.
+#[tokio::test]
+async fn untrusted_programs_run_with_a_separate_payout() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    let t0 = h.t0;
+    h.add_entry(t0 + 100);
+
+    let payout = Pubkey::new_unique();
+    let mut turner = Turner::new(
+        LiteSvmSource::new(&h.svm, &h.watch_keys),
+        Keypair::new(),
+        TurnerConfig {
+            payout: Some(payout),
+            ..TurnerConfig::default()
+        },
+    );
+    {
+        let mut svm = h.svm.lock().unwrap();
+        svm.airdrop(&turner.keeper_pubkey(), 1_000_000_000).unwrap();
+        // The payout needs to exist to receive lamports.
+        svm.airdrop(&payout, 1_000_000).unwrap();
+    }
+    turner.refresh_watches().await.unwrap();
+
+    let before = h.svm.lock().unwrap().get_balance(&payout).unwrap();
+    h.warp(t0 + 200, 2);
+    let outcomes = turner.tick().await.unwrap();
+    assert_eq!(sent(&outcomes).len(), 1, "{outcomes:?}");
+
+    // Paid in full: the payout pays no transaction fee, so unlike the fee
+    // payer it nets the whole amount.
+    let after = h.svm.lock().unwrap().get_balance(&payout).unwrap();
+    assert_eq!(after - before, PAYMENT);
+    assert_eq!(h.entry_count(), 0);
+}
+
+/// A resolver that names the fee payer — rather than the payout
+/// placeholder — is a drain attempt, and the turner refuses to build it.
+///
+/// Asserted against the predicate directly rather than through the
+/// harness: demo-book's resolvers are honest, and anything staged into its
+/// scratch region is overwritten by the resolver during simulation, so
+/// there is no way to make it emit a hostile list without adding a
+/// deliberately malicious second program.
+#[test]
+fn executor_naming_a_signer_is_detected() {
+    let fee_payer = Pubkey::new_unique();
+    let payout = Pubkey::new_unique();
+    let book = Pubkey::new_unique();
+
+    let honest = Instruction {
+        program_id: demo_id(),
+        accounts: vec![
+            AccountMeta::new(payout, false),
+            AccountMeta::new(book, false),
+        ],
+        data: vec![],
+    };
+    assert!(
+        !relay_crank_turner::names_signer(&honest, &fee_payer),
+        "an honest executor never names the fee payer"
+    );
+
+    // The attack: the resolver slips the fee payer into the account list.
+    // Marking it `is_signer: false` here changes nothing — the runtime
+    // reports it as a signer anyway, because it signs the transaction.
+    let hostile = Instruction {
+        program_id: demo_id(),
+        accounts: vec![
+            AccountMeta::new(payout, false),
+            AccountMeta::new(book, false),
+            AccountMeta {
+                pubkey: fee_payer,
+                is_signer: false,
+                is_writable: true,
+            },
+        ],
+        data: vec![],
+    };
+    assert!(relay_crank_turner::names_signer(&hostile, &fee_payer));
+}
+
+/// Trusted programs skip the guards: the transaction is the executor
+/// alone, plus compute budget — no begin/assert pair.
+#[tokio::test]
+async fn trusted_programs_skip_the_guards() {
+    let mut h = setup(PAYMENT, 100, trusting(TurnerConfig::default()));
+    h.refresh().await;
+    let t0 = h.t0;
+    h.add_entry(t0 + 100);
+
+    h.warp(t0 + 200, 2);
+    let outcomes = h.tick().await;
+    assert_eq!(sent(&outcomes).len(), 1, "{outcomes:?}");
+    assert_eq!(h.entry_count(), 0);
+    // No guard account was ever created, because no guard ran.
+    let payout = h.turner.keeper_pubkey();
+    let guard = h.turner.guard_address(payout, 0);
+    assert!(
+        h.svm
+            .lock()
+            .unwrap()
+            .get_account(&guard)
+            .is_none_or(|a| a.data.is_empty()),
+        "a trusted crank should not create a guard account"
     );
 }

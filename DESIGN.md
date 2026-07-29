@@ -31,6 +31,14 @@ Wake kinds:
 - `OnAccountChange`: fire when the named byte range changes. The watched account may be the condition account itself or any other (e.g. an oracle).
 - `EverySlots`: poll every N slots — the fallback that backstops a bad hint.
 
+### Trust model
+
+A turner runs instructions chosen by target programs it may not control, so two rules bound what a hostile one can do.
+
+**The payout must never sign.** Signer status on Solana is transaction-global: an account that signs the message is a signer inside *every* instruction of it, whatever the per-instruction `AccountMeta` says. A malicious executor handed the fee payer would therefore see `is_signer: true` and could CPI a System transfer to drain it — marking the meta `is_signer: false` is necessary but nowhere near sufficient. So `--payout-address` names a separate account that receives payment and never signs; the fee payer signs and is never handed to an executor. The turner additionally refuses to build any untrusted executor whose account list names the fee payer (`names_signer`), which catches a resolver that tries to slip it in directly rather than through `KEEPER_PLACEHOLDER`. Without a payout configured, untrusted programs are skipped entirely rather than risked.
+
+**Trusted programs opt out of all of it.** `--trusted-program <ID>` says "I wrote this, I don't need a condom": its executors run with no guard instructions (two fewer instructions, their compute, ~100 bytes) and may be paid straight to the fee payer. Only list programs you control — the guards and the payout separation are the only things standing between a turner and a malicious executor.
+
 ### Resolver output: staging, not return data
 
 Return data is capped at 1024 bytes, which would bound how many accounts and args a resolver can name — exactly the wrong thing to bound, since batch cranks grow with the work (sweep every expired order, each with its own owner). So the resolver **stages** `[num_accounts: u8][data_len: u16][AccountRefV0; n][data]` in one of its own writable accounts and returns a 10-byte `ResponsePointerV0 { work, account_index, offset, len }`; `account_index` indexes the condition's `resolver_accounts`. The turner reads the byte range out of the simulation's **post-execution account state** (`simulateTransaction`'s `accounts` config; litesvm's `post_accounts`).
@@ -60,7 +68,7 @@ The fee bar drops the *whole watch*, not just the underachieving condition: a bo
 Anchor v2 (anchor-next, same pinned rev as velocity's anchor-v2 workspace). Two jobs:
 
 1. **Registry**: `register_watch_v0(target, offset)` / `close_watch_v0`. A `WatchV0` is `[disc][target_program][target][registrar][offset]` — discovery metadata only. `target_program` is read from the target account, not from args. Registration is permissionless (garbage watches parse-fail and get dropped at refresh); the registrar can close and reclaim rent.
-2. **Payment guards**: `begin_guard_v0` / `assert_paid_v0`, bracketing the executor:
+2. **Payment guards**: `begin_guard_v0` / `assert_paid_v0`, bracketing the executor. `begin_guard_v0` takes a signing `payer` (which funds the guard account) and a non-signing `payout` (whose balance is measured) — deliberately different accounts, see the trust model above:
 
 ```
 [ begin_guard_v0 ]  [ the executor, directly ]  [ assert_paid_v0(min_payment) ]

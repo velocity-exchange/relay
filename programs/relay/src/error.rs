@@ -6,8 +6,8 @@ pub enum RelayError {
     InsufficientKeeperPayment,
     #[msg("Guard was not armed by begin_guard_v0 in this transaction")]
     GuardNotArmed,
-    #[msg("Guard does not belong to the given keeper")]
-    GuardKeeperMismatch,
+    #[msg("Guard does not belong to the given payout account")]
+    GuardPayoutMismatch,
     #[msg("Signer does not match the watch registrar")]
     InvalidRegistrar,
 }

@@ -61,6 +61,8 @@ All simulation runs locally in an in-process SVM — pass `--watch-program <YOUR
 
 Accounts are only served from cache without revalidation when a subscription actually covers them and the feed is alive; anything uncovered is refetched within `--max-age-uncovered-ms` so simulation never runs on stale state.
 
+Safety flags: `--payout-address <PUBKEY>` is where executors pay, and **must not be the fee payer** — signer status is transaction-global, so an untrusted executor handed the signing key could drain it. Untrusted programs are skipped without one. `--trusted-program <ID>` marks a program you wrote: its cranks skip the payment guards and may be paid to the fee payer directly, saving two instructions and their compute.
+
 Operational flags: `--concurrency` (cranks in flight per tick), `--min-program-profit` (skip programs whose recent cranks lost money), `--metrics-port` (Prometheus `/metrics` + `/health`, default 9899), `--max-cranks-per-tx` (pack cranks into shared transactions, default 3), `--max-priority-fee`.
 
 Every flag also reads from env (`RELAY_RPC_URL`, `RELAY_KEEPER_KEYPAIR`, `RELAY_TRANSPORT`, `RELAY_GRPC_ENDPOINT`, `RELAY_MIN_CRANK_PAYMENT`, `RELAY_TICK_MS`, ...). Subscriptions only replace account reads; simulation and submission always go over RPC.
