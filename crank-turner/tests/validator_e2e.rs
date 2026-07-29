@@ -823,3 +823,156 @@ where
     }
     false
 }
+
+/// Real RPC caps `getMultipleAccounts` at 100 keys per call. A turner
+/// tracking more than a handful of watches blows straight past that on
+/// every tick, so the source has to chunk.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs solana-test-validator; run scripts/e2e.sh"]
+async fn account_reads_chunk_past_the_rpc_limit() {
+    let validator = Validator::start().await;
+    let source = RpcSource::new(validator.url());
+
+    // Well past the limit, and deliberately a mix of real and missing
+    // accounts so the ordering of the reply matters.
+    let mut keys: Vec<Pubkey> = (0..250).map(|_| Pubkey::new_unique()).collect();
+    let known = Pubkey::new_from_array([0u8; 32]); // system program
+    keys[137] = known;
+
+    let accounts = source
+        .get_multiple_accounts(&keys)
+        .await
+        .expect("a turner with many watches must not fail its account reads");
+    assert_eq!(accounts.len(), keys.len(), "one slot per requested key");
+    assert!(
+        accounts[137].is_some(),
+        "results must stay aligned with the request across chunks"
+    );
+    assert!(accounts[0].is_none());
+    drop(validator);
+}
+
+/// The guard's whole purpose, proven on chain rather than in simulation.
+///
+/// Every other underpayment test rejects the crank at simulation time,
+/// which is the easy case. This one hand-builds a guarded transaction that
+/// *does* reach the cluster while the book pays less than asserted, and
+/// checks the runtime reverts all of it — including the executor's work.
+/// That atomicity is what makes a sim-to-land race survivable.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs solana-test-validator; run scripts/e2e.sh"]
+async fn guard_reverts_a_landed_underpaying_crank() {
+    let validator = Validator::start().await;
+    let client = Client::new(validator.url()).await;
+    let payer = client.payer.pubkey();
+    // Payout is a separate non-signing account, as an untrusted crank
+    // requires.
+    let payout = Pubkey::new_unique();
+    client.fund(&payout, 1_000_000).await;
+
+    let book = client.create_book(100).await;
+    let now = client.unix_timestamp().await;
+    client.post_quote(&book, now - 1, 100, SIDE_BID).await; // already expired
+    assert_eq!(client.entry_count(&book).await, 1);
+
+    // The book now pays half of what the crank will assert.
+    client
+        .send(
+            &[Instruction {
+                program_id: demo_id(),
+                accounts: vec![
+                    AccountMeta::new(book, false),
+                    AccountMeta::new_readonly(payer, true),
+                ],
+                data: disc("set_payment_v0")
+                    .into_iter()
+                    .chain((PAYMENT / 2).to_le_bytes())
+                    .collect(),
+            }],
+            &[],
+        )
+        .await;
+
+    let nonce = 0u8;
+    let guard = Pubkey::find_program_address(
+        &[relay_spec::GUARD_SEED, payout.as_ref(), &[nonce]],
+        &relay_id(),
+    )
+    .0;
+    let system = Pubkey::new_from_array([0u8; 32]);
+    let begin = Instruction {
+        program_id: relay_id(),
+        accounts: vec![
+            AccountMeta::new(payer, true),
+            AccountMeta::new_readonly(payout, false),
+            AccountMeta::new(guard, false),
+            AccountMeta::new_readonly(system, false),
+        ],
+        data: relay_spec::encode_begin_guard_v0_data(nonce).to_vec(),
+    };
+    // sweep_v0 { ids: [1] }
+    let sweep = Instruction {
+        program_id: demo_id(),
+        accounts: vec![
+            AccountMeta::new(payout, false),
+            AccountMeta::new(book, false),
+        ],
+        data: disc("sweep_v0")
+            .into_iter()
+            .chain(1u32.to_le_bytes())
+            .chain(1u64.to_le_bytes())
+            .collect(),
+    };
+    let assert_paid = Instruction {
+        program_id: relay_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(payout, false),
+            AccountMeta::new(guard, false),
+        ],
+        // Assert the full price, which the book no longer pays.
+        data: relay_spec::encode_assert_paid_v0_data(PAYMENT, nonce).to_vec(),
+    };
+
+    let payout_before = client.lamports(&payout).await;
+    let blockhash = client.rpc.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[begin.clone(), sweep.clone(), assert_paid],
+        Some(&payer),
+        &[&client.payer],
+        blockhash,
+    );
+    let landed = client.rpc.send_and_confirm_transaction(&tx).await;
+    assert!(
+        landed.is_err(),
+        "the guard should have failed the transaction"
+    );
+
+    // Everything reverted: the entry is still there and nothing was paid.
+    assert_eq!(
+        client.entry_count(&book).await,
+        1,
+        "the executor's work must revert with the guard"
+    );
+    assert_eq!(client.lamports(&payout).await, payout_before);
+
+    // The same crank at the price the book actually pays goes through,
+    // proving the failure was the assertion and not the setup.
+    let assert_half = Instruction {
+        program_id: relay_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(payout, false),
+            AccountMeta::new(guard, false),
+        ],
+        data: relay_spec::encode_assert_paid_v0_data(PAYMENT / 2, nonce).to_vec(),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[begin, sweep, assert_half],
+        Some(&payer),
+        &[&client.payer],
+        client.rpc.get_latest_blockhash().await.unwrap(),
+    );
+    client.rpc.send_and_confirm_transaction(&tx).await.unwrap();
+    assert_eq!(client.entry_count(&book).await, 0, "the honest crank lands");
+    assert_eq!(client.lamports(&payout).await - payout_before, PAYMENT / 2);
+    drop(validator);
+}

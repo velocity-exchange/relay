@@ -45,6 +45,12 @@ Prefer declarative iterator chains (`map`/`filter`/`fold`/`try_fold`/`find`/`col
 
 `crank-turner/tests/*` hand-pin demo-book's offsets and sizes (`BOOK_ACCOUNT_LEN`, `CONDITIONS_OFFSET`, `ENTRY_COUNT_OFFSET`, `STAGING_OFFSET`, ...) so the turner crates never depend on the anchor-v2 tree. **Any change to `BookV0` breaks them**, usually as `InvalidInstructionData` or a nonsense assertion rather than a clean failure — re-read `programs/demo-book/src/state.rs` and update both test files. The e2e test guards itself with a per-side/total consistency check for exactly this reason.
 
+## What the e2e is for
+
+`scripts/e2e.sh` exists to catch what litesvm structurally cannot: real RPC limits and encodings, commitment lag, on-chain atomicity, and the daemon's own plumbing. It has already found three defects the unit suites passed clean on — an unchunked `getMultipleAccounts` (RPC caps at 100), a compute limit summed from probes that never saw the appended instruction, and a duplicate submission from too-short post-send suppression. When adding turner behavior, ask whether it can only be wrong against a real cluster; if so it belongs here.
+
+Known gaps, in rough priority: the gRPC transport is never executed (needs a geyser plugin in the validator); nothing kills the websocket or restarts the validator mid-run to exercise reconnect and coverage revocation; the submitter's resend / re-sign / `Expired` path never fires because blockhashes do not expire in a short test; no scenario runs two turners against one registry.
+
 ## Turner invariants
 
 - Simulation is **local** (`local_sim.rs`, an in-process LiteSVM lazy-fork). Do not add code paths that simulate over RPC; `--remote-sim` exists only as a cross-check. Accounts come cache-first, so keep `--watch-program` coverage in mind when adding account reads.

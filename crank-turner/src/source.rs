@@ -6,6 +6,7 @@
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use base64::Engine as _;
+use futures_util::StreamExt;
 use solana_account_decoder::{UiAccountData, UiAccountEncoding};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
@@ -104,6 +105,11 @@ pub trait ChainSource: Send + Sync {
     /// treat it as a hint and clamp it.
     async fn recent_priority_fee(&self, accounts: &[Pubkey]) -> Result<u64>;
 }
+
+/// RPC's per-call ceiling for `getMultipleAccounts`.
+const MAX_ACCOUNTS_PER_CALL: usize = 100;
+/// How many of those chunk calls to have in flight at once.
+const MAX_CONCURRENT_ACCOUNT_CALLS: usize = 8;
 
 /// Sharing a source between the turner and the submitter is the norm, so
 /// `Arc` forwards the trait rather than making every caller deref.
@@ -205,10 +211,24 @@ fn decode_ui_account(ui: solana_account_decoder::UiAccount) -> Option<Account> {
 #[async_trait]
 impl ChainSource for RpcSource {
     async fn get_multiple_accounts(&self, pubkeys: &[Pubkey]) -> Result<Vec<Option<Account>>> {
-        self.client
-            .get_multiple_accounts(pubkeys)
-            .await
+        // RPC rejects more than 100 keys per call, and a turner tracking a
+        // real registry passes that on every tick. `buffered` preserves
+        // input order, so concatenating the chunk replies keeps each slot
+        // aligned with the key that asked for it.
+        let chunks: Vec<Vec<Pubkey>> = pubkeys
+            .chunks(MAX_ACCOUNTS_PER_CALL)
+            .map(<[Pubkey]>::to_vec)
+            .collect();
+        let replies: Vec<_> = futures_util::stream::iter(chunks)
+            .map(|chunk| async move { self.client.get_multiple_accounts(&chunk).await })
+            .buffered(MAX_CONCURRENT_ACCOUNT_CALLS)
+            .collect()
+            .await;
+        replies
+            .into_iter()
+            .collect::<std::result::Result<Vec<_>, _>>()
             .context("get_multiple_accounts")
+            .map(|chunks| chunks.into_iter().flatten().collect())
     }
 
     async fn get_watch_accounts(
