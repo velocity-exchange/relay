@@ -12,7 +12,7 @@ members = ["spec", "chain-source", "crank-turner"]
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/noahprince22/relay"
+repository = "https://github.com/velocity-exchange/relay"
 
 [profile.release]
 lto = "fat"
