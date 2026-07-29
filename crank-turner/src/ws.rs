@@ -81,8 +81,14 @@ async fn run(
                 // Immediate rebuild with the new set.
                 backoff = Duration::from_secs(1);
             }
-            SessionEnd::Failed(err) => {
-                warn!(error = %err, "ws session failed; reconnecting in {backoff:?}");
+            SessionEnd::Failed { established, error } => {
+                // A session that was live and dropped is not evidence the
+                // endpoint is down, so do not inherit the delay built up
+                // by earlier connect failures.
+                if established {
+                    backoff = Duration::from_secs(1);
+                }
+                warn!(error = %error, "ws session failed; reconnecting in {backoff:?}");
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(30));
             }
@@ -92,7 +98,23 @@ async fn run(
 
 enum SessionEnd {
     InterestChanged,
-    Failed(String),
+    Failed {
+        /// Whether this session ever got as far as subscribing. A
+        /// connection that worked and then dropped should be retried
+        /// promptly; only repeated *failures to establish* deserve a
+        /// growing delay.
+        established: bool,
+        error: String,
+    },
+}
+
+impl SessionEnd {
+    fn failed(error: impl Into<String>) -> Self {
+        Self::Failed {
+            established: false,
+            error: error.into(),
+        }
+    }
 }
 
 /// One connected session: subscribe to everything, pump until the interest
@@ -108,7 +130,7 @@ async fn session(
     feed.set_coverage(Coverage::default());
     let client = match PubsubClient::new(ws_url).await {
         Ok(client) => client,
-        Err(err) => return SessionEnd::Failed(format!("connect: {err}")),
+        Err(err) => return SessionEnd::failed(format!("connect: {err}")),
     };
     let account_config = RpcAccountInfoConfig {
         encoding: Some(UiAccountEncoding::Base64),
@@ -141,7 +163,7 @@ async fn session(
                 program_streams.push(stream);
                 program_unsubs.push(unsub);
             }
-            Err(err) => return SessionEnd::Failed(format!("program_subscribe: {err}")),
+            Err(err) => return SessionEnd::failed(format!("program_subscribe: {err}")),
         }
     }
 
@@ -171,7 +193,7 @@ async fn session(
                 );
                 unsubs.push(unsub);
             }
-            Err(err) => return SessionEnd::Failed(format!("account_subscribe {pubkey}: {err}")),
+            Err(err) => return SessionEnd::failed(format!("account_subscribe {pubkey}: {err}")),
         }
     }
     streams.extend(program_streams.into_iter().map(|stream| {
@@ -216,7 +238,7 @@ async fn session(
                 );
                 unsubs.push(unsub);
             }
-            Err(err) => return SessionEnd::Failed(format!("program_subscribe {program}: {err}")),
+            Err(err) => return SessionEnd::failed(format!("program_subscribe {program}: {err}")),
         }
     }
     // Everything above is subscribed, so silence about these accounts now
@@ -233,15 +255,24 @@ async fn session(
             update = merged.next() => match update {
                 Some(update) => {
                     if feed.updates.send(update).is_err() {
-                        break SessionEnd::Failed("feed receiver dropped".into());
+                        break SessionEnd::Failed {
+                            established: true,
+                            error: "feed receiver dropped".into(),
+                        };
                     }
                 }
                 // All streams ended: connection is gone.
-                None => break SessionEnd::Failed("ws streams ended".into()),
+                None => break SessionEnd::Failed {
+                    established: true,
+                    error: "ws streams ended".into(),
+                },
             },
             changed = interest.changed() => break match changed {
                 Ok(()) => SessionEnd::InterestChanged,
-                Err(_) => SessionEnd::Failed("interest sender dropped".into()),
+                Err(_) => SessionEnd::Failed {
+                    established: true,
+                    error: "interest sender dropped".into(),
+                },
             },
         }
     };

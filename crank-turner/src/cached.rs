@@ -341,14 +341,20 @@ impl<Inner: ChainSource> ChainSource for CachedSource<Inner> {
         }))
     }
 
+    /// The clock goes through the same freshness rule as any other
+    /// account, which matters more here than anywhere else: a clock served
+    /// blindly from cache freezes the moment the feed dies, and every
+    /// timestamp and slot wake is then evaluated against a "now" that
+    /// never advances. The turner would go silently idle while still
+    /// looking healthy — refreshing its registry, reporting no work.
     async fn clock(&self) -> Result<ClockSnapshot> {
-        let cached = self.with_state(|state, _| {
-            state
-                .accounts
-                .get(&sysvar::clock::id())
-                .and_then(|e| e.account.as_ref())
-                .and_then(|acc| bincode::deserialize::<Clock>(&acc.data).ok())
-        });
+        let cached = self
+            .get_multiple_accounts(&[sysvar::clock::id()])
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+            .and_then(|account| bincode::deserialize::<Clock>(&account.data).ok());
         match cached {
             Some(clock) => Ok(ClockSnapshot {
                 slot: clock.slot,

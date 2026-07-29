@@ -47,13 +47,14 @@ Prefer declarative iterator chains (`map`/`filter`/`fold`/`try_fold`/`find`/`col
 
 ## What the e2e is for
 
-`scripts/e2e.sh` exists to catch what litesvm structurally cannot: real RPC limits and encodings, commitment lag, on-chain atomicity, and the daemon's own plumbing. It has already found three defects the unit suites passed clean on — an unchunked `getMultipleAccounts` (RPC caps at 100), a compute limit summed from probes that never saw the appended instruction, and a duplicate submission from too-short post-send suppression. When adding turner behavior, ask whether it can only be wrong against a real cluster; if so it belongs here.
+`scripts/e2e.sh` exists to catch what litesvm structurally cannot: real RPC limits and encodings, commitment lag, on-chain atomicity, and the daemon's own plumbing. It has already found five defects the unit suites passed clean on — an unchunked `getMultipleAccounts` (RPC caps at 100), a compute limit summed from probes that never saw the appended instruction, a duplicate submission from too-short post-send suppression, a websocket backoff that never reset after a working session, and — the worst — a clock served from cache with no freshness check, which froze every timestamp and slot wake the moment the feed died while the turner still looked healthy. When adding turner behavior, ask whether it can only be wrong against a real cluster; if so it belongs here.
 
-Known gaps, in rough priority: the gRPC transport is never executed (needs a geyser plugin in the validator); nothing kills the websocket or restarts the validator mid-run to exercise reconnect and coverage revocation; the submitter's resend / re-sign / `Expired` path never fires because blockhashes do not expire in a short test; no scenario runs two turners against one registry.
+Known gaps, in rough priority: the gRPC transport is never executed (needs a geyser plugin in the validator); the submitter's resend / re-sign / `Expired` path never fires because blockhashes do not expire in a short test; no scenario runs two turners against one registry, or 100+ books against real transaction size limits; nothing restarts the validator itself (only the websocket is severed, via the proxy in `daemon_survives_losing_its_subscription`).
 
 ## Turner invariants
 
 - Simulation is **local** (`local_sim.rs`, an in-process LiteSVM lazy-fork). Do not add code paths that simulate over RPC; `--remote-sim` exists only as a cross-check. Accounts come cache-first, so keep `--watch-program` coverage in mind when adding account reads.
+- Everything the turner reads goes through the freshness rule, **including the clock** — it is an account like any other, and serving it blind is what froze all time-based wakes when the feed died. Do not add a read path that bypasses `needs_revalidation`.
 - Cache freshness is a **correctness** invariant, not a tuning knob: an account may only be served from cache without revalidation when a backend has published live `Coverage` for it *and* the feed is healthy. Never widen that (e.g. "trust anything we once fetched") — it feeds stale state into simulation. Backends must publish `Coverage::default()` the moment a session drops.
 - Packed transactions must keep each crank's `[begin_guard, executor, assert_paid]` triple **contiguous** — that is the only reason one guard account can serve a whole pack.
 

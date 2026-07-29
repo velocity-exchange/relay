@@ -654,15 +654,30 @@ impl Daemon {
     /// Spawn the binary the way an operator would: websocket transport,
     /// its own timer, its own submitter, its own metrics server.
     fn start(rpc_url: &str, keypair_path: &str, metrics_port: u16, log: String) -> Self {
+        Self::start_with_ws(
+            rpc_url,
+            &format!("ws://127.0.0.1:{}", RPC_PORT + 1),
+            keypair_path,
+            metrics_port,
+            log,
+        )
+    }
+
+    fn start_with_ws(
+        rpc_url: &str,
+        ws_url: &str,
+        keypair_path: &str,
+        metrics_port: u16,
+        log: String,
+    ) -> Self {
         let out = std::fs::File::create(&log).expect("log file");
         let err = out.try_clone().expect("log file");
         let child = Command::new(env!("CARGO_BIN_EXE_relay-crank-turner"))
             .args([
                 "--rpc-url",
                 rpc_url,
-                // The validator serves pubsub on the RPC port + 1.
                 "--ws-url",
-                &format!("ws://127.0.0.1:{}", RPC_PORT + 1),
+                ws_url,
                 "--transport",
                 "ws",
                 "--keypair",
@@ -975,4 +990,163 @@ async fn guard_reverts_a_landed_underpaying_crank() {
     assert_eq!(client.entry_count(&book).await, 0, "the honest crank lands");
     assert_eq!(client.lamports(&payout).await - payout_before, PAYMENT / 2);
     drop(validator);
+}
+
+// --- chaos: the subscription dies underneath a running daemon ---
+
+/// A TCP proxy the test can sever, sitting between the daemon and the
+/// validator's pubsub port. Killing the validator would take RPC down
+/// too; this severs only the websocket, which is the failure that
+/// actually happens in production — a provider drops the stream while
+/// RPC keeps answering.
+struct WsProxy {
+    port: u16,
+    severed: tokio::sync::watch::Sender<bool>,
+}
+
+impl WsProxy {
+    async fn start(upstream_port: u16, port: u16) -> Self {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .expect("bind proxy");
+        let (severed, _) = tokio::sync::watch::channel(false);
+        let flag = severed.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut downstream, _)) = listener.accept().await else {
+                    continue;
+                };
+                if *flag.borrow() {
+                    // Refuse while severed, the way a dead provider does.
+                    continue;
+                }
+                let mut watch = flag.subscribe();
+                tokio::spawn(async move {
+                    let Ok(mut upstream) =
+                        tokio::net::TcpStream::connect(("127.0.0.1", upstream_port)).await
+                    else {
+                        return;
+                    };
+                    tokio::select! {
+                        _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream) => {}
+                        // Sever: drop both halves mid-stream.
+                        _ = async { while watch.changed().await.is_ok() {
+                            if *watch.borrow() { break; }
+                        } } => {}
+                    }
+                });
+            }
+        });
+        Self { port, severed }
+    }
+
+    fn sever(&self) {
+        let _ = self.severed.send(true);
+    }
+
+    fn restore(&self) {
+        let _ = self.severed.send(false);
+    }
+}
+
+/// Count of cache reads served without a live subscription, straight from
+/// the daemon's own metrics.
+fn uncovered_reads(metrics: &str) -> u64 {
+    metrics
+        .lines()
+        .find(|l| l.starts_with(r#"relay_cache_reads_total{coverage="uncovered"}"#))
+        .and_then(|l| l.rsplit(' ').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+/// A daemon whose websocket dies must keep cranking, not go blind.
+///
+/// This is the freshness design under fire: when the backend loses its
+/// session it publishes empty coverage, so the cache stops trusting
+/// silence and revalidates against RPC. Work continues, more expensively,
+/// until the subscription comes back. Nothing else in the suite exercises
+/// that path — the cache tests fake coverage, and the happy-path daemon
+/// test never loses its stream.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs solana-test-validator; run scripts/e2e.sh"]
+async fn daemon_survives_losing_its_subscription() {
+    let validator = Validator::start().await;
+    let client = Client::new(validator.url()).await;
+    let proxy = WsProxy::start(RPC_PORT + 1, 9101).await;
+
+    let keeper = Keypair::new();
+    client.fund(&keeper.pubkey(), 10_000_000_000).await;
+    let dir = std::env::temp_dir().join(format!("relay-chaos-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let keypair_path = dir.join("keeper.json").to_string_lossy().into_owned();
+    keeper.write_to_file(&keypair_path).expect("write keypair");
+
+    let book = client.create_book(100).await;
+    let metrics_port = 9978;
+    let daemon = Daemon::start_with_ws(
+        &validator.url(),
+        &format!("ws://127.0.0.1:{}", proxy.port),
+        &keypair_path,
+        metrics_port,
+        dir.join("turner.log").to_string_lossy().into_owned(),
+    );
+
+    // Baseline: cranking with a healthy subscription.
+    let now = client.unix_timestamp().await;
+    client.post_quote(&book, now + 2, 100, SIDE_BID).await;
+    assert!(
+        wait_for(Duration::from_secs(60), || async {
+            client.entry_count(&book).await == 0
+        })
+        .await,
+        "baseline crank never happened.\nlogs:\n{}",
+        daemon.logs()
+    );
+
+    // Sever the stream. RPC stays up, exactly as when a provider drops.
+    proxy.sever();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let during_start = uncovered_reads(&scrape(metrics_port).await.unwrap_or_default());
+
+    // Work posted while blind must still get cranked.
+    let now = client.unix_timestamp().await;
+    client.post_quote(&book, now + 2, 101, SIDE_BID).await;
+    assert!(
+        wait_for(Duration::from_secs(60), || async {
+            client.entry_count(&book).await == 0
+        })
+        .await,
+        "daemon stopped cranking when its subscription died.\nlogs:\n{}",
+        daemon.logs()
+    );
+
+    // And it noticed: with coverage revoked, reads fall back to RPC.
+    let during_end = uncovered_reads(&scrape(metrics_port).await.unwrap_or_default());
+    assert!(
+        during_end > during_start,
+        "expected uncovered reads to climb while the feed was down \
+         ({during_start} -> {during_end})"
+    );
+
+    // Restore, and confirm it recovers rather than limping on RPC forever.
+    proxy.restore();
+    let now = client.unix_timestamp().await;
+    client.post_quote(&book, now + 2, 102, SIDE_BID).await;
+    assert!(
+        wait_for(Duration::from_secs(90), || async {
+            client.entry_count(&book).await == 0
+        })
+        .await,
+        "daemon never recovered after the subscription returned.\nlogs:\n{}",
+        daemon.logs()
+    );
+    let logs = daemon.logs();
+    assert!(
+        logs.matches("ws session failed").count() >= 1,
+        "expected the daemon to report the dropped session:\n{logs}"
+    );
+    drop(daemon);
+    drop(validator);
+    let _ = std::fs::remove_dir_all(&dir);
 }
