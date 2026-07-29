@@ -3533,6 +3533,7 @@ dependencies = [
  "solana-pubsub-client",
  "solana-rpc-client-api",
  "solana-sdk",
+ "solana-transaction-status-client-types",
  "tokio",
  "tracing",
  "yellowstone-grpc-client",

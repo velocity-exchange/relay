@@ -45,6 +45,12 @@ Prefer declarative iterator chains (`map`/`filter`/`fold`/`try_fold`/`find`/`col
 
 `crank-turner/tests/*` hand-pin demo-book's offsets and sizes (`BOOK_ACCOUNT_LEN`, `CONDITIONS_OFFSET`, `ENTRY_COUNT_OFFSET`, `STAGING_OFFSET`, ...) so the turner crates never depend on the anchor-v2 tree. **Any change to `BookV0` breaks them**, usually as `InvalidInstructionData` or a nonsense assertion rather than a clean failure — re-read `programs/demo-book/src/state.rs` and update both test files. The e2e test guards itself with a per-side/total consistency check for exactly this reason.
 
+## Commitment and forks
+
+Reads, subscriptions, and simulation run at `processed`; the blockhash and signature outcomes require `confirmed`. Do not "fix" the first by raising it — stale state is what makes a keeper's simulation wrong — and do not lower the second two: a `processed` blockhash can be abandoned, and a `processed` signature status is not yet an outcome.
+
+`processed` means a cached write can be taken back with **no correcting notification**, because the canonical chain never writes that account. Fork detection (slot subscriptions → `SlotUpdate` → `CachedSource::drain_slots`) is the only thing covering that, so treat it as load-bearing. Two traps, both pinned by tests: only the *processed* slot status may move the fork tip (confirmed and finalized repeat slots already passed, and would read as a switch every slot, throwing the cache away continuously); and ordinary skipped slots are not switches, so the predicate must key on the parent being below the tip rather than on gaps. There is no way to make a single-node test validator fork, so the state machine is pinned by unit tests in `cached.rs`, and the e2e only asserts the subscription is live and never fires.
+
 ## What the e2e is for
 
 `scripts/e2e.sh` exists to catch what litesvm structurally cannot: real RPC limits and encodings, commitment lag, on-chain atomicity, and the daemon's own plumbing. It has already found five defects the unit suites passed clean on — an unchunked `getMultipleAccounts` (RPC caps at 100), a compute limit summed from probes that never saw the appended instruction, a duplicate submission from too-short post-send suppression, a websocket backoff that never reset after a working session, and — the worst — a clock served from cache with no freshness check, which froze every timestamp and slot wake the moment the feed died while the turner still looked healthy.

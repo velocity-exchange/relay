@@ -19,6 +19,7 @@ prometheus = { version = "0.13", default-features = false }
 solana-account = "3"
 solana-account-decoder = "3"
 solana-client = "3"
+solana-transaction-status-client-types = "3"
 solana-commitment-config = "3"
 solana-pubsub-client = "3"
 solana-rpc-client-api = "3"

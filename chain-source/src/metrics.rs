@@ -18,6 +18,19 @@ use prometheus::{
 /// This crate's registry. Consumers gather it next to their own.
 pub static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
 
+/// Fork switches observed, and the provisional cached accounts they
+/// invalidated. Reads run at `processed`, so a write can be taken back; this
+/// is how often that actually happens.
+pub static REORGS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec_with_registry!(
+        "chain_reorgs_total",
+        "Fork switches detected, and accounts dropped as a result",
+        &["kind"],
+        REGISTRY
+    )
+    .expect("metric registers")
+});
+
 /// Where a watched account update came from: `stream` or `poll`.
 pub static UPDATE_SOURCE: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec_with_registry!(

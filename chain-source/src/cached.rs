@@ -54,7 +54,9 @@ use solana_sdk::signature::Signature;
 use solana_sdk::sysvar;
 use solana_sdk::transaction::Transaction;
 
-use crate::feed::FeedReceiver;
+use tracing::warn;
+
+use crate::feed::{FeedReceiver, SlotUpdate};
 use crate::grpc::ProgramSubscription;
 use crate::metrics;
 use crate::source::{AccountFilter, ChainSource, ClockSnapshot, SimOutcome};
@@ -117,6 +119,11 @@ struct CacheState {
     warm: bool,
     /// Last update of any kind — the feed's heartbeat.
     last_feed_update: Option<Instant>,
+    /// Highest slot seen processing. A processed slot at or below this, or
+    /// one built on a parent below it, means the cluster switched forks.
+    fork_tip: u64,
+    /// Highest rooted slot: the floor below which nothing can be undone.
+    root: u64,
 }
 
 pub struct CachedSource<Inner> {
@@ -137,6 +144,8 @@ impl<Inner: ChainSource> CachedSource<Inner> {
                 interested: HashSet::new(),
                 warm: false,
                 last_feed_update: None,
+                fork_tip: 0,
+                root: 0,
             }),
         };
         // The clock rides the feed like any other account.
@@ -158,6 +167,13 @@ impl<Inner: ChainSource> CachedSource<Inner> {
 
     /// Apply pending feed updates. Updates are ordered per account by slot;
     /// stale ones (older slot than cached) are dropped.
+    ///
+    /// Accounts first, then slots. The two arrive on separate channels, so
+    /// their relative order is not guaranteed, and doing fork invalidation
+    /// last means a write from the fork being abandoned cannot slip in
+    /// behind it. The cost is that fresh writes from the *new* fork get
+    /// dropped too, since they are also above the fork point — conservative
+    /// in the direction that costs a refetch rather than a wrong simulation.
     fn drain(state: &mut CacheState, config: &CachedSourceConfig) {
         while let Ok(update) = state.feed.updates.try_recv() {
             let is_indexed = update
@@ -182,6 +198,61 @@ impl<Inner: ChainSource> CachedSource<Inner> {
             if is_indexed {
                 state.indexed_keys.insert(update.pubkey);
             }
+        }
+        Self::drain_slots(state);
+    }
+
+    /// Track the fork the cluster is on, and drop provisional writes when it
+    /// changes.
+    ///
+    /// This is the half of `processed` reads that the account stream cannot
+    /// cover on its own. A write on an abandoned fork produces no canonical
+    /// write, so no correcting notification is ever sent, and silence is
+    /// indistinguishable from "unchanged" — the cached value would stand
+    /// until the age ceiling expired, feeding simulations a world that never
+    /// happened. Dropping the entry sends it back through the normal
+    /// revalidation path, where it is refetched before use.
+    fn drain_slots(state: &mut CacheState) {
+        while let Ok(update) = state.feed.slots.try_recv() {
+            state.last_feed_update = Some(Instant::now());
+            let (slot, parent) = match update {
+                SlotUpdate::Rooted { slot } => {
+                    state.root = state.root.max(slot);
+                    continue;
+                }
+                SlotUpdate::Processed { slot, parent } => (slot, parent),
+            };
+            // Two shapes of fork switch: a slot we have already passed
+            // showing up again, or a new slot built on something older than
+            // what we had already seen processed. Skipped slots — normal and
+            // frequent — are neither: they leave the tip advancing and the
+            // parent at the previous tip.
+            let switched = state.fork_tip > 0
+                && (slot <= state.fork_tip || parent.is_some_and(|p| p < state.fork_tip));
+            state.fork_tip = state.fork_tip.max(slot);
+            if !switched {
+                continue;
+            }
+            // Everything above the common ancestor is suspect. Without a
+            // parent, fall back to the last rooted slot.
+            let settled = parent.unwrap_or(state.root);
+            let before = state.accounts.len();
+            state.accounts.retain(|_, entry| entry.slot <= settled);
+            let dropped = before - state.accounts.len();
+            state
+                .indexed_keys
+                .retain(|key| state.accounts.contains_key(key));
+            metrics::REORGS.with_label_values(&["detected"]).inc();
+            metrics::REORGS
+                .with_label_values(&["accounts_dropped"])
+                .inc_by(dropped as u64);
+            warn!(
+                slot,
+                parent = ?parent,
+                settled,
+                dropped,
+                "fork switch: dropped provisional accounts"
+            );
         }
     }
 
@@ -407,4 +478,220 @@ fn matches_any(account: &Account, subscriptions: &[ProgramSubscription]) -> bool
     subscriptions.iter().any(|subscription| {
         account.owner == subscription.program && matches_filters(account, &subscription.filter_sets)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::feed::{feed_channel, AccountUpdate};
+
+    /// The fork state machine, driven directly. There is no way to make a
+    /// single-node test validator fork, so this is where the behaviour is
+    /// pinned; the transports' job is only to translate their own slot
+    /// notifications into these events.
+    struct Harness {
+        state: CacheState,
+        config: CachedSourceConfig,
+        sender: crate::feed::FeedSender,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let (sender, receiver) = feed_channel();
+            Self {
+                state: CacheState {
+                    feed: receiver,
+                    accounts: HashMap::new(),
+                    indexed_keys: HashSet::new(),
+                    interested: HashSet::new(),
+                    warm: false,
+                    last_feed_update: None,
+                    fork_tip: 0,
+                    root: 0,
+                },
+                config: CachedSourceConfig::default(),
+                sender,
+            }
+        }
+
+        /// An account write observed at `slot`.
+        fn wrote(&mut self, pubkey: Pubkey, slot: u64) {
+            self.sender
+                .updates
+                .send(AccountUpdate {
+                    pubkey,
+                    account: Some(Account {
+                        lamports: slot,
+                        ..Default::default()
+                    }),
+                    slot,
+                })
+                .unwrap();
+        }
+
+        fn slot(&mut self, update: SlotUpdate) {
+            self.sender.set_slot(update);
+        }
+
+        fn drain(&mut self) {
+            CachedSource::<crate::source::RpcSource>::drain(&mut self.state, &self.config);
+        }
+
+        fn cached(&self, pubkey: &Pubkey) -> Option<u64> {
+            self.state.accounts.get(pubkey).map(|entry| entry.slot)
+        }
+    }
+
+    /// Slots get skipped constantly on a live cluster: the parent of a new
+    /// slot is routinely below `slot - 1`. That is not a fork switch, and
+    /// treating it as one would throw the cache away every few slots.
+    #[test]
+    fn skipped_slots_are_not_a_fork_switch() {
+        let mut h = Harness::new();
+        let account = Pubkey::new_unique();
+
+        h.slot(SlotUpdate::Processed {
+            slot: 100,
+            parent: Some(99),
+        });
+        h.wrote(account, 100);
+        h.drain();
+        assert_eq!(h.cached(&account), Some(100));
+
+        // 101 and 102 skipped; 103 builds straight on 100, which is the tip.
+        h.slot(SlotUpdate::Processed {
+            slot: 103,
+            parent: Some(100),
+        });
+        h.drain();
+        // Surviving the skip *is* the assertion: an invalidation would have
+        // dropped this. The counter is a process-global static, so asserting
+        // on it here would race the other tests in this module.
+        assert_eq!(h.cached(&account), Some(100), "cache survived a skip");
+    }
+
+    /// The case the whole mechanism exists for: a write lands at `processed`
+    /// on a fork that is then abandoned. No canonical write follows, so no
+    /// correcting notification ever arrives — without this the phantom value
+    /// would be served until the age ceiling expired.
+    #[test]
+    fn a_fork_switch_drops_writes_from_the_abandoned_fork() {
+        let mut h = Harness::new();
+        let (settled, phantom) = (Pubkey::new_unique(), Pubkey::new_unique());
+
+        h.slot(SlotUpdate::Rooted { slot: 100 });
+        h.slot(SlotUpdate::Processed {
+            slot: 101,
+            parent: Some(100),
+        });
+        h.wrote(settled, 100);
+        h.wrote(phantom, 101);
+        h.drain();
+        assert_eq!(h.cached(&phantom), Some(101));
+
+        // The cluster switches: a new slot built on 100, so 101 is gone.
+        h.slot(SlotUpdate::Processed {
+            slot: 102,
+            parent: Some(100),
+        });
+        h.drain();
+        assert_eq!(h.cached(&phantom), None, "provisional write survived");
+        assert_eq!(
+            h.cached(&settled),
+            Some(100),
+            "a write at or below the fork point is settled and must be kept"
+        );
+    }
+
+    /// A slot number reappearing is the other shape of the same thing.
+    #[test]
+    fn a_repeated_slot_is_a_fork_switch() {
+        let mut h = Harness::new();
+        let account = Pubkey::new_unique();
+
+        h.slot(SlotUpdate::Processed {
+            slot: 200,
+            parent: Some(199),
+        });
+        h.wrote(account, 200);
+        h.drain();
+
+        h.slot(SlotUpdate::Processed {
+            slot: 200,
+            parent: Some(199),
+        });
+        h.drain();
+        assert_eq!(h.cached(&account), None);
+    }
+
+    /// Confirmed and finalized statuses repeat slots the tip has already
+    /// passed. Only the processed status may move the tip, or every slot
+    /// would read as a switch and the cache would never hold anything.
+    #[test]
+    fn rooted_events_never_read_as_a_fork_switch() {
+        let mut h = Harness::new();
+        let account = Pubkey::new_unique();
+
+        h.slot(SlotUpdate::Processed {
+            slot: 300,
+            parent: Some(299),
+        });
+        h.wrote(account, 300);
+        h.drain();
+
+        (295..=300).for_each(|slot| h.slot(SlotUpdate::Rooted { slot }));
+        h.drain();
+        assert_eq!(h.cached(&account), Some(300));
+        assert_eq!(h.state.root, 300);
+    }
+
+    /// Dropping an account must drop it from the program index too, or a
+    /// cached `get_program_accounts` would answer with a key it can no
+    /// longer resolve.
+    #[test]
+    fn invalidation_also_clears_the_program_index() {
+        let mut h = Harness::new();
+        let account = Pubkey::new_unique();
+
+        h.slot(SlotUpdate::Processed {
+            slot: 400,
+            parent: Some(399),
+        });
+        h.wrote(account, 400);
+        h.drain();
+        h.state.indexed_keys.insert(account);
+
+        h.slot(SlotUpdate::Processed {
+            slot: 401,
+            parent: Some(399),
+        });
+        h.drain();
+        assert!(h.state.accounts.is_empty());
+        assert!(h.state.indexed_keys.is_empty());
+    }
+
+    /// Without a parent (a transport that reports only the slot), the last
+    /// rooted slot is the fallback floor.
+    #[test]
+    fn a_missing_parent_falls_back_to_the_root() {
+        let mut h = Harness::new();
+        let (settled, provisional) = (Pubkey::new_unique(), Pubkey::new_unique());
+
+        h.slot(SlotUpdate::Rooted { slot: 500 });
+        h.slot(SlotUpdate::Processed {
+            slot: 505,
+            parent: None,
+        });
+        h.wrote(settled, 500);
+        h.wrote(provisional, 505);
+        h.drain();
+
+        h.slot(SlotUpdate::Processed {
+            slot: 502,
+            parent: None,
+        });
+        h.drain();
+        assert_eq!(h.cached(&settled), Some(500));
+        assert_eq!(h.cached(&provisional), None);
+    }
 }

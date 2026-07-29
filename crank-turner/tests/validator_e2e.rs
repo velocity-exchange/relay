@@ -831,8 +831,27 @@ async fn shipped_daemon_cranks_over_websocket() {
     let metrics = scrape(metrics_port).await.unwrap_or_default();
     // And served its reads from the subscription rather than polling.
     assert!(
-        metrics.contains(r#"relay_cache_reads_total{coverage="covered"}"#),
+        metrics.contains(r#"chain_cache_reads_total{outcome="covered"}"#),
         "no covered cache reads, so the feed was not doing the work:\n{metrics}"
+    );
+
+    // Fork detection is live. Reads run at `processed`, so a write can be
+    // taken back with no correcting notification ever arriving; the slot
+    // stream is the only thing that would tell us. Failing to subscribe is
+    // deliberately non-fatal, which means it could go missing silently.
+    assert!(
+        !logs.contains("slot_subscribe failed"),
+        "slot subscription failed, so fork detection was off:\n{logs}"
+    );
+    // And it does not cry wolf. One validator cannot fork, so any detection
+    // here is a bug in the predicate — the shape to watch for is confirmed
+    // and finalized statuses, which repeat slots the tip has already passed
+    // and would otherwise read as a switch on every single slot, throwing
+    // the cache away continuously.
+    assert_eq!(
+        metric_sum(&metrics, "chain_reorgs_total", r#"kind="detected""#),
+        0,
+        "fork switches reported against a single-node validator:\n{metrics}"
     );
     assert!(
         metrics.contains("relay_cranks_total"),
@@ -1081,7 +1100,7 @@ impl WsProxy {
 fn uncovered_reads(metrics: &str) -> u64 {
     metrics
         .lines()
-        .find(|l| l.starts_with(r#"relay_cache_reads_total{coverage="uncovered"}"#))
+        .find(|l| l.starts_with(r#"chain_cache_reads_total{outcome="uncovered"}"#))
         .and_then(|l| l.rsplit(' ').next())
         .and_then(|n| n.parse().ok())
         .unwrap_or(0)

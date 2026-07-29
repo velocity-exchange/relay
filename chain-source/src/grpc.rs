@@ -26,10 +26,10 @@ use yellowstone_grpc_proto::prelude::{
     subscribe_request_filter_accounts_filter_memcmp::Data as AccountsFilterMemcmpOneof,
     subscribe_update::UpdateOneof, SubscribeRequest, SubscribeRequestFilterAccounts,
     SubscribeRequestFilterAccountsFilter, SubscribeRequestFilterAccountsFilterMemcmp,
-    SubscribeRequestPing,
+    SubscribeRequestFilterSlots, SubscribeRequestPing,
 };
 
-use crate::feed::{AccountUpdate, Coverage, FeedSender};
+use crate::feed::{AccountUpdate, Coverage, FeedSender, SlotUpdate};
 use crate::source::AccountFilter;
 
 #[derive(Debug, Clone)]
@@ -149,6 +149,17 @@ fn build_request(
         .collect();
     SubscribeRequest {
         accounts,
+        // Slot statuses, for fork detection: a `processed` account write can
+        // be taken back, and nothing in the account stream says so.
+        slots: [(
+            "slots".to_string(),
+            SubscribeRequestFilterSlots {
+                filter_by_commitment: Some(false),
+                ..Default::default()
+            },
+        )]
+        .into_iter()
+        .collect(),
         commitment: Some(CommitmentLevel::Processed as i32),
         ..Default::default()
     }
@@ -226,6 +237,23 @@ async fn run(config: GrpcFeedConfig, subscriptions: Vec<ProgramSubscription>, fe
                             if feed.updates.send(account).is_err() {
                                 return; // receiver dropped: shut down
                             }
+                        }
+                        Some(UpdateOneof::Slot(update)) => {
+                            // One event per status per slot, so only the
+                            // processed one may move the fork tip —
+                            // confirmed and finalized repeat a slot we have
+                            // already passed and would read as a switch.
+                            let event = match CommitmentLevel::try_from(update.status) {
+                                Ok(CommitmentLevel::Processed) => SlotUpdate::Processed {
+                                    slot: update.slot,
+                                    parent: update.parent,
+                                },
+                                Ok(CommitmentLevel::Finalized) => {
+                                    SlotUpdate::Rooted { slot: update.slot }
+                                }
+                                _ => continue,
+                            };
+                            feed.set_slot(event);
                         }
                         Some(UpdateOneof::Ping(_)) => {
                             // Keeps ping-expecting load balancers happy.

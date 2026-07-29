@@ -18,7 +18,7 @@ use solana_sdk::sysvar;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
-use crate::feed::{AccountUpdate, Coverage, FeedSender};
+use crate::feed::{AccountUpdate, Coverage, FeedSender, SlotUpdate};
 use crate::grpc::ProgramSubscription;
 use crate::source::AccountFilter;
 
@@ -128,6 +128,7 @@ async fn session(
         .collect();
     let mut program_streams = Vec::new();
     let mut program_unsubs = Vec::new();
+    let mut unsubs_slot = None;
     for (program, filters) in &queries {
         match client
             .program_subscribe(
@@ -147,6 +148,21 @@ async fn session(
             Err(err) => return SessionEnd::failed(format!("program_subscribe {program}: {err}")),
         }
     }
+
+    // Slots, for fork detection. `slotSubscribe` carries the parent and the
+    // root, which is everything the cache needs to tell a skipped slot from
+    // an abandoned fork. A provider that does not support it degrades to
+    // age-based revalidation rather than losing the session.
+    let mut slot_stream = match client.slot_subscribe().await {
+        Ok((stream, unsub)) => {
+            unsubs_slot = Some(unsub);
+            Some(stream)
+        }
+        Err(err) => {
+            warn!(error = %err, "slot_subscribe failed; fork detection disabled this session");
+            None
+        }
+    };
 
     // Interested accounts (targets, change-watched accounts, clock): one
     // account subscription each, tagged with its pubkey.
@@ -222,6 +238,27 @@ async fn session(
                     error: "ws streams ended".into(),
                 },
             },
+            // `Pin` dance avoided by only polling when a stream exists.
+            slot = async {
+                match slot_stream.as_mut() {
+                    Some(stream) => stream.next().await,
+                    // No slot subscription: park forever rather than
+                    // spinning on `None`.
+                    None => std::future::pending().await,
+                }
+            } => match slot {
+                Some(info) => {
+                    feed.set_slot(SlotUpdate::Processed {
+                        slot: info.slot,
+                        parent: Some(info.parent),
+                    });
+                    feed.set_slot(SlotUpdate::Rooted { slot: info.root });
+                }
+                None => break SessionEnd::Failed {
+                    established: true,
+                    error: "ws slot stream ended".into(),
+                },
+            },
             changed = interest.changed() => break match changed {
                 Ok(()) => SessionEnd::InterestChanged,
                 Err(_) => SessionEnd::Failed {
@@ -232,6 +269,10 @@ async fn session(
         }
     };
     drop(merged);
+    drop(slot_stream);
+    if let Some(unsub) = unsubs_slot {
+        unsub().await;
+    }
     // The session is over: stop vouching for anything before the
     // reconnect, so the cache revalidates in the meantime.
     feed.set_coverage(Coverage::default());

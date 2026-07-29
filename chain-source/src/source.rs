@@ -28,6 +28,7 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use solana_sdk::sysvar;
 use solana_sdk::transaction::Transaction;
+use solana_transaction_status_client_types::TransactionConfirmationStatus;
 
 /// Chain time, as the scheduler's single notion of "now" — always the
 /// on-chain clock, never wall time, so wakes can't fire early relative to
@@ -343,10 +344,25 @@ impl ChainSource for RpcSource {
                 .context("get_signature_statuses")?
                 .value;
             out.extend(statuses.into_iter().map(|status| {
-                status.map(|status| match status.err {
-                    Some(err) => SignatureOutcome::Failed(err.to_string()),
-                    None => SignatureOutcome::Landed,
-                })
+                // A `processed`-only status is not an outcome yet: the fork
+                // carrying it can still be abandoned, and the caller acts on
+                // these — booking payment, or ramping a contention delay off
+                // a revert. Leave it pending and let it settle. If the fork
+                // does get dropped it never confirms, the blockhash expires,
+                // and it comes back as a retryable `Expired` rather than a
+                // landed crank that never happened.
+                status
+                    .filter(|status| {
+                        matches!(
+                            status.confirmation_status,
+                            Some(TransactionConfirmationStatus::Confirmed)
+                                | Some(TransactionConfirmationStatus::Finalized)
+                        )
+                    })
+                    .map(|status| match status.err {
+                        Some(err) => SignatureOutcome::Failed(err.to_string()),
+                        None => SignatureOutcome::Landed,
+                    })
             }));
         }
         Ok(out)
