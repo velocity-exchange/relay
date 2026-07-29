@@ -171,6 +171,13 @@ fn compute_limit(units_consumed: u64) -> u32 {
     ((units_consumed as f64 * 1.2) as u64).clamp(1_000, MAX_COMPUTE_UNITS as u64) as u32
 }
 
+/// `ComputeBudget111111111111111111111111111111`.
+static COMPUTE_BUDGET_PROGRAM_ID: std::sync::LazyLock<Pubkey> = std::sync::LazyLock::new(|| {
+    "ComputeBudget111111111111111111111111111111"
+        .parse()
+        .expect("valid program id")
+});
+
 /// System program id (the all-zero address), required by
 /// `begin_guard_v0`'s lazy guard-account creation.
 const SYSTEM_PROGRAM_ID: Pubkey = Pubkey::new_from_array([0u8; 32]);
@@ -783,7 +790,7 @@ impl<S: ChainSource> Turner<S> {
                 units,
                 self.priority_fee(),
             );
-            let built = match self.signed_tx(&ixs).await {
+            let built = match self.sign_for_submission(&ixs).await {
                 Ok((tx, expiry)) => {
                     let ok = pack.len() == 1
                         || self
@@ -806,7 +813,7 @@ impl<S: ChainSource> Turner<S> {
                             compute_limit(single.units),
                             self.priority_fee(),
                         );
-                        match self.signed_tx(&ixs).await {
+                        match self.sign_for_submission(&ixs).await {
                             Ok((tx, expiry)) => {
                                 self.finish_pack(
                                     std::slice::from_ref(single),
@@ -1036,6 +1043,58 @@ impl<S: ChainSource> Turner<S> {
             .map(|s| s.priority_fee())
             .unwrap_or(0)
             .min(self.config.max_priority_fee)
+    }
+
+    /// The authoritative safety gate, run on the exact instruction list
+    /// about to be signed and sent.
+    ///
+    /// A malicious executor is harmless as long as it never receives an
+    /// account that signs the transaction — so rather than reason about
+    /// where the account list came from, search the finished list. Returns
+    /// the offending program if any instruction that is not ours, and not
+    /// trusted, names the fee payer. Public so an operator embedding the
+    /// turner can pre-flight their own instruction lists with the same
+    /// rule the turner enforces.
+    ///
+    /// This sits at signing time on purpose. The same check runs earlier
+    /// for a clean skip reason, but instructions are rebuilt, re-priced
+    /// and concatenated into packs after that point; putting the binding
+    /// check here means no later transformation can reintroduce a leak.
+    pub fn signer_leak(&self, ixs: &[Instruction]) -> Option<Pubkey> {
+        let fee_payer = self.keeper.pubkey();
+        ixs.iter()
+            .filter(|ix| {
+                // Our own instructions legitimately take the fee payer:
+                // begin_guard needs it to fund the guard account.
+                ix.program_id != self.config.relay_program
+                    && ix.program_id != *COMPUTE_BUDGET_PROGRAM_ID
+                    && !self.trusts(&ix.program_id)
+            })
+            .find(|ix| names_signer(ix, &fee_payer))
+            .map(|ix| ix.program_id)
+    }
+
+    /// Sign a transaction that is about to be submitted, refusing to sign
+    /// one that would hand a signing account to an untrusted program.
+    async fn sign_for_submission(&self, ixs: &[Instruction]) -> Result<(Transaction, u64)> {
+        if let Some(program) = self.signer_leak(ixs) {
+            metrics::FAILURES
+                .with_label_values(&["signer_leak", &metrics::program_label(&program)])
+                .inc();
+            anyhow::bail!(
+                "refusing to sign: untrusted program {program} would receive the fee payer, \
+                 which signs this transaction"
+            );
+        }
+        let (tx, expiry) = self.signed_tx(ixs).await?;
+        // The leak check above compares against one key, which is only
+        // sufficient while the turner signs with exactly one.
+        debug_assert_eq!(
+            tx.signatures.len(),
+            1,
+            "signer_leak assumes a single-signer transaction"
+        );
+        Ok((tx, expiry))
     }
 
     /// Sign against the shared blockhash the submitter keeps refreshed,

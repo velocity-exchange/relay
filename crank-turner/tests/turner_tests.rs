@@ -1982,3 +1982,91 @@ async fn trusted_programs_skip_the_guards() {
         "a trusted crank should not create a guard account"
     );
 }
+
+/// The binding check runs at signing time, so a leak introduced *after*
+/// the early skip check — by packing, re-pricing, or a future refactor —
+/// still cannot be signed. Exercised by handing the turner a condition
+/// whose executor is an untrusted program and confirming that a
+/// transaction naming the fee payer never leaves.
+#[tokio::test]
+async fn signing_refuses_to_hand_the_fee_payer_to_an_untrusted_program() {
+    let payout = Pubkey::new_unique();
+    let mut h = setup(PAYMENT, 100, guarded_config(payout));
+    h.svm.lock().unwrap().airdrop(&payout, 1_000_000).unwrap();
+    h.refresh().await;
+    let t0 = h.t0;
+    h.add_entry(t0 + 100);
+
+    // Baseline: the untrusted path works, and the fee payer is nowhere in
+    // the executor, so nothing is refused.
+    h.warp(t0 + 200, 2);
+    let outcomes = h.tick().await;
+    assert_eq!(sent(&outcomes).len(), 1, "{outcomes:?}");
+    assert!(
+        !outcomes.iter().any(|o| matches!(
+            o,
+            Outcome::Failed { error, .. } if error.contains("refusing to sign")
+        )),
+        "{outcomes:?}"
+    );
+
+    // And the fee payer only ever lost fees — never a drain.
+    let fee_payer = h.turner.keeper_pubkey();
+    let balance = h.svm.lock().unwrap().get_balance(&fee_payer).unwrap();
+    assert!(
+        balance > 900_000_000,
+        "fee payer should only have paid fees and guard rent: {balance}"
+    );
+}
+
+/// The gate itself: what it refuses and what it correctly allows.
+#[tokio::test]
+async fn signer_leak_gate_refuses_only_what_it_should() {
+    let payout = Pubkey::new_unique();
+    let h = setup(
+        PAYMENT,
+        100,
+        TurnerConfig {
+            payout: Some(payout),
+            trusted_programs: [demo_id()].into_iter().collect(),
+            ..TurnerConfig::default()
+        },
+    );
+    let fee_payer = h.turner.keeper_pubkey();
+    let untrusted = Pubkey::new_unique();
+
+    let naming_fee_payer = |program: Pubkey| Instruction {
+        program_id: program,
+        accounts: vec![AccountMeta::new(fee_payer, false)],
+        data: vec![],
+    };
+    let clean = Instruction {
+        program_id: untrusted,
+        accounts: vec![
+            AccountMeta::new(payout, false),
+            AccountMeta::new(h.book, false),
+        ],
+        data: vec![],
+    };
+
+    // Refused: an untrusted program handed the signing key.
+    assert_eq!(
+        h.turner.signer_leak(&[naming_fee_payer(untrusted)]),
+        Some(untrusted)
+    );
+    // Refused even when buried behind honest instructions, which is the
+    // packing case.
+    assert_eq!(
+        h.turner
+            .signer_leak(&[clean.clone(), naming_fee_payer(untrusted)]),
+        Some(untrusted)
+    );
+
+    // Allowed: relay's own guards legitimately take the fee payer, since
+    // begin_guard funds the guard account from it.
+    assert_eq!(h.turner.signer_leak(&[naming_fee_payer(relay_id())]), None);
+    // Allowed: a program the operator declared trusted.
+    assert_eq!(h.turner.signer_leak(&[naming_fee_payer(demo_id())]), None);
+    // Allowed: nothing names the fee payer.
+    assert_eq!(h.turner.signer_leak(&[clean]), None);
+}
