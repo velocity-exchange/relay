@@ -117,6 +117,18 @@ pub struct TurnerConfig {
     /// `None` means "pay the fee payer", which is only allowed for
     /// programs on `trusted_programs`.
     pub payout: Option<Pubkey>,
+    /// Periodically roll a wrapped-SOL payout's lamports into its token
+    /// balance via [`Turner::sync_payout`].
+    ///
+    /// A wSOL account is the natural payout: the SPL Token program owns
+    /// it, so only *it* can debit the lamports, and it only does so for
+    /// `transfer`/`close_account`, which need the authority — the keeper —
+    /// to sign. The keeper is never in an executor's account list, so a
+    /// hostile executor can credit the account and nothing else. Payment
+    /// arrives as raw lamports (which is what the guard measures), and
+    /// `sync_native` — an instruction with no signer at all — is what
+    /// turns those lamports into spendable token balance.
+    pub sync_native_payout: bool,
     /// Programs whose executors are run without payment guards and may be
     /// paid directly to the fee payer. This is the "I wrote this program,
     /// I do not need a condom" setting: it saves two instructions, their
@@ -172,6 +184,15 @@ fn compute_limit(units_consumed: u64) -> u32 {
     ((units_consumed as f64 * 1.2) as u64).clamp(1_000, MAX_COMPUTE_UNITS as u64) as u32
 }
 
+/// SPL Token, and its `SyncNative` instruction tag. Hand-rolled rather
+/// than pulling in the token crate for one 1-byte instruction.
+static TOKEN_PROGRAM_ID: std::sync::LazyLock<Pubkey> = std::sync::LazyLock::new(|| {
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        .parse()
+        .expect("valid program id")
+});
+const SYNC_NATIVE_TAG: u8 = 17;
+
 /// `ComputeBudget111111111111111111111111111111`.
 static COMPUTE_BUDGET_PROGRAM_ID: std::sync::LazyLock<Pubkey> = std::sync::LazyLock::new(|| {
     "ComputeBudget111111111111111111111111111111"
@@ -194,6 +215,7 @@ impl Default for TurnerConfig {
             no_work_backoff_slots: 8,
             failure_backoff_slots: 16,
             payout: None,
+            sync_native_payout: false,
             trusted_programs: HashSet::new(),
             guard_payments: true,
             guard_nonce: 0,
@@ -786,57 +808,71 @@ impl<S: ChainSource> Turner<S> {
         updates: &mut Vec<(CondKey, StateUpdate)>,
     ) {
         for pack in self.pack(prepared).await {
-            let units = compute_limit(pack.iter().map(|p| p.units).sum());
-            let ixs = self.with_compute_budget(
-                pack.iter().flat_map(|p| p.ixs.iter().cloned()).collect(),
-                units,
-                self.priority_fee(),
-            );
-            let built = match self.sign_for_submission(&ixs).await {
-                Ok((tx, expiry)) => {
-                    let ok = pack.len() == 1
-                        || self
-                            .source
-                            .simulate_transaction(&tx, &[])
-                            .await
-                            .map(|sim| sim.err.is_none())
-                            .unwrap_or(false);
-                    ok.then_some((tx, expiry))
+            // Measure the *assembled* transaction rather than summing the
+            // per-crank estimates: the body picks up instructions the
+            // individual probes never saw (the appended sync_native), and
+            // billing on a limit that excludes them starves the tail.
+            let body: Vec<Instruction> = pack.iter().flat_map(|p| p.ixs.iter().cloned()).collect();
+            let measured = self.measure(&body).await;
+            let Some(units) = measured else {
+                // The assembly does not simulate, though every member did
+                // on its own: a packing artifact. Send them individually
+                // rather than dropping the work.
+                metrics::PACKS.with_label_values(&["split"]).inc();
+                for single in &pack {
+                    self.submit_single(single, outcomes, updates).await;
                 }
-                Err(_) => None,
+                continue;
             };
-            match built {
-                Some((tx, expiry)) => self.finish_pack(&pack, tx, expiry, outcomes, updates).await,
-                None => {
-                    metrics::PACKS.with_label_values(&["split"]).inc();
-                    for single in &pack {
-                        let ixs = self.with_compute_budget(
-                            single.ixs.clone(),
-                            compute_limit(single.units),
-                            self.priority_fee(),
-                        );
-                        match self.sign_for_submission(&ixs).await {
-                            Ok((tx, expiry)) => {
-                                self.finish_pack(
-                                    std::slice::from_ref(single),
-                                    tx,
-                                    expiry,
-                                    outcomes,
-                                    updates,
-                                )
-                                .await
-                            }
-                            Err(err) => {
-                                outcomes.push(Outcome::Failed {
-                                    condition: single.key,
-                                    stage: Stage::Send,
-                                    error: format!("{err:#}"),
-                                });
-                                updates.push((single.key, StateUpdate::Failed));
-                            }
-                        }
-                    }
-                }
+            let ixs = self.with_compute_budget(body, units, self.priority_fee());
+            match self.sign_for_submission(&ixs).await {
+                Ok((tx, expiry)) => self.finish_pack(&pack, tx, expiry, outcomes, updates).await,
+                Err(err) => pack.iter().for_each(|p| {
+                    outcomes.push(Outcome::Failed {
+                        condition: p.key,
+                        stage: Stage::Send,
+                        error: format!("{err:#}"),
+                    });
+                    updates.push((p.key, StateUpdate::Failed));
+                }),
+            }
+        }
+    }
+
+    /// Simulate an instruction body with a generous budget, returning the
+    /// compute limit to actually request. `None` means it did not simulate.
+    async fn measure(&self, body: &[Instruction]) -> Option<u32> {
+        let probe = self.with_compute_budget(body.to_vec(), MAX_COMPUTE_UNITS, 0);
+        let (tx, _) = self.signed_tx(&probe).await.ok()?;
+        let sim = self.source.simulate_transaction(&tx, &[]).await.ok()?;
+        sim.err.is_none().then(|| compute_limit(sim.units_consumed))
+    }
+
+    /// Fall-back path: one verified crank, on its own.
+    async fn submit_single(
+        &self,
+        single: &Prepared,
+        outcomes: &mut Vec<Outcome>,
+        updates: &mut Vec<(CondKey, StateUpdate)>,
+    ) {
+        let body: Vec<Instruction> = single.ixs.clone();
+        let units = self
+            .measure(&body)
+            .await
+            .unwrap_or_else(|| compute_limit(single.units));
+        let ixs = self.with_compute_budget(body, units, self.priority_fee());
+        match self.sign_for_submission(&ixs).await {
+            Ok((tx, expiry)) => {
+                self.finish_pack(std::slice::from_ref(single), tx, expiry, outcomes, updates)
+                    .await
+            }
+            Err(err) => {
+                outcomes.push(Outcome::Failed {
+                    condition: single.key,
+                    stage: Stage::Send,
+                    error: format!("{err:#}"),
+                });
+                updates.push((single.key, StateUpdate::Failed));
             }
         }
     }
@@ -990,6 +1026,37 @@ impl<S: ChainSource> Turner<S> {
                 data: spec::encode_assert_paid_v0_data(min_payment, nonce).to_vec(),
             },
         ]
+    }
+
+    /// Roll a wrapped-SOL payout's accumulated lamports into its token
+    /// balance, as a standalone transaction.
+    ///
+    /// Deliberately *not* part of a crank. Payment arrives as lamports and
+    /// the guard measures lamports, so nothing about correctness or safety
+    /// waits on this — it only decides when the proceeds become spendable
+    /// as tokens. Bundling it into every crank would buy an instruction,
+    /// its compute, and its bytes on every single transaction to keep a
+    /// number fresh that nobody reads in between. Call it on a timer.
+    pub async fn sync_payout(&self) -> Result<Option<Signature>> {
+        let Some(payout) = self.config.payout else {
+            return Ok(None);
+        };
+        if !self.config.sync_native_payout {
+            return Ok(None);
+        }
+        let sync = Instruction {
+            program_id: *TOKEN_PROGRAM_ID,
+            accounts: vec![AccountMeta::new(payout, false)],
+            data: vec![SYNC_NATIVE_TAG],
+        };
+        let units = self
+            .measure(std::slice::from_ref(&sync))
+            .await
+            .unwrap_or(10_000);
+        let ixs = self.with_compute_budget(vec![sync], units, self.priority_fee());
+        let (tx, expiry) = self.sign_for_submission(&ixs).await?;
+        let signature = self.submit(tx, *TOKEN_PROGRAM_ID, 0, expiry).await?;
+        Ok(Some(signature))
     }
 
     /// A payout account's guard PDA for a given nonce.

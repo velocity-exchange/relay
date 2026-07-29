@@ -31,7 +31,7 @@ use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
 use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::{Keypair, Signer};
+use solana_sdk::signature::{Keypair, Signature, Signer};
 use solana_sdk::transaction::Transaction;
 
 const RPC_PORT: u16 = 8999;
@@ -48,6 +48,21 @@ const MAX_ENTRIES: usize = 32;
 const SIDE_BID: u8 = 0;
 const SIDE_ASK: u8 = 1;
 const PAYMENT: u64 = 100_000;
+const TOKEN_ACCOUNT_LEN: usize = 165;
+/// SPL token account layout: mint(32) owner(32) amount(8) ...
+const TOKEN_AMOUNT_OFFSET: usize = 64;
+
+fn token_program() -> Pubkey {
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        .parse()
+        .unwrap()
+}
+
+fn native_mint() -> Pubkey {
+    "So11111111111111111111111111111111111111112"
+        .parse()
+        .unwrap()
+}
 const WATCH_V0_LEN: usize = spec::WATCH_V0_LEN;
 
 fn relay_id() -> Pubkey {
@@ -282,6 +297,52 @@ impl Client {
         book.pubkey()
     }
 
+    /// Create a wrapped-SOL account owned by `authority`.
+    ///
+    /// This is the payout shape the turner wants for untrusted programs:
+    /// the SPL Token program owns the account, so only it can debit the
+    /// lamports, and only for operations that need `authority` to sign —
+    /// which a hostile executor never gets, because the authority is not
+    /// in its account list. Anyone may credit it, and `sync_native` (no
+    /// signer) turns those lamports into token balance.
+    async fn create_wsol(&self, authority: &Pubkey) -> Pubkey {
+        let wsol = Keypair::new();
+        let rent = self
+            .rpc
+            .get_minimum_balance_for_rent_exemption(TOKEN_ACCOUNT_LEN)
+            .await
+            .unwrap();
+        let create = solana_system_interface::instruction::create_account(
+            &self.payer.pubkey(),
+            &wsol.pubkey(),
+            rent,
+            TOKEN_ACCOUNT_LEN as u64,
+            &token_program(),
+        );
+        // InitializeAccount3 { owner }: tag 18, no rent sysvar, no signer.
+        let init = Instruction {
+            program_id: token_program(),
+            accounts: vec![
+                AccountMeta::new(wsol.pubkey(), false),
+                AccountMeta::new_readonly(native_mint(), false),
+            ],
+            data: [18u8].into_iter().chain(authority.to_bytes()).collect(),
+        };
+        self.send(&[create, init], &[&wsol]).await;
+        wsol.pubkey()
+    }
+
+    /// The SPL token `amount` field, which only tracks lamports once
+    /// `sync_native` has run.
+    async fn token_amount(&self, account: &Pubkey) -> u64 {
+        let data = self.account(account).await;
+        u64::from_le_bytes(
+            data[TOKEN_AMOUNT_OFFSET..TOKEN_AMOUNT_OFFSET + 8]
+                .try_into()
+                .unwrap(),
+        )
+    }
+
     /// The order-posting bot: one quote per call.
     async fn post_quote(&self, book: &Pubkey, expiry_ts: i64, price: u64, side: u8) {
         let ix = Instruction {
@@ -326,8 +387,15 @@ fn build_turner(url: String, keeper: Keypair) -> Turner<Arc<dyn ChainSource>> {
 }
 
 /// Run ticks until `done` reports true, or fail with what the turner saw.
+///
+/// On timeout this looks up what actually happened to the transactions the
+/// turner sent. Without a submitter attached, sends are fire-and-forget,
+/// so `Sent` means "handed to the RPC", not "landed" — and a crank that
+/// fails on chain otherwise shows up as an infinite stream of successful
+/// sends with nothing changing.
 async fn turn_until<F>(
     turner: &mut Turner<Arc<dyn ChainSource>>,
+    client: &Client,
     timeout: Duration,
     mut done: F,
 ) -> Vec<Outcome>
@@ -347,7 +415,33 @@ where
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    panic!("condition never became true; turner saw: {seen:?}");
+
+    let signatures: Vec<Signature> = seen
+        .iter()
+        .filter_map(|o| match o {
+            Outcome::Sent { signature, .. } => Some(*signature),
+            _ => None,
+        })
+        .collect();
+    let mut on_chain = Vec::new();
+    for signature in signatures.iter().rev().take(3) {
+        let status = client
+            .rpc
+            .get_signature_statuses(&[*signature])
+            .await
+            .ok()
+            .and_then(|r| r.value.into_iter().next().flatten());
+        on_chain.push(format!("{signature}: {status:?}"));
+    }
+    let failures: Vec<&Outcome> = seen
+        .iter()
+        .filter(|o| matches!(o, Outcome::Failed { .. }))
+        .collect();
+    panic!(
+        "condition never became true.\n  sent: {}\n  last on-chain: {on_chain:#?}\n  \
+         turner failures: {failures:#?}",
+        signatures.len()
+    );
 }
 
 /// The full loop against a real chain: a bot posts orders, and the turner
@@ -381,7 +475,7 @@ async fn crank_turner_drives_a_real_book() {
     client.post_quote(&book, now + 3600, 90, SIDE_BID).await;
     assert_eq!(client.entry_count(&book).await, 3);
 
-    let outcomes = turn_until(&mut turner, Duration::from_secs(60), async || {
+    let outcomes = turn_until(&mut turner, &client, Duration::from_secs(60), async || {
         client.entry_count(&book).await == 1
     })
     .await;
@@ -402,7 +496,7 @@ async fn crank_turner_drives_a_real_book() {
         client.post_quote(&book, far, 80 + price, SIDE_BID).await;
     }
     assert!(client.entry_count(&book).await >= 6);
-    turn_until(&mut turner, Duration::from_secs(60), async || {
+    turn_until(&mut turner, &client, Duration::from_secs(60), async || {
         client.entry_count(&book).await < 6
     })
     .await;
@@ -428,7 +522,7 @@ async fn crank_turner_drives_a_real_book() {
 
     // This ask crosses the resting bid at 101.
     client.post_quote(&crossing, far, 50, SIDE_ASK).await;
-    turn_until(&mut turner, Duration::from_secs(60), async || {
+    turn_until(&mut turner, &client, Duration::from_secs(60), async || {
         client.entry_count(&crossing).await == 2
     })
     .await;
@@ -448,6 +542,94 @@ async fn crank_turner_drives_a_real_book() {
     assert!(
         client.lamports(&keeper_pubkey).await > 0,
         "keeper still solvent after paying fees"
+    );
+    drop(validator);
+}
+
+/// The wrapped-SOL payout, end to end against the real SPL Token program.
+///
+/// demo-book is run **untrusted** here, which is the whole point: the
+/// turner guards the crank, pays a wSOL account it controls, and never
+/// hands the executor its signing key. Payment lands as lamports (which
+/// the guard measures), and the appended `sync_native` — an instruction
+/// with no signer — turns them into spendable token balance.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs solana-test-validator; run scripts/e2e.sh"]
+async fn wrapped_sol_payout_is_paid_and_synced() {
+    let validator = Validator::start().await;
+    let client = Client::new(validator.url()).await;
+    let keeper = Keypair::new();
+    client.fund(&keeper.pubkey(), 10_000_000_000).await;
+    let keeper_pubkey = keeper.pubkey();
+
+    // The payout: wSOL owned by the keeper, which never signs the cranks.
+    let payout = client.create_wsol(&keeper_pubkey).await;
+    let payout_rent = client.lamports(&payout).await;
+    assert_eq!(client.token_amount(&payout).await, 0);
+
+    let source: Arc<dyn ChainSource> = Arc::new(LocalSimSource::new(
+        RpcSource::new(validator.url()),
+        LocalSimConfig { pool_size: 4 },
+    ));
+    let mut turner = Turner::new(
+        source,
+        keeper,
+        TurnerConfig {
+            filter: WatchFilter::for_programs([demo_id()]),
+            // Untrusted: guards on, and the fee payer must stay out of the
+            // executor's account list entirely.
+            payout: Some(payout),
+            sync_native_payout: true,
+            no_work_backoff_slots: 1,
+            ..TurnerConfig::default()
+        },
+    );
+
+    let book = client.create_book(100).await;
+    assert_eq!(turner.refresh_watches().await.unwrap().admitted, 1);
+
+    let payer_before = client.lamports(&keeper_pubkey).await;
+    let now = client.unix_timestamp().await;
+    client.post_quote(&book, now + 2, 100, SIDE_BID).await;
+    turn_until(&mut turner, &client, Duration::from_secs(60), async || {
+        client.entry_count(&book).await == 0
+    })
+    .await;
+
+    // Paid in lamports, which is what the guard measures — and the token
+    // `amount` has NOT moved, because cranks deliberately do not carry a
+    // sync_native instruction.
+    let paid = client.lamports(&payout).await - payout_rent;
+    assert!(paid >= PAYMENT, "payout received {paid} lamports");
+    assert_eq!(
+        client.token_amount(&payout).await,
+        0,
+        "cranks should not pay for a sync every time"
+    );
+
+    // The turner rolls it into spendable token balance later, on its own
+    // schedule, in one standalone transaction.
+    let signature = turner
+        .sync_payout()
+        .await
+        .expect("sync submitted")
+        .expect("sync enabled");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while client.token_amount(&payout).await == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    assert_eq!(
+        client.token_amount(&payout).await,
+        paid,
+        "sync_native should mirror lamports above the rent reserve ({signature})"
+    );
+
+    // The fee payer only ever spent fees — it was never handed to the
+    // executor, so it could not be rugged.
+    let payer_after = client.lamports(&keeper_pubkey).await;
+    assert!(
+        payer_before - payer_after < 10_000_000,
+        "fee payer should only have paid fees: {payer_before} -> {payer_after}"
     );
     drop(validator);
 }

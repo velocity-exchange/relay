@@ -126,6 +126,14 @@ struct Args {
     /// entirely without this.
     #[arg(long, env = "RELAY_PAYOUT_ADDRESS")]
     payout_address: Option<Pubkey>,
+    /// Periodically roll a wrapped-SOL payout's accumulated lamports into
+    /// its token balance. Payment lands as lamports either way; this only
+    /// decides when it becomes spendable as wSOL.
+    #[arg(long, env = "RELAY_SYNC_NATIVE_PAYOUT", default_value_t = false)]
+    sync_native_payout: bool,
+    /// How often, in ticks, to run that sync.
+    #[arg(long, env = "RELAY_SYNC_EVERY_TICKS", default_value_t = 300)]
+    sync_every_ticks: u64,
     /// Programs you wrote and trust: their executors run without payment
     /// guards (two fewer instructions, less compute, smaller
     /// transactions) and may be paid straight to the fee payer.
@@ -171,6 +179,7 @@ async fn main() -> Result<()> {
         relay_program: args.program_id,
         min_crank_payment: args.min_crank_payment,
         payout: args.payout_address,
+        sync_native_payout: args.sync_native_payout,
         trusted_programs: args.trusted_program.iter().copied().collect(),
         guard_payments: !args.no_guard,
         guard_nonce: args.guard_nonce,
@@ -307,6 +316,13 @@ async fn run<S: ChainSource>(mut turner: Turner<S>, args: &Args) -> Result<()> {
                     "registry refreshed"
                 ),
                 Err(e) => warn!(error = %format!("{e:#}"), "registry refresh failed"),
+            }
+        }
+        if args.sync_native_payout && ticks > 0 && ticks.is_multiple_of(args.sync_every_ticks) {
+            match turner.sync_payout().await {
+                Ok(Some(signature)) => info!(%signature, "synced wrapped-SOL payout"),
+                Ok(None) => {}
+                Err(e) => warn!(error = %format!("{e:#}"), "payout sync failed"),
             }
         }
         ticks += 1;
