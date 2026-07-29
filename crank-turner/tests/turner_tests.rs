@@ -25,6 +25,7 @@ use solana_account::ReadableAccount;
 use solana_sdk::account::Account;
 use solana_sdk::clock::Clock;
 use solana_sdk::instruction::{AccountMeta, Instruction};
+use solana_sdk::message::Message;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature};
 use solana_sdk::signer::Signer;
@@ -2083,4 +2084,132 @@ async fn signer_leak_gate_refuses_only_what_it_should() {
         data: vec![],
     };
     assert_eq!(h.turner.signer_leak(&[paying]), None);
+}
+
+/// Hostile case 1: the resolver hands back an account list that marks the
+/// turner's own wallet as a signer. Nothing legitimate needs signing
+/// privilege — executors are permissionless — so the turner refuses to
+/// sign such a transaction at all.
+#[tokio::test]
+async fn hostile_is_signer_true_is_rejected_by_the_turner() {
+    let payout = Pubkey::new_unique();
+    let h = setup(PAYMENT, 100, guarded_config(payout));
+    let fee_payer = h.turner.keeper_pubkey();
+    let untrusted = Pubkey::new_unique();
+
+    let asks_for_signature = Instruction {
+        program_id: untrusted,
+        accounts: vec![AccountMeta {
+            pubkey: fee_payer,
+            is_signer: true,
+            is_writable: true,
+        }],
+        data: vec![],
+    };
+    assert_eq!(
+        h.turner.signer_leak(&[asks_for_signature]),
+        Some(untrusted),
+        "an executor asking for a signature must be refused"
+    );
+
+    // Even a signature on some unrelated account is refused: an executor
+    // has no legitimate use for one.
+    let stranger = Instruction {
+        program_id: untrusted,
+        accounts: vec![AccountMeta {
+            pubkey: Pubkey::new_unique(),
+            is_signer: true,
+            is_writable: false,
+        }],
+        data: vec![],
+    };
+    assert_eq!(h.turner.signer_leak(&[stranger]), Some(untrusted));
+}
+
+/// Hostile case 2, and the reason the whole trust model is shaped the way
+/// it is: an instruction that marks the fee payer `is_signer: false` and
+/// moves its lamports anyway **succeeds**.
+///
+/// Solana's runtime does not reject it, because a compiled message has no
+/// per-instruction signer bit — `is_signer` is read from the account's
+/// position in the message's signer section, and the fee payer is always
+/// in it. So the meta flag the turner sets is not a defense, and the only
+/// real one is keeping the fee payer out of an untrusted executor's
+/// account list entirely.
+///
+/// This test asserts the drain works. If a future runtime honoured
+/// per-instruction signer flags it would start failing, and the turner
+/// could be relaxed — until then, `signer_leak` is what stands in the way.
+#[test]
+fn hostile_drain_succeeds_with_is_signer_false() {
+    let mut svm = LiteSVM::new();
+    let victim = Keypair::new(); // fee payer, and the account being drained
+    let thief = Pubkey::new_unique();
+    svm.airdrop(&victim.pubkey(), 10_000_000_000).unwrap();
+
+    let mut data = vec![2, 0, 0, 0]; // System: Transfer
+    data.extend_from_slice(&5_000_000_000u64.to_le_bytes());
+    let hostile = Instruction {
+        program_id: Pubkey::new_from_array([0u8; 32]), // system program
+        accounts: vec![
+            AccountMeta {
+                pubkey: victim.pubkey(),
+                is_signer: false,
+                is_writable: true,
+            },
+            AccountMeta {
+                pubkey: thief,
+                is_signer: false,
+                is_writable: true,
+            },
+        ],
+        data,
+    };
+
+    let msg = Message::new(&[hostile], Some(&victim.pubkey()));
+    let tx = Transaction::new(&[&victim], msg, svm.latest_blockhash());
+    assert!(
+        svm.send_transaction(tx).is_ok(),
+        "if this ever starts failing, Solana began honouring per-instruction \
+         signer flags and the turner can stop refusing to name the fee payer"
+    );
+    assert_eq!(
+        svm.get_balance(&thief).unwrap(),
+        5_000_000_000,
+        "is_signer: false did not stop the drain"
+    );
+}
+
+/// And the turner never lets that transaction exist: the same hostile
+/// shape is refused before signing.
+#[tokio::test]
+async fn turner_refuses_to_sign_the_drain() {
+    let payout = Pubkey::new_unique();
+    let h = setup(PAYMENT, 100, guarded_config(payout));
+    let fee_payer = h.turner.keeper_pubkey();
+    let untrusted = Pubkey::new_unique();
+
+    let mut data = vec![2, 0, 0, 0];
+    data.extend_from_slice(&5_000_000_000u64.to_le_bytes());
+    let drain = Instruction {
+        program_id: untrusted,
+        accounts: vec![
+            AccountMeta {
+                pubkey: fee_payer,
+                is_signer: false,
+                is_writable: true,
+            },
+            AccountMeta {
+                pubkey: Pubkey::new_unique(),
+                is_signer: false,
+                is_writable: true,
+            },
+        ],
+        data,
+    };
+    assert_eq!(
+        h.turner.signer_leak(&[drain]),
+        Some(untrusted),
+        "the drain shape must be refused despite is_signer: false"
+    );
 }

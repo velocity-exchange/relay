@@ -1075,7 +1075,17 @@ impl<S: ChainSource> Turner<S> {
                     && ix.program_id != *COMPUTE_BUDGET_PROGRAM_ID
                     && !self.trusts(&ix.program_id)
             })
-            .find(|ix| names_transaction_signer(ix, signers))
+            .find(|ix| {
+                // Two ways an executor can end up holding a signature.
+                // First, asking for one outright — nothing legitimate
+                // needs it, since executors are permissionless.
+                ix.accounts.iter().any(|meta| meta.is_signer)
+                    // Second, and the one that actually bites: naming an
+                    // account that signs the transaction for another
+                    // reason. `is_signer: false` on the meta does not help
+                    // there — see `hostile_drain_succeeds_with_is_signer_false`.
+                    || names_transaction_signer(ix, signers)
+            })
             .map(|ix| ix.program_id)
     }
 
