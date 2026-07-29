@@ -36,3 +36,4 @@ yellowstone-grpc-proto = { git = "https://github.com/rpcpool/yellowstone-grpc", 
 
 [dev-dependencies]
 sha2 = "0.10"
+solana-system-interface = { version = "3", features = ["bincode"] }

@@ -19,7 +19,7 @@ The on-chain instruction is always the authoritative predicate — a stale turne
 |---|---|
 | `spec/` | `relay-spec` — pod wire types (bytemuck only); embed this in your program |
 | `programs/relay/` | watch registry + payment guard instructions (Anchor v2) |
-| `programs/demo-book/` | reference target: expiring entries swept for a reward, soft-cap eviction |
+| `programs/demo-book/` | reference target: a two-sided book with three conditions — expiry sweep, soft-cap eviction, and crossing |
 | `crank-turner/` | the generic turner daemon + litesvm end-to-end tests |
 
 ## Build & test
@@ -28,7 +28,10 @@ The on-chain instruction is always the authoritative predicate — a stale turne
 ./scripts/build-programs.sh    # SBF-build both programs (needs cargo-build-sbf, tools v1.52)
 cargo test                     # spec + turner tests (root workspace)
 cd programs && cargo test      # program tests (litesvm, cross-program)
+./scripts/e2e.sh               # end-to-end against a real solana-test-validator
 ```
+
+`e2e.sh` deploys both programs to a throwaway validator, runs a turner, posts orders from a bot, and checks that expiry, eviction, and crossing all get cranked on a chain that is genuinely moving.
 
 ## Run the turner
 

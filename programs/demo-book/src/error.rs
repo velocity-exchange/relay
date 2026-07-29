@@ -18,4 +18,8 @@ pub enum DemoError {
     StagingOverflow,
     #[msg("Signer does not match the book authority")]
     InvalidAuthority,
+    #[msg("Entry is on the wrong side for this operation")]
+    WrongSide,
+    #[msg("Best bid does not cross best ask")]
+    NotCrossing,
 }

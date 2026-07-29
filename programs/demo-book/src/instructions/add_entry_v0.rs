@@ -15,12 +15,17 @@ pub struct AddEntryV0 {
 pub struct AddEntryArgsV0 {
     /// May already be in the past — such an entry is sweepable immediately.
     pub expiry_ts: i64,
+    pub price: u64,
+    /// [`crate::state::SIDE_BID`] or [`crate::state::SIDE_ASK`].
+    pub side: u8,
 }
 
 /// `insert` maintains the min-over-inserts hint itself: when this entry
 /// brings the minimum down, the sweep wake update is a single field store
 /// into the pod condition block.
 pub fn handle_add_entry_v0(ctx: &mut Context<AddEntryV0>, args: AddEntryArgsV0) -> Result<()> {
-    ctx.accounts.book.insert(args.expiry_ts)?;
+    ctx.accounts
+        .book
+        .insert(args.expiry_ts, args.price, args.side)?;
     Ok(())
 }

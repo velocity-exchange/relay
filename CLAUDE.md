@@ -16,6 +16,7 @@ Relay: generic condition-cranking for Solana programs — see [DESIGN.md](./DESI
 ./scripts/build-programs.sh          # SBF build both programs (cargo-build-sbf --tools-version v1.52)
 cd programs && cargo test            # program litesvm tests (need the SBF build first)
 cargo test                           # root workspace: spec + crank-turner (turner tests also need the SBF build)
+./scripts/e2e.sh                     # end-to-end on a real validator (needs solana-test-validator)
 cargo fmt && cargo clippy            # run in BOTH workspaces before declaring work done
 ```
 
@@ -36,6 +37,10 @@ Prefer declarative iterator chains (`map`/`filter`/`fold`/`try_fold`/`find`/`col
 - Executors take no signers, and the turner never marks one as a signer. Nothing in this system may ever lend signer privilege to an executor.
 - **Never reintroduce a CPI wrapper around executors.** Relay asserts around the call (guards), it does not mediate the call: a wrapper would consume one of the four CPI levels the executor's own stack needs (velocity → CLOB is already two deep) and add per-invoke cost. If a guard needs more context, extend the guard instructions, not the call path.
 - Program keypairs live OUTSIDE the repo (`~/.config/solana/velocity-keys/relay.json`, `relay-demo-book.json`); only `declare_id!` pubkeys are committed. `.gitignore` blocks `**/*keypair*.json`.
+
+## Test layout mirrors
+
+`crank-turner/tests/*` hand-pin demo-book's offsets and sizes (`BOOK_ACCOUNT_LEN`, `CONDITIONS_OFFSET`, `ENTRY_COUNT_OFFSET`, `STAGING_OFFSET`, ...) so the turner crates never depend on the anchor-v2 tree. **Any change to `BookV0` breaks them**, usually as `InvalidInstructionData` or a nonsense assertion rather than a clean failure — re-read `programs/demo-book/src/state.rs` and update both test files. The e2e test guards itself with a per-side/total consistency check for exactly this reason.
 
 ## Turner invariants
 

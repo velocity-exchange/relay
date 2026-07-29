@@ -14,6 +14,9 @@
 //! - **Evict** ([`WakeV0::OnAccountChange`] on `entry_count`): once the book
 //!   holds at least `evict_threshold` entries, the oldest entry can be
 //!   evicted for a reward — the CLOB soft-cap pattern.
+//! - **Cross** ([`WakeV0::OnAccountChange`] on `version`, which every
+//!   mutation bumps): whenever the book changes at all, check whether the
+//!   best bid crosses the best ask and match them if so.
 //!
 //! Executors require no signer: cranks are permissionless, priced by
 //! `payment_per_crank`, and the instruction itself is the authoritative
@@ -78,5 +81,15 @@ pub mod demo_book {
 
     pub fn evict_v0(ctx: &mut Context<EvictV0>, args: EvictArgsV0) -> Result<()> {
         instructions::evict_v0::handle_evict_v0(ctx, args)
+    }
+
+    pub fn resolve_cross_v0(
+        ctx: &mut Context<ResolveCrossV0>,
+    ) -> Result<[u8; relay_spec::RESPONSE_POINTER_LEN]> {
+        instructions::resolve_cross_v0::handle_resolve_cross_v0(ctx)
+    }
+
+    pub fn cross_v0(ctx: &mut Context<CrossV0>, args: CrossArgsV0) -> Result<()> {
+        instructions::cross_v0::handle_cross_v0(ctx, args)
     }
 }

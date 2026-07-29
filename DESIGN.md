@@ -116,7 +116,9 @@ Discovery over unbounded account sets (finding liquidatable users) is not expres
 ## Repo layout
 
 - `spec/` — `relay-spec`: the wire types. Zero-copy pod; depends only on bytemuck.
-- `programs/` — separate cargo workspace (anchor-v2 pinned rev, own lockfile + target): `relay` program, `demo-book` (reference target embedding conditions: timestamp sweep with self-repairing hint, change-wake threshold evict; hosts the cross-program tests).
+- `programs/` — separate cargo workspace (anchor-v2 pinned rev, own lockfile + target): `relay` program, `demo-book` (reference target: a two-sided book carrying one condition per wake kind — `AtTimestamp` expiry sweep with a self-repairing hint, `OnAccountChange` soft-cap eviction on `entry_count`, and `OnAccountChange` crossing on a `version` counter every mutation bumps, i.e. "whenever the book changes at all, look for a cross"). Hosts the cross-program tests.
 - `crank-turner/` — root-workspace client crate (solana 3.x), litesvm tests drive the full loop against built `.so` fixtures.
+
+`crank-turner/tests/validator_e2e.rs` runs the whole thing against a real `solana-test-validator` (`./scripts/e2e.sh`): both programs deployed, a turner on its normal loop, a bot posting orders, and assertions that expiry, eviction, and crossing each get cranked and paid for. It is `#[ignore]`d in the default run because it needs the validator binary.
 
 Program keypairs are never committed; `declare_id!` pubkeys only.

@@ -3537,6 +3537,7 @@ dependencies = [
  "solana-pubsub-client",
  "solana-rpc-client-api",
  "solana-sdk",
+ "solana-system-interface 3.3.0",
  "tokio",
  "tracing",
  "tracing-subscriber",

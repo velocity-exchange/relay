@@ -10,8 +10,8 @@ use demo_book::anchor_lang_v2::prelude::Address;
 use demo_book::anchor_lang_v2::solana_program::instruction::{AccountMeta, Instruction};
 use demo_book::anchor_lang_v2::Discriminator;
 use demo_book::state::{
-    BookV0, BOOK_ACCOUNT_LEN, CONDITIONS_OFFSET, ENTRY_COUNT_OFFSET, EVICT_CONDITION,
-    STAGING_OFFSET, SWEEP_CONDITION,
+    BookV0, BOOK_ACCOUNT_LEN, CONDITIONS_OFFSET, CROSS_CONDITION, ENTRY_COUNT_OFFSET,
+    EVICT_CONDITION, SIDE_ASK, SIDE_BID, STAGING_OFFSET, SWEEP_CONDITION,
 };
 use demo_book::{accounts, instruction, AddEntryArgsV0, InitializeBookArgsV0, SetPaymentArgsV0};
 use litesvm::types::{FailedTransactionMetadata, TransactionMetadata};
@@ -151,8 +151,16 @@ fn now(ctx: &Ctx) -> i64 {
 }
 
 fn add_entry(ctx: &mut Ctx, expiry_ts: i64) {
+    add_quote(ctx, expiry_ts, 100, demo_book::state::SIDE_BID)
+}
+
+fn add_quote(ctx: &mut Ctx, expiry_ts: i64, price: u64, side: u8) {
     let ix = instruction::AddEntryV0 {
-        args: AddEntryArgsV0 { expiry_ts },
+        args: AddEntryArgsV0 {
+            expiry_ts,
+            price,
+            side,
+        },
     }
     .to_instruction(accounts::AddEntryV0 {
         book: addr(ctx.book),
@@ -337,7 +345,7 @@ fn keeper_balance(ctx: &Ctx) -> u64 {
 fn init_writes_valid_condition_block() {
     let ctx = setup();
     let conditions = read_conditions(&ctx);
-    assert_eq!(conditions.len(), 2);
+    assert_eq!(conditions.len(), 3);
 
     let sweep = &conditions[SWEEP_CONDITION as usize];
     assert!(sweep.is_active());
@@ -734,4 +742,111 @@ fn entry_count(ctx: &Ctx) -> u32 {
             .try_into()
             .unwrap(),
     )
+}
+
+// --- cross: any change to the book ---
+
+#[test]
+fn cross_condition_watches_the_version_counter() {
+    let ctx = setup();
+    let conditions = read_conditions(&ctx);
+    let cross = &conditions[CROSS_CONDITION as usize];
+    match cross.wake().unwrap() {
+        spec::WakeView::OnAccountChange {
+            address,
+            offset,
+            len,
+        } => {
+            assert_eq!(address, ctx.book.to_bytes());
+            assert_eq!(offset as usize, demo_book::state::VERSION_OFFSET);
+            assert_eq!(len, 8, "eight bytes stand in for the whole book changing");
+        }
+        other => panic!("cross wake should be OnAccountChange, got {other:?}"),
+    }
+}
+
+#[test]
+fn every_mutation_bumps_the_version() {
+    let mut ctx = setup();
+    let t = now(&ctx);
+    let version = |ctx: &Ctx| {
+        let data = ctx.svm.get_account(&ctx.book).unwrap().data;
+        u64::from_le_bytes(
+            data[demo_book::state::VERSION_OFFSET..demo_book::state::VERSION_OFFSET + 8]
+                .try_into()
+                .unwrap(),
+        )
+    };
+    let start = version(&ctx);
+    add_quote(&mut ctx, t + 1000, 100, SIDE_BID);
+    let after_insert = version(&ctx);
+    assert!(after_insert > start, "insert must bump the version");
+
+    let ix = instruction::CancelEntryV0 {
+        args: demo_book::CancelEntryArgsV0 { id: 1 },
+    }
+    .to_instruction(accounts::CancelEntryV0 {
+        book: addr(ctx.book),
+        authority: addr(ctx.authority.pubkey()),
+    });
+    send(&mut ctx, ix).unwrap();
+    assert!(version(&ctx) > after_insert, "cancel must bump the version");
+}
+
+#[test]
+fn uncrossed_book_resolves_to_no_work() {
+    let mut ctx = setup();
+    let t = now(&ctx);
+    add_quote(&mut ctx, t + 1000, 100, SIDE_BID);
+    add_quote(&mut ctx, t + 1000, 110, SIDE_ASK); // bid < ask
+    assert!(resolve(&mut ctx, CROSS_CONDITION).is_none());
+}
+
+#[test]
+fn crossed_book_is_matched() {
+    let mut ctx = setup();
+    let t = now(&ctx);
+    add_quote(&mut ctx, t + 1000, 90, SIDE_BID); // id 1, worse bid
+    add_quote(&mut ctx, t + 1000, 105, SIDE_BID); // id 2, best bid
+    add_quote(&mut ctx, t + 1000, 100, SIDE_ASK); // id 3, best ask
+    add_quote(&mut ctx, t + 1000, 120, SIDE_ASK); // id 4, worse ask
+
+    let resolved = resolve(&mut ctx, CROSS_CONDITION).expect("book is crossed");
+    // The resolver picks the best pair: bid 105 against ask 100.
+    assert_eq!(&resolved.data[..8], &2u64.to_le_bytes());
+    assert_eq!(&resolved.data[8..], &3u64.to_le_bytes());
+
+    let before = keeper_balance(&ctx);
+    let ix = executor_ix(&ctx, CROSS_CONDITION, &resolved);
+    send(&mut ctx, ix).unwrap();
+    assert_eq!(keeper_balance(&ctx), before + PAYMENT);
+    assert_eq!(entry_count(&ctx), 2, "the matched pair is gone");
+
+    // What is left no longer crosses, so the re-fired wake finds nothing.
+    assert!(resolve(&mut ctx, CROSS_CONDITION).is_none());
+}
+
+#[test]
+fn cross_rejects_a_pair_that_does_not_cross() {
+    let mut ctx = setup();
+    let t = now(&ctx);
+    add_quote(&mut ctx, t + 1000, 90, SIDE_BID); // id 1
+    add_quote(&mut ctx, t + 1000, 100, SIDE_ASK); // id 2
+
+    // A stale turner naming an uncrossed pair must be refused on chain.
+    let ix = executor_ix(
+        &ctx,
+        CROSS_CONDITION,
+        &spec::ResolvedCrankV0 {
+            accounts: BookV0::executor_accounts(&addr(ctx.book)),
+            data: 1u64
+                .to_le_bytes()
+                .into_iter()
+                .chain(2u64.to_le_bytes())
+                .collect(),
+        },
+    );
+    let failed = send(&mut ctx, ix).unwrap_err();
+    assert_eq!(custom_error_code(&failed), Some(6009)); // NotCrossing
+    assert_eq!(entry_count(&ctx), 2);
 }

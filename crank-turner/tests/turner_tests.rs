@@ -40,11 +40,11 @@ const DEMO_SO: &str = concat!(
 );
 
 // Mirrors of demo-book layout constants, hand-pinned (see module docs).
-const BOOK_ACCOUNT_LEN: usize = 2216;
-const CONDITIONS_OFFSET: u32 = 616;
-const ENTRY_COUNT_OFFSET: usize = 64;
-const NEXT_EXPIRY_OFFSET: usize = 56;
-const STAGING_OFFSET: usize = 1192;
+const BOOK_ACCOUNT_LEN: usize = 2792;
+const CONDITIONS_OFFSET: u32 = 912;
+const ENTRY_COUNT_OFFSET: usize = 72;
+const NEXT_EXPIRY_OFFSET: usize = 64;
+const STAGING_OFFSET: usize = 1768;
 
 const PAYMENT: u64 = 50_000;
 const TREASURY: u64 = 1_000_000;
@@ -343,6 +343,16 @@ fn setup_with_treasury(
     harness
 }
 
+/// `AddEntryArgsV0` wire: expiry, price, side.
+fn quote_args(expiry_ts: i64, price: u64, side: u8) -> Vec<u8> {
+    expiry_ts
+        .to_le_bytes()
+        .into_iter()
+        .chain(price.to_le_bytes())
+        .chain([side])
+        .collect()
+}
+
 fn demo_ix(name: &str, accounts: Vec<AccountMeta>, args: &[u8]) -> Instruction {
     Instruction {
         program_id: demo_id(),
@@ -400,15 +410,8 @@ impl Harness {
     }
 
     fn add_entry(&mut self, expiry_ts: i64) {
-        let ix = demo_ix(
-            "add_entry_v0",
-            vec![
-                AccountMeta::new(self.book, false),
-                AccountMeta::new_readonly(self.authority.pubkey(), true),
-            ],
-            &expiry_ts.to_le_bytes(),
-        );
-        self.send_admin(ix);
+        let book = self.book;
+        self.add_entry_to(book, expiry_ts);
     }
 
     fn cancel_entry(&mut self, id: u64) {
@@ -494,7 +497,7 @@ impl Harness {
                 AccountMeta::new(book, false),
                 AccountMeta::new_readonly(self.authority.pubkey(), true),
             ],
-            &expiry_ts.to_le_bytes(),
+            &quote_args(expiry_ts, 100, 0),
         );
         self.send_admin(ix);
     }
@@ -1283,8 +1286,8 @@ async fn conditions_are_cranked_concurrently() {
     h.warp(t0 + 200, 2);
     let outcomes = turner.tick().await.unwrap();
 
-    // Five books × two conditions each.
-    assert_eq!(outcomes.len(), 10, "{outcomes:?}");
+    // Five books × three conditions each.
+    assert_eq!(outcomes.len(), 15, "{outcomes:?}");
     assert_eq!(sent(&outcomes).len(), 5, "every book swept: {outcomes:?}");
     // Overlap is the thing to assert; wall-clock would just measure the
     // test machine. With concurrency 8 and ten due conditions, a
