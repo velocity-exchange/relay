@@ -151,6 +151,18 @@ pub static IN_FLIGHT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .expect("metric registers")
 });
 
+/// Slots each program's cranks are currently held back by, to avoid paying
+/// for races it keeps losing. Nonzero means a rival turner is winning.
+pub static CONTENTION_DELAY: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec_with_registry!(
+        "relay_contention_delay_slots",
+        "Slots cranks are deliberately delayed by, per program",
+        &["program"],
+        REGISTRY
+    )
+    .expect("metric registers")
+});
+
 /// Seconds between a wake becoming due and the crank being submitted.
 pub static WAKE_LAG: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec_with_registry!(

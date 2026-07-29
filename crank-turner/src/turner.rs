@@ -62,6 +62,10 @@ pub enum SkipReason {
     ParseFailed,
     /// The target program's recent cranks have cost more than they paid.
     Unprofitable,
+    /// Held back deliberately: this program's cranks keep losing races, so
+    /// the turner is arriving late on purpose to let a rival's transaction
+    /// land and be caught by simulation instead of by a burned fee.
+    ContentionDelay,
     /// The program is untrusted and no non-signing payout account is
     /// configured, so there is nowhere safe for it to pay.
     NoSafePayout,
@@ -251,6 +255,10 @@ struct CondState {
     failures: u32,
     /// Last slot an `EverySlots` wake fired.
     last_fired: Option<u64>,
+    /// Slot at which this condition was first seen due, when a contention
+    /// delay is holding it back. Cleared once it is acted on, so each new
+    /// piece of work is delayed afresh rather than once per condition.
+    deferred_since: Option<u64>,
 }
 
 pub struct Turner<S: ChainSource> {
@@ -276,6 +284,10 @@ enum StateUpdate {
     Sent,
     /// Attempt failed; extend the exponential backoff.
     Failed,
+    /// Due, but deliberately held back to avoid paying for a race this
+    /// program keeps losing. Records when the wait started; how long it
+    /// lasts is re-read from the live delay each tick.
+    Deferred,
 }
 
 impl<S: ChainSource> Turner<S> {
@@ -458,6 +470,7 @@ impl<S: ChainSource> Turner<S> {
         // Phase 1 — decide. Pure function of cached state and accounts.
         let mut outcomes: Vec<Outcome> = Vec::new();
         let mut due: Vec<Due> = Vec::new();
+        let mut updates: Vec<(CondKey, StateUpdate)> = Vec::new();
         for (watch, conditions) in &parsed {
             let Some(conditions) = conditions else {
                 outcomes.push(Outcome::Skipped(
@@ -482,7 +495,15 @@ impl<S: ChainSource> Turner<S> {
                 };
                 match self.decide(key, watch, condition, &clock, watched_now) {
                     Ok(ready) => due.push(ready),
-                    Err(skipped) => outcomes.push(skipped),
+                    Err(outcome) => {
+                        // The one skip with bookkeeping: record when the
+                        // wait started, so the delay is measured from
+                        // first sight rather than from the latest tick.
+                        if matches!(outcome, Outcome::Skipped(_, SkipReason::ContentionDelay)) {
+                            updates.push((key, StateUpdate::Deferred));
+                        }
+                        outcomes.push(outcome);
+                    }
                 }
             }
         }
@@ -498,7 +519,6 @@ impl<S: ChainSource> Turner<S> {
             .set(due.len() as i64);
         // Explicit loops: the closure forms would need `&mut running`
         // alongside the `&self` the in-flight futures hold.
-        let mut updates: Vec<(CondKey, StateUpdate)> = Vec::new();
         let mut prepared: Vec<Prepared> = Vec::new();
         {
             let mut running = FuturesUnordered::new();
@@ -586,6 +606,29 @@ impl<S: ChainSource> Turner<S> {
         if !due {
             return Err(Outcome::Skipped(key, SkipReason::NotDue));
         }
+        // Contention delay: this program's cranks keep getting beaten, so
+        // hold this one back and let the rival's transaction land first.
+        //
+        // The wait has to happen here, ahead of resolve and simulate, and
+        // that placement is the whole mechanism. Arriving late means the
+        // resolver reports nothing to do and no transaction is ever built,
+        // so a lost race costs nothing. Sleeping later — after simulation,
+        // before submission — would be worse than not waiting at all: it
+        // would submit a transaction built on state already known to be
+        // stale.
+        let delay = self.contention_delay(&watch.target_program);
+        if delay > 0 {
+            // Measured against the delay as it stands now, not as it stood
+            // when the wait began. That is what makes recovery prompt: when
+            // the rival stops and the published delay decays, work already
+            // being held is released on the next tick instead of serving
+            // out a sentence handed down under the old conditions.
+            let waiting_since = state.deferred_since.unwrap_or(clock.slot);
+            if clock.slot < waiting_since.saturating_add(delay) {
+                return Err(Outcome::Skipped(key, SkipReason::ContentionDelay));
+            }
+        }
+
         // How late we are, relative to when the wake actually came due.
         let lag = match wake {
             spec::WakeView::AtTimestamp { unix_ts } => {
@@ -614,6 +657,7 @@ impl<S: ChainSource> Turner<S> {
                 state.last_fired = Some(clock.slot);
                 state.suppress_until = clock.slot + backoff;
                 state.failures = 0;
+                state.deferred_since = None;
             }
             StateUpdate::Sent => {
                 let backoff = self.config.sent_backoff_slots;
@@ -625,12 +669,25 @@ impl<S: ChainSource> Turner<S> {
                 state.last_fired = Some(clock.slot);
                 state.suppress_until = clock.slot + backoff;
                 state.failures = 0;
+                state.deferred_since = None;
             }
             StateUpdate::Failed => {
                 let base = self.config.failure_backoff_slots;
                 let state = self.state.entry(key).or_default();
                 state.failures += 1;
                 state.suppress_until = clock.slot + (base << state.failures.min(6));
+                state.deferred_since = None;
+            }
+            StateUpdate::Deferred => {
+                let state = self.state.entry(key).or_default();
+                // Idempotent: this arrives on every tick of the wait, and
+                // resetting the start each time would defer forever.
+                //
+                // Deliberately touching nothing else. The wake must still
+                // read as due when the delay elapses, and `suppress_until`
+                // stays out of it so the wait is re-measured against the
+                // live delay rather than frozen at its starting value.
+                state.deferred_since.get_or_insert(clock.slot);
             }
         }
     }
@@ -1098,6 +1155,14 @@ impl<S: ChainSource> Turner<S> {
         .into_iter()
         .chain(ixs)
         .collect()
+    }
+
+    /// Slots to hold a program's cranks back by. Zero without a submitter,
+    /// which is also the no-feedback case: nothing has observed a lost race.
+    fn contention_delay(&self, program: &Pubkey) -> u64 {
+        self.submitter
+            .as_ref()
+            .map_or(0, |submitter| submitter.lag_for(program))
     }
 
     /// Is this program exempt from guards and payout separation?

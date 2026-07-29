@@ -67,6 +67,11 @@ pub struct SubmitterConfig {
     pub profit_window: usize,
     /// How often to sample recent prioritization fees.
     pub fee_refresh: Duration,
+    /// Slots added to a program's contention delay per reverted
+    /// transaction. Zero disables adaptive delay entirely.
+    pub contention_step_slots: u64,
+    /// Ceiling on the contention delay, in slots.
+    pub max_contention_slots: u64,
 }
 
 impl Default for SubmitterConfig {
@@ -77,6 +82,13 @@ impl Default for SubmitterConfig {
             max_resends: 3,
             profit_window: 20,
             fee_refresh: Duration::from_secs(5),
+            // ~1.6s per revert, up to ~5s. Enough to let a competitor's
+            // transaction land and be visible to the next simulation,
+            // while staying well inside the slack on the wakes this is
+            // meant for (expiries, evictions) rather than the ones where
+            // being first is the whole point.
+            contention_step_slots: 4,
+            max_contention_slots: 12,
         }
     }
 }
@@ -88,12 +100,32 @@ impl Default for SubmitterConfig {
 /// the same loss-making work.
 pub type ProfitSnapshot = HashMap<Pubkey, i64>;
 
+/// How many slots to hold back before cranking each program, published for
+/// the turner to apply.
+///
+/// This is the adaptive half of the profitability lesson, and the more
+/// useful one in a competitive fleet. A turner that is simply slower than a
+/// rival loses every race, and each loss costs a transaction fee for a
+/// reverted crank — it does the work, arrives second, and pays for the
+/// privilege. Delaying deliberately converts that into a free no-op: by the
+/// time the turner resolves and simulates, the rival's crank has landed, the
+/// resolver reports nothing to do, and no transaction is ever sent.
+///
+/// It is self-healing in the direction that matters. If the rival stops —
+/// crashes, is turned off, runs out of funds — the delayed turner's
+/// simulation starts finding real work again, its cranks land, and the delay
+/// decays back toward zero. The cost of a competitor disappearing is that
+/// cranks run a few seconds late until it does.
+pub type LagSnapshot = HashMap<Pubkey, u64>;
+
 /// Handle the turner holds: an outbox plus two read-only views.
 #[derive(Clone)]
 pub struct SubmitterHandle {
     pub outbox: mpsc::UnboundedSender<PendingTx>,
     pub blockhash: watch::Receiver<Option<BlockhashInfo>>,
     pub profit: watch::Receiver<ProfitSnapshot>,
+    /// Per-program contention delay, in slots.
+    pub lag: watch::Receiver<LagSnapshot>,
     /// Recently observed prioritization fee, micro-lamports per CU.
     pub priority_fee: watch::Receiver<u64>,
 }
@@ -107,6 +139,12 @@ impl SubmitterHandle {
     /// Rolling net lamports for a program (negative = losing money).
     pub fn profit_for(&self, program: &Pubkey) -> i64 {
         self.profit.borrow().get(program).copied().unwrap_or(0)
+    }
+
+    /// Slots to hold a program's cranks back by, to avoid paying for
+    /// races it keeps losing. Zero when it is winning or uncontested.
+    pub fn lag_for(&self, program: &Pubkey) -> u64 {
+        self.lag.borrow().get(program).copied().unwrap_or(0)
     }
 
     /// Latest observed priority fee, micro-lamports per compute unit.
@@ -128,6 +166,7 @@ pub fn spawn<S: ChainSource + ?Sized + 'static>(
     let (outbox, inbox) = mpsc::unbounded_channel();
     let (blockhash_tx, blockhash_rx) = watch::channel(None);
     let (profit_tx, profit_rx) = watch::channel(ProfitSnapshot::new());
+    let (lag_tx, lag_rx) = watch::channel(LagSnapshot::new());
     let (fee_tx, fee_rx) = watch::channel(0);
 
     tokio::spawn(refresh_blockhash(
@@ -140,12 +179,13 @@ pub fn spawn<S: ChainSource + ?Sized + 'static>(
         config.fee_refresh,
         fee_tx,
     ));
-    tokio::spawn(run(source, config, inbox, profit_tx));
+    tokio::spawn(run(source, config, inbox, profit_tx, lag_tx));
 
     SubmitterHandle {
         outbox,
         blockhash: blockhash_rx,
         profit: profit_rx,
+        lag: lag_rx,
         priority_fee: fee_rx,
     }
 }
@@ -191,6 +231,7 @@ async fn run<S: ChainSource + ?Sized>(
     config: SubmitterConfig,
     mut inbox: mpsc::UnboundedReceiver<PendingTx>,
     profit: watch::Sender<ProfitSnapshot>,
+    lag: watch::Sender<LagSnapshot>,
 ) {
     let mut tracked: HashMap<Signature, Tracked> = HashMap::new();
     let mut history: HashMap<Pubkey, Vec<i64>> = HashMap::new();
@@ -215,7 +256,7 @@ async fn run<S: ChainSource + ?Sized>(
                 }
             },
             _ = confirm.tick() => {
-                sweep(&source, &config, &mut tracked, &mut history, &profit).await;
+                sweep(&source, &config, &mut tracked, &mut history, &profit, &lag).await;
             }
         }
     }
@@ -229,6 +270,7 @@ async fn sweep<S: ChainSource + ?Sized>(
     tracked: &mut HashMap<Signature, Tracked>,
     history: &mut HashMap<Pubkey, Vec<i64>>,
     profit: &watch::Sender<ProfitSnapshot>,
+    lag: &watch::Sender<LagSnapshot>,
 ) {
     if tracked.is_empty() {
         return;
@@ -255,13 +297,7 @@ async fn sweep<S: ChainSource + ?Sized>(
 
     settled.iter().for_each(|(signature, result)| {
         if let Some(entry) = tracked.remove(signature) {
-            record(
-                &entry.pending,
-                result,
-                history,
-                profit,
-                config.profit_window,
-            );
+            record(&entry.pending, result, history, profit, lag, config);
         }
     });
 
@@ -285,11 +321,37 @@ async fn sweep<S: ChainSource + ?Sized>(
                 &TxResult::Expired,
                 history,
                 profit,
-                config.profit_window,
+                lag,
+                config,
             );
         } else if let Err(err) = source.send_transaction(&entry.pending.transaction).await {
             warn!(%signature, error = %format!("{err:#}"), "resend failed");
         }
+    }
+}
+
+/// The contention delay a program should carry after one transaction
+/// outcome: additive increase, multiplicative decay.
+///
+/// A reverted transaction is the signal, not overall profit. It is the one
+/// outcome that means a fee was burned for nothing, and the two things that
+/// cause it — a rival landed the same crank first, or the target's state
+/// moved out from under a simulation that had already passed — have the
+/// same fix: arrive later, and let simulation catch it for free next time.
+///
+/// Increase is additive so the delay converges on the smallest one that
+/// actually clears the rival, rather than overshooting to the ceiling on
+/// the first loss. Decay is multiplicative so recovery takes a handful of
+/// wins instead of a single one — snapping straight back to zero after one
+/// landed crank would just pay for another revert on the next contested
+/// one, and oscillate.
+fn next_delay(current: u64, result: &TxResult, step: u64, max: u64) -> u64 {
+    match result {
+        TxResult::Failed(_) => current.saturating_add(step).min(max),
+        TxResult::Landed => current / 2,
+        // Never landed, so no fee was burned and no rival took the work.
+        // That is congestion, and waiting longer does not help it.
+        TxResult::Expired => current,
     }
 }
 
@@ -298,7 +360,8 @@ fn record(
     result: &TxResult,
     history: &mut HashMap<Pubkey, Vec<i64>>,
     profit: &watch::Sender<ProfitSnapshot>,
-    window: usize,
+    lag: &watch::Sender<LagSnapshot>,
+    config: &SubmitterConfig,
 ) {
     metrics::IN_FLIGHT
         .with_label_values(&["transactions"])
@@ -330,13 +393,104 @@ fn record(
             -5000
         }
     };
+    // Adaptive contention delay, from the same outcome.
+    if config.contention_step_slots > 0 {
+        lag.send_modify(|snapshot| {
+            let slots = snapshot.entry(pending.program).or_insert(0);
+            let next = next_delay(
+                *slots,
+                result,
+                config.contention_step_slots,
+                config.max_contention_slots,
+            );
+            if next != *slots {
+                debug!(
+                    program = %pending.program,
+                    from = *slots,
+                    to = next,
+                    "contention delay adjusted"
+                );
+            }
+            *slots = next;
+            metrics::CONTENTION_DELAY
+                .with_label_values(&[&program])
+                .set(next as i64);
+        });
+    }
+
     let entries = history.entry(pending.program).or_default();
     entries.push(delta);
-    if entries.len() > window {
+    if entries.len() > config.profit_window {
         entries.remove(0);
     }
     let net: i64 = entries.iter().sum();
     profit.send_modify(|snapshot| {
         snapshot.insert(pending.program, net);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failed() -> TxResult {
+        TxResult::Failed("custom program error: 0x1771".into())
+    }
+
+    /// Each revert pushes the delay out by one step, up to the ceiling —
+    /// additive, so it settles on the smallest delay that clears the rival
+    /// rather than jumping to the ceiling on the first loss.
+    #[test]
+    fn reverts_ramp_the_delay_additively_up_to_the_ceiling() {
+        let ramp: Vec<u64> = (0..6)
+            .scan(0, |delay, _| {
+                *delay = next_delay(*delay, &failed(), 4, 12);
+                Some(*delay)
+            })
+            .collect();
+        assert_eq!(ramp, vec![4, 8, 12, 12, 12, 12]);
+    }
+
+    /// Landed cranks decay it, and it reaches zero — a turner whose rival
+    /// disappears has to end up back at real time, not stuck a few slots
+    /// late forever.
+    #[test]
+    fn landed_cranks_decay_the_delay_to_zero() {
+        let decay: Vec<u64> = (0..5)
+            .scan(12, |delay, _| {
+                *delay = next_delay(*delay, &TxResult::Landed, 4, 12);
+                Some(*delay)
+            })
+            .collect();
+        assert_eq!(decay, vec![6, 3, 1, 0, 0]);
+    }
+
+    /// Recovery is deliberately slower than escalation. One landed crank
+    /// must not snap the delay back to zero, or the next contested
+    /// condition immediately pays for another revert and the delay
+    /// oscillates instead of converging.
+    #[test]
+    fn recovery_is_slower_than_escalation() {
+        let after_one_loss = next_delay(0, &failed(), 4, 12);
+        let recovered = next_delay(after_one_loss, &TxResult::Landed, 4, 12);
+        assert!(
+            recovered > 0,
+            "a single win wiped the delay: {after_one_loss} -> {recovered}"
+        );
+    }
+
+    /// An expired transaction never landed, so no fee was burned and no
+    /// rival took the work. That is congestion, and waiting longer is not
+    /// the fix.
+    #[test]
+    fn expiry_leaves_the_delay_alone() {
+        assert_eq!(next_delay(8, &TxResult::Expired, 4, 12), 8);
+        assert_eq!(next_delay(0, &TxResult::Expired, 4, 12), 0);
+    }
+
+    /// Zero step is the off switch.
+    #[test]
+    fn a_zero_step_never_delays() {
+        assert_eq!(next_delay(0, &failed(), 0, 12), 0);
+    }
 }

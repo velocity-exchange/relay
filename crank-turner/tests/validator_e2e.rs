@@ -1274,9 +1274,9 @@ impl Client {
 }
 
 /// Average seconds per tick, from the daemon's own histogram.
-/// Sum every sample of a labelled counter whose label set contains
+/// Sum every sample of a labelled metric whose label set contains
 /// `contains`. Prometheus text format, one sample per line.
-fn counter_sum(metrics: &str, name: &str, contains: &str) -> u64 {
+fn metric_sum(metrics: &str, name: &str, contains: &str) -> u64 {
     metrics
         .lines()
         .filter(|line| line.starts_with(name) && line.contains(contains))
@@ -1380,7 +1380,7 @@ async fn daemon_handles_a_registry_larger_than_one_rpc_call() {
         "cranks failed at scale:\n{metrics}"
     );
     assert_eq!(
-        counter_sum(&metrics, "relay_transactions_total", "result=\"failed\""),
+        metric_sum(&metrics, "relay_transactions_total", "result=\"failed\""),
         0,
         "transactions failed on chain at scale:\n{metrics}"
     );
@@ -1455,9 +1455,11 @@ async fn two_turners_share_one_registry_without_wedging() {
         fleet_report(&ports, &daemons).await
     );
 
-    // Both turners must be doing work, not one starving the other out.
+    // Both turners must get work in the first round: the contention delay
+    // is driven by observed reverts, and it takes a confirm cycle or two to
+    // ramp, so neither has had time to stand down this early.
     let sent: Vec<u64> = futures_util::future::join_all(ports.iter().map(|port| async move {
-        counter_sum(
+        metric_sum(
             &scrape(*port).await.unwrap_or_default(),
             "relay_cranks_total",
             "outcome=\"sent\"",
@@ -1483,16 +1485,24 @@ async fn two_turners_share_one_registry_without_wedging() {
     );
 
     let after: Vec<u64> = futures_util::future::join_all(ports.iter().map(|port| async move {
-        counter_sum(
+        metric_sum(
             &scrape(*port).await.unwrap_or_default(),
             "relay_cranks_total",
             "outcome=\"sent\"",
         )
     }))
     .await;
+    // The fleet as a whole kept working. Deliberately *not* asserted
+    // per-turner: a turner that keeps losing races ramps its contention
+    // delay and stops submitting, which is the correct response, not a
+    // stall — see `a_losing_turner_delays_itself_and_recovers_when_the_rival_dies`
+    // for that behaviour on its own. What must hold here is that going
+    // quiet is a choice one turner makes, not a state the fleet gets stuck
+    // in, which the completed second round already establishes.
+    let (before, now): (u64, u64) = (sent.iter().sum(), after.iter().sum());
     assert!(
-        after.iter().zip(&sent).all(|(now, before)| now > before),
-        "a turner stopped landing cranks after the first round: {sent:?} -> {after:?}\n{}",
+        now > before,
+        "the fleet stopped landing cranks after the first round: {sent:?} -> {after:?}\n{}",
         fleet_report(&ports, &daemons).await
     );
     // Finally, prove the test exercised what it claims. Two uncoordinated
@@ -1504,8 +1514,8 @@ async fn two_turners_share_one_registry_without_wedging() {
     let (mut lost, mut landed) = (0, 0);
     for port in ports {
         let metrics = scrape(port).await.unwrap_or_default();
-        lost += counter_sum(&metrics, "relay_transactions_total", "result=\"failed\"");
-        landed += counter_sum(&metrics, "relay_transactions_total", "result=\"landed\"");
+        lost += metric_sum(&metrics, "relay_transactions_total", "result=\"failed\"");
+        landed += metric_sum(&metrics, "relay_transactions_total", "result=\"landed\"");
     }
     assert!(
         lost > 0,
@@ -1526,6 +1536,16 @@ async fn two_turners_share_one_registry_without_wedging() {
          losing is not self-limiting\n{}",
         fleet_report(&ports, &daemons).await
     );
+}
+
+/// Metrics text from every port, in order.
+async fn scrape_all(ports: &[u16]) -> Vec<String> {
+    futures_util::future::join_all(
+        ports
+            .iter()
+            .map(|port| async move { scrape(*port).await.unwrap_or_default() }),
+    )
+    .await
 }
 
 async fn all_books_swept(client: &Client, books: &[Pubkey]) -> bool {
@@ -1563,4 +1583,163 @@ async fn fleet_report(ports: &[u16], daemons: &[Daemon]) -> String {
         ));
     }
     report
+}
+
+/// The adaptive contention delay, end to end: a turner that keeps losing
+/// races stops paying for them, and starts again when the rival dies.
+///
+/// This is tuktuk's lesson. Two turners racing means the slower one does
+/// the work, arrives second, and pays a fee for a reverted transaction —
+/// indefinitely, because nothing about losing tells it to stop trying. The
+/// fix is to lose on purpose: hold back a few seconds, and the rival's
+/// crank lands before the delayed turner even resolves, so its simulation
+/// reports nothing to do and no transaction is built. A loss that costs
+/// nothing is sustainable.
+///
+/// The half that matters more is the recovery. A turner that backed off
+/// permanently would leave the protocol uncranked the moment its rival
+/// died, so the delay has to decay: cranks start landing again, the delay
+/// walks back down, and the only lasting cost is running a few seconds
+/// late. Both halves are asserted here — the ramp under contention, and
+/// the recovery after the rival is killed.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs solana-test-validator; run scripts/e2e.sh"]
+async fn a_losing_turner_delays_itself_and_recovers_when_the_rival_dies() {
+    const BOOKS: usize = 24;
+    const DELAY_METRIC: &str = "relay_contention_delay_slots";
+
+    let validator = Validator::start().await;
+    let client = Client::new(validator.url()).await;
+    let dir = std::env::temp_dir().join(format!("relay-contend-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let books = client.create_books(BOOKS, 100).await;
+
+    let ports = [9975u16, 9976];
+    let mut daemons = Vec::new();
+    for (i, port) in ports.iter().enumerate() {
+        let keeper = Keypair::new();
+        let path = dir.join(format!("keeper-{i}.json"));
+        keeper.write_to_file(&path).expect("write keypair");
+        client.fund(&keeper.pubkey(), 10_000_000_000).await;
+        daemons.push(Daemon::start(
+            &validator.url(),
+            &path.to_string_lossy(),
+            *port,
+            dir.join(format!("turner-{port}.log"))
+                .to_string_lossy()
+                .into_owned(),
+        ));
+    }
+
+    // Contended rounds. The delay is a gauge that decays, so sampling it
+    // only at the end would miss the ramp — poll while the work drains and
+    // keep the peak per turner.
+    //
+    // Several rounds, and a settle window after them, because the feedback
+    // is not instant: the delay only moves once the submitter's confirm
+    // pass observes a reverted transaction, which is a couple of seconds
+    // behind the crank that lost. Stopping the moment the books went empty
+    // measured the delay before the losses had been accounted for.
+    const CONTENDED_ROUNDS: usize = 3;
+    let mut peak = [0u64; 2];
+    let sample = |peak: &mut [u64; 2], metrics: &[String]| {
+        (0..2).for_each(|i| {
+            peak[i] = peak[i].max(metric_sum(&metrics[i], DELAY_METRIC, "program="));
+        });
+    };
+    for round in 0..CONTENDED_ROUNDS {
+        client.post_expired_quotes(&books).await;
+        let mut swept = false;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            let metrics = scrape_all(&ports).await;
+            sample(&mut peak, &metrics);
+            if all_books_swept(&client, &books).await {
+                swept = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        assert!(
+            swept,
+            "contended round {round} never finished\n{}",
+            fleet_report(&ports, &daemons).await
+        );
+    }
+    // Settle: let the confirm pass account for the last round's losses.
+    let settle = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < settle {
+        let metrics = scrape_all(&ports).await;
+        sample(&mut peak, &metrics);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // Kill the winner: the one that held back least.
+    let loser = if peak[0] >= peak[1] { 0 } else { 1 };
+    let winner = 1 - loser;
+    drop(daemons.remove(winner));
+    let (loser_port, loser_peak) = (ports[loser], peak[loser]);
+
+    // Round two, uncontested. Two things have to be true now, and they pull
+    // in opposite directions: the delayed turner must still do the work
+    // (late is fine, never is not), and its delay must come back down.
+    //
+    // Recovery is driven by cranks landing, so it needs work to land — with
+    // an idle registry the delay just freezes wherever contention left it.
+    // That is correct behaviour, not a bug, so this keeps feeding batches
+    // the way a live protocol would, and waits for the delay to reach zero.
+    let mut swept_alone = false;
+    let mut delay_now = loser_peak;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while Instant::now() < deadline && delay_now > 0 {
+        client.post_expired_quotes(&books).await;
+        let batch = Instant::now() + Duration::from_secs(45);
+        while Instant::now() < batch {
+            if all_books_swept(&client, &books).await {
+                swept_alone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        delay_now = metric_sum(
+            &scrape(loser_port).await.unwrap_or_default(),
+            DELAY_METRIC,
+            "program=",
+        );
+    }
+    let metrics = scrape(loser_port).await.unwrap_or_default();
+    assert!(
+        swept_alone,
+        "the delayed turner never picked the work up after its rival died \
+         (delay {delay_now} slots)\nmetrics:\n{}\nlogs (tail):\n{}",
+        metrics
+            .lines()
+            .filter(|l| l.starts_with("relay_"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        daemons[0]
+            .logs()
+            .lines()
+            .rev()
+            .take(20)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // Fully recovered: back to real time, not merely less handicapped. A
+    // turner still holding back after its rival is gone is pure latency.
+    println!(
+        "contention: peaks {peak:?} slots, loser :{loser_port} recovered {loser_peak} -> {delay_now}"
+    );
+    assert_eq!(
+        delay_now,
+        0,
+        "delay never decayed after the rival died: peak {loser_peak}\n{}",
+        metrics
+            .lines()
+            .filter(|l| l.starts_with("relay_"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
 }

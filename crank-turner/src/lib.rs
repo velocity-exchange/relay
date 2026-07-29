@@ -53,7 +53,10 @@ pub use local_sim::{LocalSimConfig, LocalSimSource};
 pub use source::{
     BlockhashInfo, ChainSource, ClockSnapshot, RpcSource, SignatureOutcome, SimOutcome,
 };
-pub use submit::{spawn as spawn_submitter, PendingTx, SubmitterConfig, SubmitterHandle, TxResult};
+pub use submit::{
+    spawn as spawn_submitter, LagSnapshot, PendingTx, ProfitSnapshot, SubmitterConfig,
+    SubmitterHandle, TxResult,
+};
 pub use turner::{
     names_transaction_signer, CondKey, Outcome, SkipReason, Stage, Turner, TurnerConfig, Watch,
     RELAY_PROGRAM_ID,

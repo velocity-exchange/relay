@@ -16,8 +16,8 @@ use async_trait::async_trait;
 use litesvm::LiteSVM;
 use relay_crank_turner::{
     feed_channel, AccountUpdate, BlockhashInfo, CachedSource, CachedSourceConfig, ChainSource,
-    ClockSnapshot, Outcome, RejectReason, SignatureOutcome, SimOutcome, SkipReason, Stage, Turner,
-    TurnerConfig, WatchFilter,
+    ClockSnapshot, LagSnapshot, Outcome, ProfitSnapshot, RejectReason, SignatureOutcome,
+    SimOutcome, SkipReason, Stage, SubmitterHandle, Turner, TurnerConfig, WatchFilter,
 };
 use relay_spec as spec;
 use sha2::{Digest, Sha256};
@@ -2211,5 +2211,213 @@ async fn turner_refuses_to_sign_the_drain() {
         h.turner.signer_leak(&[drain]),
         Some(untrusted),
         "the drain shape must be refused despite is_signer: false"
+    );
+}
+
+// --- adaptive contention delay ---
+
+/// A submitter handle whose published contention delay the test controls.
+/// The channels are the whole interface, so a test can stand in for the
+/// submitter task without running it — which is what makes the *application*
+/// of the delay testable in isolation from the feedback that produces it.
+/// The ramp itself is unit-tested in `submit.rs`.
+fn handle_with_lag(blockhash: BlockhashInfo, lag: u64) -> (SubmitterHandle, LagKeepalive) {
+    let (outbox, outbox_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (blockhash_tx, blockhash_rx) = tokio::sync::watch::channel(Some(blockhash));
+    let (profit_tx, profit_rx) = tokio::sync::watch::channel(ProfitSnapshot::new());
+    let (lag_tx, lag_rx) = tokio::sync::watch::channel(LagSnapshot::from_iter([(demo_id(), lag)]));
+    let (fee_tx, fee_rx) = tokio::sync::watch::channel(0);
+    (
+        SubmitterHandle {
+            outbox,
+            blockhash: blockhash_rx,
+            profit: profit_rx,
+            lag: lag_rx,
+            priority_fee: fee_rx,
+        },
+        LagKeepalive {
+            _outbox: outbox_rx,
+            _blockhash: blockhash_tx,
+            _profit: profit_tx,
+            lag: lag_tx,
+            _fee: fee_tx,
+        },
+    )
+}
+
+/// Keeps the far ends of those channels alive; dropping the outbox receiver
+/// would make every submission fail for the wrong reason.
+struct LagKeepalive {
+    _outbox: tokio::sync::mpsc::UnboundedReceiver<relay_crank_turner::PendingTx>,
+    _blockhash: tokio::sync::watch::Sender<Option<BlockhashInfo>>,
+    _profit: tokio::sync::watch::Sender<ProfitSnapshot>,
+    lag: tokio::sync::watch::Sender<LagSnapshot>,
+    _fee: tokio::sync::watch::Sender<u64>,
+}
+
+/// The mechanism: while a delay is in force, a due condition is held back
+/// instead of cranked, and nothing is submitted. This is what makes losing a
+/// race free — the turner never builds the transaction it would have paid
+/// for, because by the time the delay elapses simulation sees the rival's
+/// work and reports nothing to do.
+#[tokio::test]
+async fn a_contention_delay_holds_a_due_condition_back() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    let t0 = h.t0;
+    h.add_entry(t0 + 100);
+
+    const DELAY: u64 = 8;
+    let source = Arc::new(LiteSvmSource::new(&h.svm, &h.watch_keys));
+    let blockhash = source.latest_blockhash().await.unwrap();
+    let (handle, _keepalive) = handle_with_lag(blockhash, DELAY);
+    let mut turner = Turner::new(
+        Arc::clone(&source),
+        Keypair::new(),
+        trusting(TurnerConfig::default()),
+    )
+    .with_submitter(handle);
+    h.svm
+        .lock()
+        .unwrap()
+        .airdrop(&turner.keeper_pubkey(), 1_000_000_000)
+        .unwrap();
+    turner.refresh_watches().await.unwrap();
+
+    // The entry is expired, so without a delay this would crank now.
+    h.warp(t0 + 200, 2);
+    let outcomes = turner.tick().await.unwrap();
+    assert!(
+        outcomes
+            .iter()
+            .any(|o| matches!(o, Outcome::Skipped(_, SkipReason::ContentionDelay))),
+        "{outcomes:?}"
+    );
+    assert!(sent(&outcomes).is_empty(), "{outcomes:?}");
+
+    // Still held back part-way through the delay.
+    h.warp(t0 + 201, DELAY / 2);
+    let outcomes = turner.tick().await.unwrap();
+    assert!(sent(&outcomes).is_empty(), "{outcomes:?}");
+
+    // Once it elapses the work is still there and gets cranked — delaying
+    // defers, it does not drop.
+    h.warp(t0 + 202, DELAY);
+    let outcomes = turner.tick().await.unwrap();
+    assert_eq!(sent(&outcomes).len(), 1, "{outcomes:?}");
+}
+
+/// And the delay is re-armed per piece of work, not spent once. A turner
+/// that delayed only the first condition it ever saw would go back to
+/// paying for reverts on everything after it.
+#[tokio::test]
+async fn each_new_wake_is_delayed_afresh() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    let t0 = h.t0;
+    h.add_entry(t0 + 100);
+
+    const DELAY: u64 = 4;
+    let source = Arc::new(LiteSvmSource::new(&h.svm, &h.watch_keys));
+    let blockhash = source.latest_blockhash().await.unwrap();
+    let (handle, _keepalive) = handle_with_lag(blockhash, DELAY);
+    let mut turner = Turner::new(
+        Arc::clone(&source),
+        Keypair::new(),
+        trusting(TurnerConfig::default()),
+    )
+    .with_submitter(handle);
+    h.svm
+        .lock()
+        .unwrap()
+        .airdrop(&turner.keeper_pubkey(), 1_000_000_000)
+        .unwrap();
+    turner.refresh_watches().await.unwrap();
+
+    // First piece of work: delayed, then cranked.
+    h.warp(t0 + 200, 2);
+    assert!(sent(&turner.tick().await.unwrap()).is_empty());
+    h.warp(t0 + 201, DELAY);
+    assert_eq!(sent(&turner.tick().await.unwrap()).len(), 1);
+
+    // Second piece: delayed again.
+    h.add_entry(t0 + 300);
+    h.warp(t0 + 400, 8);
+    let outcomes = turner.tick().await.unwrap();
+    assert!(
+        outcomes
+            .iter()
+            .any(|o| matches!(o, Outcome::Skipped(_, SkipReason::ContentionDelay))),
+        "the second wake was not delayed: {outcomes:?}"
+    );
+}
+
+/// The control: with no delay published, nothing is held back. Guards
+/// against the deferral leaking into the uncontested path, where being
+/// late is pure loss.
+#[tokio::test]
+async fn no_delay_means_no_deferral() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    let t0 = h.t0;
+    h.add_entry(t0 + 100);
+
+    let source = Arc::new(LiteSvmSource::new(&h.svm, &h.watch_keys));
+    let blockhash = source.latest_blockhash().await.unwrap();
+    let (handle, _keepalive) = handle_with_lag(blockhash, 0);
+    let mut turner = Turner::new(
+        Arc::clone(&source),
+        Keypair::new(),
+        trusting(TurnerConfig::default()),
+    )
+    .with_submitter(handle);
+    h.svm
+        .lock()
+        .unwrap()
+        .airdrop(&turner.keeper_pubkey(), 1_000_000_000)
+        .unwrap();
+    turner.refresh_watches().await.unwrap();
+
+    h.warp(t0 + 200, 2);
+    let outcomes = turner.tick().await.unwrap();
+    assert_eq!(sent(&outcomes).len(), 1, "{outcomes:?}");
+}
+
+/// A delay that appears mid-flight applies to work already waiting, and a
+/// delay that goes away releases it. This is the recovery path: the rival
+/// dies, the published delay decays, and the turner stops holding back.
+#[tokio::test]
+async fn clearing_the_delay_releases_held_work() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    let t0 = h.t0;
+    h.add_entry(t0 + 100);
+
+    let source = Arc::new(LiteSvmSource::new(&h.svm, &h.watch_keys));
+    let blockhash = source.latest_blockhash().await.unwrap();
+    let (handle, keepalive) = handle_with_lag(blockhash, 64);
+    let mut turner = Turner::new(
+        Arc::clone(&source),
+        Keypair::new(),
+        trusting(TurnerConfig::default()),
+    )
+    .with_submitter(handle);
+    h.svm
+        .lock()
+        .unwrap()
+        .airdrop(&turner.keeper_pubkey(), 1_000_000_000)
+        .unwrap();
+    turner.refresh_watches().await.unwrap();
+
+    h.warp(t0 + 200, 2);
+    assert!(sent(&turner.tick().await.unwrap()).is_empty());
+
+    // The rival disappears: the published delay decays to nothing.
+    keepalive
+        .lag
+        .send(LagSnapshot::from_iter([(demo_id(), 0)]))
+        .unwrap();
+    h.warp(t0 + 201, 2);
+    let outcomes = turner.tick().await.unwrap();
+    assert_eq!(
+        sent(&outcomes).len(),
+        1,
+        "work stayed held after the delay cleared: {outcomes:?}"
     );
 }

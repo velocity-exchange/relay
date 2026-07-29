@@ -13,6 +13,14 @@ use solana_sdk::signature::Keypair;
 use solana_sdk::signer::EncodableKey;
 use tracing::{info, warn};
 
+fn submitter_config(args: &Args) -> SubmitterConfig {
+    SubmitterConfig {
+        contention_step_slots: args.contention_step_slots,
+        max_contention_slots: args.max_contention_slots,
+        ..SubmitterConfig::default()
+    }
+}
+
 /// How the turner learns about account state. Simulation and submission
 /// always go over RPC regardless.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -105,6 +113,18 @@ struct Args {
     /// lamports. Default: never skip.
     #[arg(long, env = "RELAY_MIN_PROGRAM_PROFIT", allow_negative_numbers = true)]
     min_program_profit: Option<i64>,
+    /// Slots to add to a program's crank delay each time one of its
+    /// transactions reverts. A reverted crank means a fee was burned for
+    /// nothing — usually a rival turner landed the same work first — and
+    /// arriving deliberately later turns the next loss into a free no-op,
+    /// because simulation catches it before a transaction is built. Decays
+    /// back toward zero as cranks start landing again, so a rival going
+    /// away costs only a few seconds of lateness. Zero disables.
+    #[arg(long, env = "RELAY_CONTENTION_STEP_SLOTS", default_value_t = 4)]
+    contention_step_slots: u64,
+    /// Ceiling on that delay, in slots.
+    #[arg(long, env = "RELAY_MAX_CONTENTION_SLOTS", default_value_t = 12)]
+    max_contention_slots: u64,
     /// Port for /metrics and /health.
     #[arg(long, env = "RELAY_METRICS_PORT", default_value_t = 9899)]
     metrics_port: u16,
@@ -203,7 +223,7 @@ async fn main() -> Result<()> {
         Transport::Rpc => {
             let source = with_local_sim(rpc, &args);
             let submitter =
-                spawn_submitter(std::sync::Arc::clone(&source), SubmitterConfig::default());
+                spawn_submitter(std::sync::Arc::clone(&source), submitter_config(&args));
             run(
                 Turner::new(source, keeper, config).with_submitter(submitter),
                 &args,
@@ -229,7 +249,7 @@ async fn main() -> Result<()> {
                 &args,
             );
             let submitter =
-                spawn_submitter(std::sync::Arc::clone(&source), SubmitterConfig::default());
+                spawn_submitter(std::sync::Arc::clone(&source), submitter_config(&args));
             run(
                 Turner::new(source, keeper, config).with_submitter(submitter),
                 &args,
@@ -258,7 +278,7 @@ async fn main() -> Result<()> {
                 &args,
             );
             let submitter =
-                spawn_submitter(std::sync::Arc::clone(&source), SubmitterConfig::default());
+                spawn_submitter(std::sync::Arc::clone(&source), submitter_config(&args));
             run(
                 Turner::new(source, keeper, config).with_submitter(submitter),
                 &args,
