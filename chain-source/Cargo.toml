@@ -1,40 +1,31 @@
 [package]
-name = "relay-crank-turner"
-description = "Generic crank turner: watches relay conditions, discovers work via simulation, submits payment-asserted cranks"
+name = "relay-chain-source"
+description = "Pluggable Solana chain access: subscription-fed account cache and in-process lazy-fork simulation behind one trait"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
-relay-spec = { path = "../spec" }
-relay-chain-source = { path = "../chain-source" }
 anyhow = "1"
 async-trait = "0.1"
 base64 = "0.22"
 bincode = "1"
-clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
-# The simulation engine, not just a test harness: every resolver and
-# executor simulation runs in-process.
+# The simulation engine, not just a test harness: callers simulate in-process
+# instead of paying an RPC round trip per decision.
 litesvm = "0.11.0"
 prometheus = { version = "0.13", default-features = false }
 solana-account = "3"
 solana-account-decoder = "3"
 solana-client = "3"
-solana-compute-budget-interface = "3"
 solana-commitment-config = "3"
 solana-pubsub-client = "3"
 solana-rpc-client-api = "3"
 solana-sdk = "3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Same git rev as velocity's rust workspace so the two dependency trees can
 # coexist in one deployment.
 yellowstone-grpc-client = { git = "https://github.com/rpcpool/yellowstone-grpc", rev = "b39a415a219e842143f97440a0d0ef04207152c2" }
 yellowstone-grpc-proto = { git = "https://github.com/rpcpool/yellowstone-grpc", rev = "b39a415a219e842143f97440a0d0ef04207152c2" }
-
-[dev-dependencies]
-sha2 = "0.10"
-solana-system-interface = { version = "3", features = ["bincode"] }

@@ -31,8 +31,8 @@ use tracing::warn;
 
 use crate::filter::{RefreshSummary, WatchFilter};
 use crate::metrics;
-use crate::source::{ChainSource, ClockSnapshot};
 use crate::submit::{PendingTx, SubmitterHandle};
+use relay_chain_source::{ChainSource, ClockSnapshot};
 
 /// One registered watch, parsed from a `WatchV0` account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -330,7 +330,10 @@ impl<S: ChainSource> Turner<S> {
         let filter = self.config.filter.clone();
         let accounts = self
             .source
-            .get_watch_accounts(&self.config.relay_program, &filter.server_side_programs())
+            .get_program_accounts(
+                &self.config.relay_program,
+                &crate::watches::watch_filter_sets(&filter.server_side_programs()),
+            )
             .await?;
         let mut candidates: Vec<Watch> = accounts
             .iter()

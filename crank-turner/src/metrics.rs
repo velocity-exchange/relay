@@ -1,16 +1,14 @@
 //! Prometheus metrics and a `/metrics` + `/health` endpoint.
 //!
 //! The label set follows the one tuktuk's crank turner found useful in
-//! production, adapted to conditions instead of tasks. Two of them are
-//! there for specific operational failures that are otherwise invisible:
+//! production, adapted to conditions instead of tasks. `relay_wake_lag_seconds`
+//! is there for an operational failure that is otherwise invisible: how late a
+//! condition was cranked relative to when its wake became due. Rising lag means
+//! the turner is oversubscribed, not that the chain is slow.
 //!
-//! - `relay_update_source` — whether a watched account arrived over the
-//!   subscription or the periodic repoll. A subscription that has silently
-//!   died shows up as the poll counter climbing while the stream counter
-//!   flatlines, long before anything else looks wrong.
-//! - `relay_wake_lag_seconds` — how late a condition was cranked relative
-//!   to when its wake became due. Rising lag means the turner is
-//!   oversubscribed, not that the chain is slow.
+//! Chain-access metrics (`chain_*`: cache outcomes, feed liveness, update
+//! path, simulation path) live in `relay-chain-source`'s own registry;
+//! [`encode`] gathers both so `/metrics` exports them together.
 
 use std::sync::LazyLock;
 
@@ -71,28 +69,6 @@ pub static LAMPORTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("metric registers")
 });
 
-/// Where a watched account update came from: `subscription` or `repoll`.
-pub static UPDATE_SOURCE: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    register_int_counter_vec_with_registry!(
-        "relay_update_source_total",
-        "Account reads served by source",
-        &["source"],
-        REGISTRY
-    )
-    .expect("metric registers")
-});
-
-/// Simulations by where they ran: `local` (in-process SVM) or `error`.
-pub static SIMULATIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    register_int_counter_vec_with_registry!(
-        "relay_simulations_total",
-        "Simulations by execution site",
-        &["site"],
-        REGISTRY
-    )
-    .expect("metric registers")
-});
-
 /// Transactions by how they were assembled: `packed`, `single`, or
 /// `split` (a pack that failed to simulate and was sent one by one).
 pub static PACKS: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -100,32 +76,6 @@ pub static PACKS: LazyLock<IntCounterVec> = LazyLock::new(|| {
         "relay_packs_total",
         "Crank transactions by packing outcome",
         &["kind"],
-        REGISTRY
-    )
-    .expect("metric registers")
-});
-
-/// Cache reads by whether a live subscription covers the account. A
-/// climbing `uncovered` count is the signal to add a `--watch-program`:
-/// those reads are the ones paying an RPC round trip to stay safe.
-pub static CACHE_READS: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    register_int_counter_vec_with_registry!(
-        "relay_cache_reads_total",
-        "Cache reads by subscription coverage",
-        &["coverage"],
-        REGISTRY
-    )
-    .expect("metric registers")
-});
-
-/// 1 while the feed is delivering, 0 once it has gone silent past the
-/// timeout. The clock sysvar updates every slot, so this is a true
-/// liveness signal rather than a measure of chain activity.
-pub static FEED_HEALTHY: LazyLock<IntGaugeVec> = LazyLock::new(|| {
-    register_int_gauge_vec_with_registry!(
-        "relay_feed_healthy",
-        "Whether the account subscription feed is delivering",
-        &["feed"],
         REGISTRY
     )
     .expect("metric registers")
@@ -187,9 +137,13 @@ pub static TICK_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
     .expect("metric registers")
 });
 
+/// Both registries: the turner's own metrics plus the chain-access layer's
+/// (`relay-chain-source` owns those so it needn't know about this endpoint).
 pub fn encode() -> String {
+    let mut families = REGISTRY.gather();
+    families.extend(relay_chain_source::metrics::REGISTRY.gather());
     TextEncoder::new()
-        .encode_to_string(&REGISTRY.gather())
+        .encode_to_string(&families)
         .unwrap_or_else(|err| format!("# encoding failed: {err}\n"))
 }
 

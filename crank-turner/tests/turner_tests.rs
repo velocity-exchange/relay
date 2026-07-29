@@ -15,9 +15,10 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use litesvm::LiteSVM;
 use relay_crank_turner::{
-    feed_channel, AccountUpdate, BlockhashInfo, CachedSource, CachedSourceConfig, ChainSource,
-    ClockSnapshot, LagSnapshot, Outcome, ProfitSnapshot, RejectReason, SignatureOutcome,
-    SimOutcome, SkipReason, Stage, SubmitterHandle, Turner, TurnerConfig, WatchFilter,
+    feed_channel, watch_filter_sets, watch_subscription, AccountFilter, AccountUpdate,
+    BlockhashInfo, CachedSource, CachedSourceConfig, ChainSource, ClockSnapshot, LagSnapshot,
+    Outcome, ProfitSnapshot, RejectReason, SignatureOutcome, SimOutcome, SkipReason, Stage,
+    SubmitterHandle, Turner, TurnerConfig, WatchFilter,
 };
 use relay_spec as spec;
 use sha2::{Digest, Sha256};
@@ -95,23 +96,23 @@ impl ChainSource for LiteSvmSource {
         Ok(pubkeys.iter().map(|pk| svm.get_account(pk)).collect())
     }
 
-    async fn get_watch_accounts(
+    async fn get_program_accounts(
         &self,
         program: &Pubkey,
-        target_programs: &[Pubkey],
+        filter_sets: &[Vec<AccountFilter>],
     ) -> Result<Vec<(Pubkey, Account)>> {
         let svm = self.svm.lock().unwrap();
         let keys = self.watch_keys.lock().unwrap();
-        // Stands in for the provider-side memcmp on `target_program`.
-        let allowed: Vec<[u8; 32]> = target_programs.iter().map(|pk| pk.to_bytes()).collect();
+        // Stands in for provider-side filtering.
         Ok(keys
             .iter()
             .filter_map(|pk| svm.get_account(pk).map(|acc| (*pk, acc)))
-            .filter(|(_, acc)| acc.owner == *program && acc.data.len() == spec::WATCH_V0_LEN)
+            .filter(|(_, acc)| acc.owner == *program)
             .filter(|(_, acc)| {
-                allowed.is_empty()
-                    || spec::WatchV0::read_from_account(&acc.data)
-                        .is_ok_and(|w| allowed.contains(&w.target_program))
+                filter_sets.is_empty()
+                    || filter_sets
+                        .iter()
+                        .any(|set| set.iter().all(|filter| filter.matches(acc)))
             })
             .collect())
     }
@@ -225,14 +226,12 @@ impl ChainSource for NoRemoteSimSource {
         *self.fetches.lock().unwrap() += 1;
         self.inner.get_multiple_accounts(pubkeys).await
     }
-    async fn get_watch_accounts(
+    async fn get_program_accounts(
         &self,
         program: &Pubkey,
-        target_programs: &[Pubkey],
+        filter_sets: &[Vec<AccountFilter>],
     ) -> Result<Vec<(Pubkey, Account)>> {
-        self.inner
-            .get_watch_accounts(program, target_programs)
-            .await
+        self.inner.get_program_accounts(program, filter_sets).await
     }
     async fn clock(&self) -> Result<ClockSnapshot> {
         self.inner.clock().await
@@ -859,13 +858,13 @@ async fn cached_source_serves_feed_updates_and_publishes_interest() {
         inner,
         receiver,
         CachedSourceConfig {
-            relay_program: relay_id(),
+            indexed_programs: vec![watch_subscription(relay_id(), &[])],
             // Trust the cache indefinitely so this test isolates the
             // update-merging behavior from the freshness policy.
             max_age_uncovered: std::time::Duration::from_secs(3600),
             max_age_covered: std::time::Duration::from_secs(3600),
             feed_silence_timeout: std::time::Duration::from_secs(3600),
-            watch_programs: Vec::new(),
+            covered_programs: Vec::new(),
         },
     );
 
@@ -927,13 +926,13 @@ async fn turner_cranks_through_cached_source() {
         inner,
         receiver,
         CachedSourceConfig {
-            relay_program: relay_id(),
+            indexed_programs: vec![watch_subscription(relay_id(), &[])],
             // No live backend in this test, so revalidate every read to
             // keep the cache honest against the inner source.
             max_age_uncovered: std::time::Duration::ZERO,
             max_age_covered: std::time::Duration::ZERO,
             feed_silence_timeout: std::time::Duration::from_secs(3600),
-            watch_programs: Vec::new(),
+            covered_programs: Vec::new(),
         },
     );
     let mut turner = Turner::new(cached, Keypair::new(), trusting(TurnerConfig::default()));
@@ -1120,12 +1119,12 @@ async fn program_allowlist_is_pushed_to_the_provider() {
 
     let source = LiteSvmSource::new(&h.svm, &h.watch_keys);
     let all = source
-        .get_watch_accounts(&relay_id(), &[])
+        .get_program_accounts(&relay_id(), &watch_filter_sets(&[]))
         .await
         .unwrap()
         .len();
     let scoped = source
-        .get_watch_accounts(&relay_id(), &[demo_id()])
+        .get_program_accounts(&relay_id(), &watch_filter_sets(&[demo_id()]))
         .await
         .unwrap();
     assert_eq!(all, 2, "both watches exist in the registry");
@@ -1249,14 +1248,12 @@ impl ChainSource for SlowSource {
     async fn get_multiple_accounts(&self, pubkeys: &[Pubkey]) -> Result<Vec<Option<Account>>> {
         self.inner.get_multiple_accounts(pubkeys).await
     }
-    async fn get_watch_accounts(
+    async fn get_program_accounts(
         &self,
         program: &Pubkey,
-        target_programs: &[Pubkey],
+        filter_sets: &[Vec<AccountFilter>],
     ) -> Result<Vec<(Pubkey, Account)>> {
-        self.inner
-            .get_watch_accounts(program, target_programs)
-            .await
+        self.inner.get_program_accounts(program, filter_sets).await
     }
     async fn clock(&self) -> Result<ClockSnapshot> {
         self.inner.clock().await
@@ -1492,7 +1489,7 @@ async fn all_simulation_happens_locally() {
 
     let encoded = relay_crank_turner::metrics::encode();
     assert!(
-        encoded.contains("relay_simulations_total"),
+        encoded.contains("chain_simulations_total"),
         "local simulations should be counted"
     );
 }
@@ -1545,12 +1542,12 @@ async fn watched_program_accounts_are_never_refetched() {
         counted,
         receiver,
         CachedSourceConfig {
-            relay_program: relay_id(),
+            indexed_programs: vec![watch_subscription(relay_id(), &[])],
             // Would otherwise revalidate on every read.
             max_age_uncovered: std::time::Duration::ZERO,
             max_age_covered: std::time::Duration::from_secs(3600),
             feed_silence_timeout: std::time::Duration::from_secs(3600),
-            watch_programs: vec![demo_id()],
+            covered_programs: vec![demo_id()],
         },
     );
     // A live backend vouching for the program, plus a heartbeat so the
@@ -1710,14 +1707,14 @@ fn freshness_cache(
     (sender, CachedSource::new(counted, receiver, config))
 }
 
-fn freshness_config(watch_programs: Vec<Pubkey>) -> CachedSourceConfig {
+fn freshness_config(covered_programs: Vec<Pubkey>) -> CachedSourceConfig {
     CachedSourceConfig {
-        relay_program: relay_id(),
+        indexed_programs: vec![watch_subscription(relay_id(), &[])],
         // Zero: an uncovered account must be revalidated on every read.
         max_age_uncovered: std::time::Duration::ZERO,
         max_age_covered: std::time::Duration::from_secs(3600),
         feed_silence_timeout: std::time::Duration::from_secs(3600),
-        watch_programs,
+        covered_programs,
     }
 }
 
@@ -1798,8 +1795,8 @@ async fn silent_feed_stops_trusting_coverage() {
     );
 
     let encoded = relay_crank_turner::metrics::encode();
-    assert!(encoded.contains("relay_feed_healthy"));
-    assert!(encoded.contains("relay_cache_reads_total"));
+    assert!(encoded.contains("chain_feed_healthy"));
+    assert!(encoded.contains("chain_cache_reads_total"));
 }
 
 /// Dropping a subscription revokes coverage immediately, without waiting

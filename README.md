@@ -20,6 +20,7 @@ The on-chain instruction is always the authoritative predicate — a stale turne
 | `spec/` | `relay-spec` — pod wire types (bytemuck only); embed this in your program |
 | `programs/relay/` | watch registry + payment guard instructions (Anchor v2) |
 | `programs/demo-book/` | reference target: a two-sided book with three conditions — expiry sweep, soft-cap eviction, and crossing |
+| `chain-source/` | `relay-chain-source` — pluggable chain access: subscription-fed account cache + in-process lazy-fork simulation behind one trait. Protocol-agnostic; consumable on its own |
 | `crank-turner/` | the generic turner daemon + litesvm end-to-end tests |
 
 ## Build & test

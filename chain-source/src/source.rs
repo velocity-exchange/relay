@@ -1,7 +1,13 @@
 //! Chain access behind a trait so transports are pluggable. `RpcSource` is
 //! the reference implementation (polling); [`crate::cached::CachedSource`]
 //! wraps it with a subscription-fed cache for the websocket and gRPC paths;
-//! tests use a litesvm-backed source.
+//! [`crate::local_sim::LocalSimSource`] moves simulation in-process. Tests
+//! use a litesvm-backed source.
+//!
+//! Program-account queries take [`AccountFilter`]s rather than any
+//! protocol's account layout, so this layer stays generic: the caller says
+//! "this size, these bytes at this offset" and each transport translates
+//! that into its own filter language.
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -65,15 +71,18 @@ pub struct SimOutcome {
 pub trait ChainSource: Send + Sync {
     async fn get_multiple_accounts(&self, pubkeys: &[Pubkey]) -> Result<Vec<Option<Account>>>;
 
-    /// relay watch accounts, pre-filtered to plausible `WatchV0`s by
-    /// size/discriminator. `target_programs` is the operator's program
-    /// allowlist: non-empty means the provider itself should filter on the
-    /// watch's `target_program` (memcmp), so another protocol's watches are
-    /// never transmitted. Empty means no program restriction.
-    async fn get_watch_accounts(
+    /// Accounts owned by `program`, pre-filtered by the provider.
+    ///
+    /// `filter_sets` is a union of alternatives: each inner set is one
+    /// provider-side query (filters within a set are ANDed), and the results
+    /// are concatenated. That shape exists because a memcmp can only match
+    /// one value, so an allowlist of N values is N queries — still far
+    /// cheaper than downloading everything and discarding it locally. An
+    /// empty outer slice means one unfiltered query.
+    async fn get_program_accounts(
         &self,
         program: &Pubkey,
-        target_programs: &[Pubkey],
+        filter_sets: &[Vec<AccountFilter>],
     ) -> Result<Vec<(Pubkey, Account)>>;
 
     async fn clock(&self) -> Result<ClockSnapshot>;
@@ -118,12 +127,12 @@ impl<T: ChainSource + ?Sized> ChainSource for std::sync::Arc<T> {
     async fn get_multiple_accounts(&self, pubkeys: &[Pubkey]) -> Result<Vec<Option<Account>>> {
         (**self).get_multiple_accounts(pubkeys).await
     }
-    async fn get_watch_accounts(
+    async fn get_program_accounts(
         &self,
         program: &Pubkey,
-        target_programs: &[Pubkey],
+        filter_sets: &[Vec<AccountFilter>],
     ) -> Result<Vec<(Pubkey, Account)>> {
-        (**self).get_watch_accounts(program, target_programs).await
+        (**self).get_program_accounts(program, filter_sets).await
     }
     async fn clock(&self) -> Result<ClockSnapshot> {
         (**self).clock().await
@@ -170,24 +179,46 @@ impl RpcSource {
     }
 }
 
-/// `WatchV0`-shaped account filters, optionally narrowed to one target
-/// program. Shared by the RPC and websocket paths.
-pub fn watch_filters(target_program: Option<&Pubkey>) -> Vec<RpcFilterType> {
-    [
-        RpcFilterType::DataSize(relay_spec::WATCH_V0_LEN as u64),
-        RpcFilterType::Memcmp(Memcmp::new_raw_bytes(
-            0,
-            relay_spec::WATCH_V0_DISCRIMINATOR.to_vec(),
-        )),
-    ]
-    .into_iter()
-    .chain(target_program.map(|pk| {
-        RpcFilterType::Memcmp(Memcmp::new_raw_bytes(
-            relay_spec::WATCH_TARGET_PROGRAM_OFFSET,
-            pk.to_bytes().to_vec(),
-        ))
-    }))
-    .collect()
+/// A provider-side account filter, in terms every transport can express.
+/// Callers build these from their own account layouts; nothing in this crate
+/// knows what the bytes mean.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountFilter {
+    /// Exact account data length.
+    DataSize(u64),
+    /// `bytes` appear at `offset` in the account data.
+    Memcmp { offset: usize, bytes: Vec<u8> },
+}
+
+impl AccountFilter {
+    /// Convenience for a discriminator-style prefix match.
+    pub fn prefix(bytes: impl Into<Vec<u8>>) -> Self {
+        AccountFilter::Memcmp {
+            offset: 0,
+            bytes: bytes.into(),
+        }
+    }
+
+    pub(crate) fn to_rpc(&self) -> RpcFilterType {
+        match self {
+            AccountFilter::DataSize(len) => RpcFilterType::DataSize(*len),
+            AccountFilter::Memcmp { offset, bytes } => {
+                RpcFilterType::Memcmp(Memcmp::new_raw_bytes(*offset, bytes.clone()))
+            }
+        }
+    }
+
+    /// Evaluate locally. A cache has to re-apply filters itself, because the
+    /// backend's subscription may be broader than a given query.
+    pub fn matches(&self, account: &Account) -> bool {
+        match self {
+            AccountFilter::DataSize(len) => account.data.len() as u64 == *len,
+            AccountFilter::Memcmp { offset, bytes } => account
+                .data
+                .get(*offset..offset.saturating_add(bytes.len()))
+                .is_some_and(|slice| slice == bytes.as_slice()),
+        }
+    }
 }
 
 fn decode_ui_account(ui: solana_account_decoder::UiAccount) -> Option<Account> {
@@ -231,22 +262,20 @@ impl ChainSource for RpcSource {
             .map(|chunks| chunks.into_iter().flatten().collect())
     }
 
-    async fn get_watch_accounts(
+    async fn get_program_accounts(
         &self,
         program: &Pubkey,
-        target_programs: &[Pubkey],
+        filter_sets: &[Vec<AccountFilter>],
     ) -> Result<Vec<(Pubkey, Account)>> {
-        // A memcmp can only match one value, so an allowlist of N programs
-        // is N queries. Worth it: the alternative is downloading every
-        // other protocol's registry entries and discarding them locally.
-        let queries: Vec<Option<Pubkey>> = if target_programs.is_empty() {
-            vec![None]
+        let empty: Vec<Vec<AccountFilter>> = vec![Vec::new()];
+        let queries = if filter_sets.is_empty() {
+            &empty[..]
         } else {
-            target_programs.iter().copied().map(Some).collect()
+            filter_sets
         };
         let mut out = Vec::new();
-        for target_program in queries {
-            let filters = watch_filters(target_program.as_ref());
+        for set in queries {
+            let filters: Vec<RpcFilterType> = set.iter().map(AccountFilter::to_rpc).collect();
             // Deprecated in favor of the ui-accounts variant, but this one
             // returns `Account` directly, which is what the trait wants.
             #[allow(deprecated)]
@@ -264,7 +293,7 @@ impl ChainSource for RpcSource {
                     },
                 )
                 .await
-                .context("get_program_accounts(watches)")?;
+                .context("get_program_accounts")?;
             out.extend(accounts);
         }
         Ok(out)

@@ -30,6 +30,7 @@ use yellowstone_grpc_proto::prelude::{
 };
 
 use crate::feed::{AccountUpdate, Coverage, FeedSender};
+use crate::source::AccountFilter;
 
 #[derive(Debug, Clone)]
 pub struct GrpcFeedConfig {
@@ -37,91 +38,101 @@ pub struct GrpcFeedConfig {
     pub x_token: Option<String>,
 }
 
-/// `target_programs` narrows the watch-registry filter to those programs
-/// (one filter entry each); empty streams every watch.
+/// A provider-side subscription to accounts owned by one program.
+///
+/// `filter_sets` is a union of alternatives, matching
+/// [`ChainSource::get_program_accounts`](crate::ChainSource::get_program_accounts):
+/// each inner set becomes one stream entry (filters ANDed), because a memcmp
+/// matches a single value. Empty means "every account this program owns".
+#[derive(Debug, Clone)]
+pub struct ProgramSubscription {
+    pub program: Pubkey,
+    pub filter_sets: Vec<Vec<AccountFilter>>,
+}
+
+impl ProgramSubscription {
+    /// Every account owned by `program` — the mode that keeps local
+    /// simulation off the network.
+    pub fn all(program: Pubkey) -> Self {
+        Self {
+            program,
+            filter_sets: Vec::new(),
+        }
+    }
+}
+
+/// Subscribe to `subscriptions` (each a program plus optional filters) and
+/// the caller's explicit interest set. Filtered subscriptions keep another
+/// protocol's accounts from ever crossing the wire; unfiltered ones make a
+/// program's whole state resident so simulating its instructions is free.
 pub fn spawn_grpc_feed(
     config: GrpcFeedConfig,
-    relay_program: Pubkey,
-    target_programs: Vec<Pubkey>,
+    subscriptions: Vec<ProgramSubscription>,
     feed: FeedSender,
 ) -> JoinHandle<()> {
-    spawn_grpc_feed_with_programs(config, relay_program, target_programs, Vec::new(), feed)
+    tokio::spawn(run(config, subscriptions, feed))
 }
 
-/// `watch_programs` streams every account owned by those programs, which
-/// is what keeps local simulation off the network.
-pub fn spawn_grpc_feed_with_programs(
-    config: GrpcFeedConfig,
-    relay_program: Pubkey,
-    target_programs: Vec<Pubkey>,
-    watch_programs: Vec<Pubkey>,
-    feed: FeedSender,
-) -> JoinHandle<()> {
-    tokio::spawn(run(
-        config,
-        relay_program,
-        target_programs,
-        watch_programs,
-        feed,
-    ))
+/// Programs whose subscription carries no filters, and are therefore fully
+/// covered by the stream.
+fn unfiltered_programs(subscriptions: &[ProgramSubscription]) -> std::collections::HashSet<Pubkey> {
+    subscriptions
+        .iter()
+        .filter(|subscription| subscription.filter_sets.is_empty())
+        .map(|subscription| subscription.program)
+        .collect()
 }
 
-/// Watch-registry filters: the relay program as owner, `WatchV0` size, and
-/// — when the operator scoped the turner — a memcmp pinning
-/// `target_program`, so other protocols' watches never cross the wire.
-fn watch_filters(target_program: Option<&Pubkey>) -> Vec<SubscribeRequestFilterAccountsFilter> {
-    [SubscribeRequestFilterAccountsFilter {
-        filter: Some(AccountsFilterOneof::Datasize(
-            relay_spec::WATCH_V0_LEN as u64,
-        )),
-    }]
-    .into_iter()
-    .chain(
-        target_program.map(|pk| SubscribeRequestFilterAccountsFilter {
-            filter: Some(AccountsFilterOneof::Memcmp(
-                SubscribeRequestFilterAccountsFilterMemcmp {
-                    offset: relay_spec::WATCH_TARGET_PROGRAM_OFFSET as u64,
-                    data: Some(AccountsFilterMemcmpOneof::Bytes(pk.to_bytes().to_vec())),
-                },
-            )),
+fn to_grpc_filter(filter: &AccountFilter) -> SubscribeRequestFilterAccountsFilter {
+    SubscribeRequestFilterAccountsFilter {
+        filter: Some(match filter {
+            AccountFilter::DataSize(len) => AccountsFilterOneof::Datasize(*len),
+            AccountFilter::Memcmp { offset, bytes } => {
+                AccountsFilterOneof::Memcmp(SubscribeRequestFilterAccountsFilterMemcmp {
+                    offset: *offset as u64,
+                    data: Some(AccountsFilterMemcmpOneof::Bytes(bytes.clone())),
+                })
+            }
         }),
-    )
-    .collect()
+    }
 }
 
 fn build_request(
-    relay_program: &Pubkey,
-    target_programs: &[Pubkey],
-    watch_programs: &[Pubkey],
+    subscriptions: &[ProgramSubscription],
     interest: &HashSet<Pubkey>,
 ) -> SubscribeRequest {
-    let watch_entries: Vec<(String, SubscribeRequestFilterAccounts)> = if target_programs.is_empty()
-    {
-        vec![(
-            "watches".to_string(),
-            SubscribeRequestFilterAccounts {
-                owner: vec![relay_program.to_string()],
-                filters: watch_filters(None),
-                ..Default::default()
-            },
-        )]
-    } else {
-        target_programs
-            .iter()
-            .enumerate()
-            .map(|(i, target_program)| {
-                (
-                    format!("watches-{i}"),
+    let owned_entries: Vec<(String, SubscribeRequestFilterAccounts)> = subscriptions
+        .iter()
+        .enumerate()
+        .flat_map(|(i, subscription)| {
+            let owner = vec![subscription.program.to_string()];
+            if subscription.filter_sets.is_empty() {
+                return vec![(
+                    format!("owned-{i}"),
                     SubscribeRequestFilterAccounts {
-                        owner: vec![relay_program.to_string()],
-                        filters: watch_filters(Some(target_program)),
+                        owner,
                         ..Default::default()
                     },
-                )
-            })
-            .collect()
-    };
-    let accounts: HashMap<String, SubscribeRequestFilterAccounts> = watch_entries
+                )];
+            }
+            subscription
+                .filter_sets
+                .iter()
+                .enumerate()
+                .map(|(j, set)| {
+                    (
+                        format!("owned-{i}-{j}"),
+                        SubscribeRequestFilterAccounts {
+                            owner: owner.clone(),
+                            filters: set.iter().map(to_grpc_filter).collect(),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect()
+        })
+        .collect();
+    let accounts: HashMap<String, SubscribeRequestFilterAccounts> = owned_entries
         .into_iter()
         .chain([(
             "interest".to_string(),
@@ -135,17 +146,6 @@ fn build_request(
                 ..Default::default()
             },
         )])
-        // Everything owned by the watched programs, so local simulation
-        // finds its accounts already cached.
-        .chain(watch_programs.iter().enumerate().map(|(i, program)| {
-            (
-                format!("owned-{i}"),
-                SubscribeRequestFilterAccounts {
-                    owner: vec![program.to_string()],
-                    ..Default::default()
-                },
-            )
-        }))
         .collect();
     SubscribeRequest {
         accounts,
@@ -154,13 +154,7 @@ fn build_request(
     }
 }
 
-async fn run(
-    config: GrpcFeedConfig,
-    relay_program: Pubkey,
-    target_programs: Vec<Pubkey>,
-    watch_programs: Vec<Pubkey>,
-    feed: FeedSender,
-) {
+async fn run(config: GrpcFeedConfig, subscriptions: Vec<ProgramSubscription>, feed: FeedSender) {
     let mut backoff = Duration::from_secs(1);
     let mut interest = feed.interest.clone();
     loop {
@@ -185,12 +179,7 @@ async fn run(
             }
         };
 
-        let request = build_request(
-            &relay_program,
-            &target_programs,
-            &watch_programs,
-            &interest.borrow_and_update(),
-        );
+        let request = build_request(&subscriptions, &interest.borrow_and_update());
         let (mut sink, mut stream) = match client.subscribe_with_request(Some(request)).await {
             Ok(pair) => pair,
             Err(err) => {
@@ -204,7 +193,10 @@ async fn run(
         // Subscribed: silence about these accounts now means "unchanged".
         feed.set_coverage(Coverage {
             accounts: interest.borrow().iter().copied().collect(),
-            programs: watch_programs.iter().copied().collect(),
+            // Only an unfiltered subscription covers every account a
+            // program owns; a filtered one says nothing about what it
+            // excludes.
+            programs: unfiltered_programs(&subscriptions),
         });
         debug!("grpc subscribed");
 
@@ -260,12 +252,8 @@ async fn run(
                 changed = interest.changed() => match changed {
                     Ok(()) => {
                         // Filter update on the live stream — no reconnect.
-                        let request = build_request(
-                            &relay_program,
-                            &target_programs,
-                            &watch_programs,
-                            &interest.borrow_and_update(),
-                        );
+                        let request =
+                            build_request(&subscriptions, &interest.borrow_and_update());
                         if let Err(err) = sink.send(request).await {
                             warn!(error = %err, "grpc filter update failed; reconnecting");
                             feed.set_coverage(Coverage::default());
@@ -274,7 +262,10 @@ async fn run(
                         // Newly interested accounts are covered from here.
                         feed.set_coverage(Coverage {
                             accounts: interest.borrow().iter().copied().collect(),
-                            programs: watch_programs.iter().copied().collect(),
+                            // Only an unfiltered subscription covers every account a
+            // program owns; a filtered one says nothing about what it
+            // excludes.
+            programs: unfiltered_programs(&subscriptions),
                         });
                     }
                     Err(_) => return, // interest sender dropped: shut down

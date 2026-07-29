@@ -3516,6 +3516,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "relay-chain-source"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "bincode",
+ "futures-util",
+ "litesvm",
+ "prometheus",
+ "solana-account",
+ "solana-account-decoder",
+ "solana-client",
+ "solana-commitment-config",
+ "solana-pubsub-client",
+ "solana-rpc-client-api",
+ "solana-sdk",
+ "tokio",
+ "tracing",
+ "yellowstone-grpc-client",
+ "yellowstone-grpc-proto",
+]
+
+[[package]]
 name = "relay-crank-turner"
 version = "0.1.0"
 dependencies = [
@@ -3527,6 +3551,7 @@ dependencies = [
  "futures-util",
  "litesvm",
  "prometheus",
+ "relay-chain-source",
  "relay-spec",
  "sha2 0.10.9",
  "solana-account",

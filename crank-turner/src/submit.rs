@@ -28,7 +28,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::metrics;
-use crate::source::{BlockhashInfo, ChainSource, SignatureOutcome};
+use relay_chain_source::{BlockhashInfo, ChainSource, SignatureOutcome};
 
 /// How a submitted transaction ended.
 #[derive(Debug, Clone, PartialEq, Eq)]

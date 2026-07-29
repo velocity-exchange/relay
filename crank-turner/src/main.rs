@@ -3,10 +3,10 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use relay_crank_turner::{
-    derive_ws_url, feed_channel, grpc::spawn_grpc_feed_with_programs, metrics, spawn_submitter,
-    ws::spawn_ws_feed_with_programs, CachedSource, CachedSourceConfig, ChainSource, GrpcFeedConfig,
-    LocalSimConfig, LocalSimSource, Outcome, RpcSource, SubmitterConfig, Turner, TurnerConfig,
-    WatchFilter,
+    derive_ws_url, feed_channel, metrics, spawn_grpc_feed, spawn_submitter, spawn_ws_feed,
+    watch_subscription, CachedSource, CachedSourceConfig, ChainSource, GrpcFeedConfig,
+    LocalSimConfig, LocalSimSource, Outcome, ProgramSubscription, RpcSource, SubmitterConfig,
+    Turner, TurnerConfig, WatchFilter,
 };
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
@@ -236,13 +236,7 @@ async fn main() -> Result<()> {
                 .clone()
                 .unwrap_or_else(|| derive_ws_url(&args.rpc_url));
             let (sender, receiver) = feed_channel();
-            spawn_ws_feed_with_programs(
-                ws_url.clone(),
-                args.program_id,
-                filter.server_side_programs(),
-                args.watch_program.clone(),
-                sender,
-            );
+            spawn_ws_feed(ws_url.clone(), subscriptions(&args, &filter), sender);
             info!(%ws_url, watched = args.watch_program.len(), "websocket subscriptions enabled");
             let source = with_local_sim(
                 CachedSource::new(rpc, receiver, cached_config(&args)),
@@ -262,14 +256,12 @@ async fn main() -> Result<()> {
                 .clone()
                 .context("--grpc-endpoint is required for the grpc transport")?;
             let (sender, receiver) = feed_channel();
-            spawn_grpc_feed_with_programs(
+            spawn_grpc_feed(
                 GrpcFeedConfig {
                     endpoint: endpoint.clone(),
                     x_token: args.grpc_x_token.clone(),
                 },
-                args.program_id,
-                filter.server_side_programs(),
-                args.watch_program.clone(),
+                subscriptions(&args, &filter),
                 sender,
             );
             info!(%endpoint, watched = args.watch_program.len(), "yellowstone gRPC subscriptions enabled");
@@ -288,13 +280,32 @@ async fn main() -> Result<()> {
     }
 }
 
+/// What the feed subscribes to: the watch registry (scoped to the
+/// operator's allowlist, so other protocols' watches never cross the wire)
+/// plus every account owned by each `--watch-program`, which is what keeps
+/// local simulation off the network.
+fn subscriptions(args: &Args, filter: &WatchFilter) -> Vec<ProgramSubscription> {
+    std::iter::once(watch_subscription(
+        args.program_id,
+        &filter.server_side_programs(),
+    ))
+    .chain(
+        args.watch_program
+            .iter()
+            .copied()
+            .map(ProgramSubscription::all),
+    )
+    .collect()
+}
+
 fn cached_config(args: &Args) -> CachedSourceConfig {
     CachedSourceConfig {
-        relay_program: args.program_id,
+        // The registry is the query the turner answers from cache.
+        indexed_programs: vec![watch_subscription(args.program_id, &[])],
         max_age_uncovered: std::time::Duration::from_millis(args.max_age_uncovered_ms),
         max_age_covered: std::time::Duration::from_secs(args.max_age_covered_s),
         feed_silence_timeout: std::time::Duration::from_secs(args.feed_silence_s),
-        watch_programs: args.watch_program.clone(),
+        covered_programs: args.watch_program.clone(),
     }
 }
 

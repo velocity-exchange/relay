@@ -6,14 +6,15 @@
 //!
 //! Interest is learned two ways. Any pubkey a caller asks for is added to
 //! the published interest set, which backends subscribe to individually.
-//! On top of that, `watch_programs` streams **every** account owned by the
-//! named programs — the setting that makes local simulation cheap: a
-//! turner cranking its own protocol names that protocol's program id and
-//! then almost never pays an RPC fetch to simulate, because every account
-//! a crank touches is already resident.
+//! On top of that, `covered_programs` streams **every** account owned by the
+//! named programs — the setting that makes local simulation cheap: a client
+//! simulating its own protocol names that protocol's program id and then
+//! almost never pays an RPC fetch, because every account its instructions
+//! touch is already resident.
 //!
-//! Watch-registry accounts arrive via the backend's program-owner
-//! subscription after a one-time warm start through the inner source.
+//! Accounts matching an `indexed_programs` subscription are additionally
+//! tracked by key, so [`ChainSource::get_program_accounts`] can be answered
+//! from the cache after a one-time warm start through the inner source.
 //!
 //! ## Freshness
 //!
@@ -54,13 +55,18 @@ use solana_sdk::sysvar;
 use solana_sdk::transaction::Transaction;
 
 use crate::feed::FeedReceiver;
+use crate::grpc::ProgramSubscription;
 use crate::metrics;
-use crate::source::{ChainSource, ClockSnapshot, SimOutcome};
+use crate::source::{AccountFilter, ChainSource, ClockSnapshot, SimOutcome};
 
 #[derive(Debug, Clone)]
 pub struct CachedSourceConfig {
     /// The relay program whose watch accounts the backend streams.
-    pub relay_program: Pubkey,
+    /// Program-account queries the cache should answer locally. Accounts
+    /// matching one of these are indexed by key as they arrive, so a
+    /// `get_program_accounts` for the same program is served from cache
+    /// after the first warm-up fetch.
+    pub indexed_programs: Vec<ProgramSubscription>,
     /// How long an account with no live subscription may be served from
     /// cache before it must be refetched. Keep this short: these are
     /// exactly the accounts a simulation could be wrong about. Zero means
@@ -75,19 +81,19 @@ pub struct CachedSourceConfig {
     /// Cache every account owned by these programs, not just the ones
     /// explicitly asked for. Point this at the protocol you crank and
     /// local simulation stops needing the network.
-    pub watch_programs: Vec<Pubkey>,
+    pub covered_programs: Vec<Pubkey>,
 }
 
 impl Default for CachedSourceConfig {
     fn default() -> Self {
         Self {
-            relay_program: crate::turner::TurnerConfig::default().relay_program,
+            indexed_programs: Vec::new(),
             // About one slot: an uncovered account is never more than a
             // block behind what a simulation sees.
             max_age_uncovered: Duration::from_millis(400),
             max_age_covered: Duration::from_secs(30),
             feed_silence_timeout: Duration::from_secs(10),
-            watch_programs: Vec::new(),
+            covered_programs: Vec::new(),
         }
     }
 }
@@ -106,7 +112,7 @@ struct CacheState {
     accounts: HashMap<Pubkey, CachedAccount>,
     /// Pubkeys ever observed as relay watch accounts (from the warm start or
     /// the backend's owner subscription).
-    watch_keys: HashSet<Pubkey>,
+    indexed_keys: HashSet<Pubkey>,
     interested: HashSet<Pubkey>,
     warm: bool,
     /// Last update of any kind — the feed's heartbeat.
@@ -127,7 +133,7 @@ impl<Inner: ChainSource> CachedSource<Inner> {
             state: Mutex::new(CacheState {
                 feed,
                 accounts: HashMap::new(),
-                watch_keys: HashSet::new(),
+                indexed_keys: HashSet::new(),
                 interested: HashSet::new(),
                 warm: false,
                 last_feed_update: None,
@@ -154,9 +160,10 @@ impl<Inner: ChainSource> CachedSource<Inner> {
     /// stale ones (older slot than cached) are dropped.
     fn drain(state: &mut CacheState, config: &CachedSourceConfig) {
         while let Ok(update) = state.feed.updates.try_recv() {
-            let is_watch = update.account.as_ref().is_some_and(|acc| {
-                acc.owner == config.relay_program && acc.data.len() == relay_spec::WATCH_V0_LEN
-            });
+            let is_indexed = update
+                .account
+                .as_ref()
+                .is_some_and(|acc| matches_any(acc, &config.indexed_programs));
             let now = Instant::now();
             state.last_feed_update = Some(now);
             let entry = state
@@ -172,8 +179,8 @@ impl<Inner: ChainSource> CachedSource<Inner> {
                 entry.account = update.account;
                 entry.observed = now;
             }
-            if is_watch {
-                state.watch_keys.insert(update.pubkey);
+            if is_indexed {
+                state.indexed_keys.insert(update.pubkey);
             }
         }
     }
@@ -289,21 +296,21 @@ impl<Inner: ChainSource> ChainSource for CachedSource<Inner> {
         }))
     }
 
-    async fn get_watch_accounts(
+    async fn get_program_accounts(
         &self,
         program: &Pubkey,
-        target_programs: &[Pubkey],
+        filter_sets: &[Vec<AccountFilter>],
     ) -> Result<Vec<(Pubkey, Account)>> {
         let warm = self.with_state(|state, _| state.warm);
         if !warm {
             let accounts = self
                 .inner
-                .get_watch_accounts(program, target_programs)
+                .get_program_accounts(program, filter_sets)
                 .await?;
             let fetched_at = Instant::now();
             self.with_state(|state, _| {
                 accounts.into_iter().for_each(|(pk, account)| {
-                    state.watch_keys.insert(pk);
+                    state.indexed_keys.insert(pk);
                     state.accounts.entry(pk).or_insert_with(|| CachedAccount {
                         slot: 0,
                         account: Some(account),
@@ -313,28 +320,18 @@ impl<Inner: ChainSource> ChainSource for CachedSource<Inner> {
                 state.warm = true;
             });
         }
-        // The backend's own subscription filter may be broader than the
-        // caller's allowlist (or absent), so re-apply it here.
-        let allowed: std::collections::HashSet<[u8; 32]> =
-            target_programs.iter().map(|pk| pk.to_bytes()).collect();
-        Ok(self.with_state(|state, config| {
+        // The backend's subscription may be broader than this query, so the
+        // caller's own filters are re-applied locally.
+        Ok(self.with_state(|state, _| {
             state
-                .watch_keys
+                .indexed_keys
                 .iter()
                 .filter_map(|pk| {
                     state
                         .accounts
                         .get(pk)
                         .and_then(|e| e.account.clone())
-                        .filter(|acc| {
-                            acc.owner == config.relay_program
-                                && acc.data.len() == relay_spec::WATCH_V0_LEN
-                        })
-                        .filter(|acc| {
-                            allowed.is_empty()
-                                || relay_spec::WatchV0::read_from_account(&acc.data)
-                                    .is_ok_and(|w| allowed.contains(&w.target_program))
-                        })
+                        .filter(|acc| acc.owner == *program && matches_filters(acc, filter_sets))
                         .map(|acc| (*pk, acc))
                 })
                 .collect()
@@ -394,4 +391,20 @@ impl<Inner: ChainSource> ChainSource for CachedSource<Inner> {
     async fn send_transaction(&self, tx: &Transaction) -> Result<Signature> {
         self.inner.send_transaction(tx).await
     }
+}
+
+/// Whether `account` satisfies at least one of `filter_sets` (an empty outer
+/// slice means "no restriction"), the local twin of the provider-side filter.
+fn matches_filters(account: &Account, filter_sets: &[Vec<AccountFilter>]) -> bool {
+    filter_sets.is_empty()
+        || filter_sets
+            .iter()
+            .any(|set| set.iter().all(|filter| filter.matches(account)))
+}
+
+/// Whether `account` belongs to any of the indexed program subscriptions.
+fn matches_any(account: &Account, subscriptions: &[ProgramSubscription]) -> bool {
+    subscriptions.iter().any(|subscription| {
+        account.owner == subscription.program && matches_filters(account, &subscription.filter_sets)
+    })
 }

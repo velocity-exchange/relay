@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["spec", "crank-turner"]
+members = ["spec", "chain-source", "crank-turner"]
 
 # The on-chain programs live in a SEPARATE workspace at `programs/` (anchor-v2
 # alpha + SBF toolchain, own lockfile + target dir) so its dependency tree

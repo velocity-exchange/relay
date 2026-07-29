@@ -22,36 +22,34 @@
 //! send. A stale local view therefore costs at most a wasted simulation or
 //! a landed-but-failed transaction fee — never a wrong crank.
 //!
-//! Chain access goes through [`source::ChainSource`], and the transports
-//! mirror what the velocity keeper stack uses:
+//! Chain access goes through [`ChainSource`] from `relay-chain-source`, and
+//! the transports mirror what the velocity keeper stack uses:
 //!
-//! - [`source::RpcSource`] — plain RPC polling (the floor, zero infra).
-//! - [`cached::CachedSource`] fed by [`ws::spawn_ws_feed`] —
+//! - [`RpcSource`] — plain RPC polling (the floor, zero infra).
+//! - [`CachedSource`] fed by [`spawn_ws_feed`] —
 //!   `programSubscribe`/`accountSubscribe`, the TS-keeper-bot path.
-//! - [`cached::CachedSource`] fed by [`grpc::spawn_grpc_feed`] —
-//!   Yellowstone/geyser gRPC, the keep-rs path.
+//! - [`CachedSource`] fed by [`spawn_grpc_feed`] — Yellowstone/geyser gRPC,
+//!   the keep-rs path.
 //!
 //! Subscriptions only replace *reads*; simulation and submission always go
 //! to RPC. Tests drive the full loop against litesvm.
 
-pub mod cached;
-pub mod feed;
 pub mod filter;
-pub mod grpc;
-pub mod local_sim;
 pub mod metrics;
-pub mod source;
 pub mod submit;
 pub mod turner;
-pub mod ws;
+pub mod watches;
 
-pub use cached::{CachedSource, CachedSourceConfig};
-pub use feed::{feed_channel, AccountUpdate, Coverage, FeedReceiver, FeedSender};
+// Chain access lives in `relay-chain-source`, which knows nothing about
+// relay: the watch-registry filters that make it relay-aware are built here
+// (see [`watches`]) and handed in as generic `AccountFilter`s.
 pub use filter::{RefreshSummary, RejectReason, WatchFilter};
-pub use grpc::{spawn_grpc_feed, GrpcFeedConfig};
-pub use local_sim::{LocalSimConfig, LocalSimSource};
-pub use source::{
-    BlockhashInfo, ChainSource, ClockSnapshot, RpcSource, SignatureOutcome, SimOutcome,
+pub use relay_chain_source::ws::derive_ws_url;
+pub use relay_chain_source::{
+    feed_channel, spawn_grpc_feed, spawn_ws_feed, AccountFilter, AccountUpdate, BlockhashInfo,
+    CachedSource, CachedSourceConfig, ChainSource, ClockSnapshot, Coverage, FeedReceiver,
+    FeedSender, GrpcFeedConfig, LocalSimConfig, LocalSimSource, ProgramSubscription, RpcSource,
+    SignatureOutcome, SimOutcome,
 };
 pub use submit::{
     spawn as spawn_submitter, LagSnapshot, PendingTx, ProfitSnapshot, SubmitterConfig,
@@ -61,4 +59,4 @@ pub use turner::{
     names_transaction_signer, CondKey, Outcome, SkipReason, Stage, Turner, TurnerConfig, Watch,
     RELAY_PROGRAM_ID,
 };
-pub use ws::{derive_ws_url, spawn_ws_feed};
+pub use watches::{watch_filter_sets, watch_subscription};

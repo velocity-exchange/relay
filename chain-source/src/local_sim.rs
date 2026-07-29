@@ -37,7 +37,9 @@ use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 use crate::metrics;
-use crate::source::{BlockhashInfo, ChainSource, ClockSnapshot, SignatureOutcome, SimOutcome};
+use crate::source::{
+    AccountFilter, BlockhashInfo, ChainSource, ClockSnapshot, SignatureOutcome, SimOutcome,
+};
 
 /// Loader whose program accounts hold the ELF directly.
 static BPF_LOADER: LazyLock<Pubkey> = LazyLock::new(|| {
@@ -301,14 +303,12 @@ impl<Inner: ChainSource> ChainSource for LocalSimSource<Inner> {
         self.inner.get_multiple_accounts(pubkeys).await
     }
 
-    async fn get_watch_accounts(
+    async fn get_program_accounts(
         &self,
         program: &Pubkey,
-        target_programs: &[Pubkey],
+        filter_sets: &[Vec<AccountFilter>],
     ) -> Result<Vec<(Pubkey, Account)>> {
-        self.inner
-            .get_watch_accounts(program, target_programs)
-            .await
+        self.inner.get_program_accounts(program, filter_sets).await
     }
 
     async fn clock(&self) -> Result<ClockSnapshot> {

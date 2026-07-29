@@ -1,6 +1,5 @@
-//! Websocket subscription backend: `programSubscribe` on the relay program
-//! (watch registry) + `accountSubscribe` per interested pubkey — the same
-//! paths velocity's TS keeper bots and velocity-rs's ws mode use.
+//! Websocket subscription backend: `programSubscribe` per
+//! [`ProgramSubscription`] + `accountSubscribe` per interested pubkey.
 //!
 //! Deliberately thin: translate notifications into
 //! [`crate::feed::AccountUpdate`]s and rebuild the world on interest change
@@ -13,40 +12,26 @@ use solana_account_decoder::UiAccountEncoding;
 use solana_commitment_config::CommitmentConfig;
 use solana_pubsub_client::nonblocking::pubsub_client::PubsubClient;
 use solana_rpc_client_api::config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
+use solana_rpc_client_api::filter::RpcFilterType;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::sysvar;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use crate::feed::{AccountUpdate, Coverage, FeedSender};
+use crate::grpc::ProgramSubscription;
+use crate::source::AccountFilter;
 
-/// `target_programs` narrows the watch-registry subscription to those
-/// programs (one subscription each); empty subscribes to every watch.
+/// Subscribe to each [`ProgramSubscription`] (filtered sets become one
+/// `programSubscribe` each, since a memcmp matches one value) plus the
+/// caller's interest set. An unfiltered subscription streams everything a
+/// program owns, which is what keeps local simulation off the network.
 pub fn spawn_ws_feed(
     ws_url: String,
-    relay_program: Pubkey,
-    target_programs: Vec<Pubkey>,
+    subscriptions: Vec<ProgramSubscription>,
     feed: FeedSender,
 ) -> JoinHandle<()> {
-    spawn_ws_feed_with_programs(ws_url, relay_program, target_programs, Vec::new(), feed)
-}
-
-/// `watch_programs` streams every account owned by those programs, which
-/// is what keeps local simulation off the network.
-pub fn spawn_ws_feed_with_programs(
-    ws_url: String,
-    relay_program: Pubkey,
-    target_programs: Vec<Pubkey>,
-    watch_programs: Vec<Pubkey>,
-    feed: FeedSender,
-) -> JoinHandle<()> {
-    tokio::spawn(run(
-        ws_url,
-        relay_program,
-        target_programs,
-        watch_programs,
-        feed,
-    ))
+    tokio::spawn(run(ws_url, subscriptions, feed))
 }
 
 /// Derive a websocket url from an RPC url the way the Solana CLI does.
@@ -57,26 +42,11 @@ pub fn derive_ws_url(rpc_url: &str) -> String {
     ws.replacen(":8899", ":8900", 1)
 }
 
-async fn run(
-    ws_url: String,
-    relay_program: Pubkey,
-    target_programs: Vec<Pubkey>,
-    watch_programs: Vec<Pubkey>,
-    feed: FeedSender,
-) {
+async fn run(ws_url: String, subscriptions: Vec<ProgramSubscription>, feed: FeedSender) {
     let mut backoff = Duration::from_secs(1);
     let mut interest = feed.interest.clone();
     loop {
-        match session(
-            &ws_url,
-            relay_program,
-            &target_programs,
-            &watch_programs,
-            &feed,
-            &mut interest,
-        )
-        .await
-        {
+        match session(&ws_url, &subscriptions, &feed, &mut interest).await {
             SessionEnd::InterestChanged => {
                 // Immediate rebuild with the new set.
                 backoff = Duration::from_secs(1);
@@ -121,9 +91,7 @@ impl SessionEnd {
 /// set changes or the connection dies.
 async fn session(
     ws_url: &str,
-    relay_program: Pubkey,
-    target_programs: &[Pubkey],
-    watch_programs: &[Pubkey],
+    subscriptions: &[ProgramSubscription],
     feed: &FeedSender,
     interest: &mut tokio::sync::watch::Receiver<std::collections::HashSet<Pubkey>>,
 ) -> SessionEnd {
@@ -138,21 +106,34 @@ async fn session(
         ..Default::default()
     };
 
-    // Watch registry: one program subscription per allowed target program
-    // (memcmp can only match one value), or a single unfiltered one.
-    let watch_queries: Vec<Option<Pubkey>> = if target_programs.is_empty() {
-        vec![None]
-    } else {
-        target_programs.iter().copied().map(Some).collect()
-    };
+    // One `programSubscribe` per (program, filter set); an unfiltered
+    // subscription is a single stream over everything the program owns.
+    let queries: Vec<(Pubkey, Option<Vec<RpcFilterType>>)> = subscriptions
+        .iter()
+        .flat_map(|subscription| {
+            if subscription.filter_sets.is_empty() {
+                return vec![(subscription.program, None)];
+            }
+            subscription
+                .filter_sets
+                .iter()
+                .map(|set| {
+                    (
+                        subscription.program,
+                        Some(set.iter().map(AccountFilter::to_rpc).collect()),
+                    )
+                })
+                .collect()
+        })
+        .collect();
     let mut program_streams = Vec::new();
     let mut program_unsubs = Vec::new();
-    for target_program in &watch_queries {
+    for (program, filters) in &queries {
         match client
             .program_subscribe(
-                &relay_program,
+                program,
                 Some(RpcProgramAccountsConfig {
-                    filters: Some(crate::source::watch_filters(target_program.as_ref())),
+                    filters: filters.clone(),
                     account_config: account_config.clone(),
                     ..Default::default()
                 }),
@@ -163,7 +144,7 @@ async fn session(
                 program_streams.push(stream);
                 program_unsubs.push(unsub);
             }
-            Err(err) => return SessionEnd::failed(format!("program_subscribe: {err}")),
+            Err(err) => return SessionEnd::failed(format!("program_subscribe {program}: {err}")),
         }
     }
 
@@ -209,43 +190,17 @@ async fn session(
             })
             .boxed()
     }));
-    // Whole-program subscriptions: everything these programs own, so a
-    // local simulation finds its accounts already cached.
-    for program in watch_programs {
-        match client
-            .program_subscribe(
-                program,
-                Some(RpcProgramAccountsConfig {
-                    account_config: account_config.clone(),
-                    ..Default::default()
-                }),
-            )
-            .await
-        {
-            Ok((stream, unsub)) => {
-                streams.push(
-                    stream
-                        .map(|response| AccountUpdate {
-                            pubkey: response
-                                .value
-                                .pubkey
-                                .parse()
-                                .unwrap_or_else(|_| Pubkey::default()),
-                            account: response.value.account.decode(),
-                            slot: response.context.slot,
-                        })
-                        .boxed(),
-                );
-                unsubs.push(unsub);
-            }
-            Err(err) => return SessionEnd::failed(format!("program_subscribe {program}: {err}")),
-        }
-    }
     // Everything above is subscribed, so silence about these accounts now
     // means "unchanged" rather than "nobody listening".
     feed.set_coverage(Coverage {
         accounts: wanted.iter().copied().collect(),
-        programs: watch_programs.iter().copied().collect(),
+        // Only an unfiltered subscription covers every account a program
+        // owns; a filtered one says nothing about the accounts it excludes.
+        programs: subscriptions
+            .iter()
+            .filter(|subscription| subscription.filter_sets.is_empty())
+            .map(|subscription| subscription.program)
+            .collect(),
     });
     debug!(subscriptions = streams.len(), "ws session subscribed");
 
