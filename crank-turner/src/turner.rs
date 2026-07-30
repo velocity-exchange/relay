@@ -310,6 +310,124 @@ impl<S: ChainSource> Turner<S> {
         self
     }
 
+    /// The registry as this turner sees it, after filtering.
+    pub fn watches(&self) -> &[Watch] {
+        &self.watches
+    }
+
+    /// Everything the turner concludes about one condition, and why.
+    ///
+    /// The verdict comes from the same `decide` and crank path the daemon
+    /// runs — not a reimplementation — so a debugging tool built on this
+    /// cannot disagree with production about whether a condition is due.
+    /// The crank path stops at a prepared transaction, which is why this is
+    /// a read-only operation: submission lives in `submit_packs`, not here.
+    ///
+    /// Two limits are inherent rather than incidental, and callers should
+    /// surface them. A turner with no tick history has no `last_seen` to
+    /// compare a change-wake against, so those always read as due; and
+    /// `Backoff` and `ContentionDelay` are per-process state, so a fresh
+    /// process never reports them however backed-off the daemon is.
+    pub async fn explain(&self, key: CondKey) -> Result<Explanation> {
+        let (target, offset, index) = key;
+        let watch = *self
+            .watches
+            .iter()
+            .find(|w| w.target == target && w.offset == offset)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no watch registered for {target} at offset {offset}                      (or it was filtered out by this turner's config)"
+                )
+            })?;
+        let clock = self.source.clock().await?;
+        let account = self
+            .load_map(&[target])
+            .await?
+            .remove(&target)
+            .ok_or_else(|| anyhow::anyhow!("target account {target} does not exist"))?;
+        let conditions =
+            spec::read_conditions_unaligned(&account.data, offset as usize).map_err(|err| {
+                anyhow::anyhow!("condition block at offset {offset} is unreadable: {err:?}")
+            })?;
+        let condition = *conditions.get(index as usize).ok_or_else(|| {
+            anyhow::anyhow!(
+                "condition {index} is past the end of the block ({} present)",
+                conditions.len()
+            )
+        })?;
+
+        // The change-wake's watched bytes may live on another account.
+        let watched_now = match condition.wake() {
+            Ok(spec::WakeView::OnAccountChange {
+                address,
+                offset,
+                len,
+            }) => {
+                let watched = Pubkey::from(address);
+                let data = if watched == target {
+                    Some(account.data.clone())
+                } else {
+                    self.load_map(&[watched])
+                        .await?
+                        .remove(&watched)
+                        .map(|acc| acc.data)
+                };
+                Some(data.map_or_else(Vec::new, |data| slice_or_empty(&data, offset, len)))
+            }
+            _ => None,
+        };
+
+        let verdict = match self.decide(key, &watch, &condition, &clock, watched_now.clone()) {
+            Err(Outcome::Skipped(_, reason)) => Verdict::Skipped(reason),
+            Err(other) => Verdict::Failed {
+                stage: Stage::ResolveSim,
+                error: format!("unexpected decide outcome: {other:?}"),
+            },
+            Ok(due) => match self.try_crank(&due, &clock).await {
+                Ok(CrankResult::Ready(prepared)) => Verdict::WouldSend {
+                    min_payment: prepared.min_payment,
+                    units: prepared.units,
+                    instructions: prepared.ixs,
+                },
+                Ok(CrankResult::Done(Outcome::NoWork(_), _)) => Verdict::NoWork,
+                Ok(CrankResult::Done(Outcome::Failed { stage, error, .. }, _)) => {
+                    Verdict::Failed { stage, error }
+                }
+                Ok(CrankResult::Done(Outcome::Skipped(_, reason), _)) => Verdict::Skipped(reason),
+                Ok(CrankResult::Done(outcome, _)) => Verdict::Failed {
+                    stage: Stage::Send,
+                    error: format!("unexpected crank outcome: {outcome:?}"),
+                },
+                Err(err) => Verdict::Failed {
+                    stage: Stage::ResolveSim,
+                    error: format!("{err:#}"),
+                },
+            },
+        };
+
+        Ok(Explanation {
+            key,
+            program: watch.target_program,
+            registrar: watch.registrar,
+            condition,
+            clock,
+            watched_now,
+            stateless: self.state.is_empty(),
+            verdict,
+        })
+    }
+
+    /// Submit a prepared crank. Split out from [`Self::explain`] so a
+    /// debugging tool can show what would be sent and then send exactly
+    /// that, rather than re-deriving it.
+    pub async fn send_explained(&self, explanation: &Explanation) -> Result<Signature> {
+        let Verdict::WouldSend { instructions, .. } = &explanation.verdict else {
+            anyhow::bail!("nothing to send: {:?}", explanation.verdict);
+        };
+        let (tx, _units) = self.sign_for_submission(instructions).await?;
+        self.source.send_transaction(&tx).await
+    }
+
     pub fn keeper_pubkey(&self) -> Pubkey {
         self.keeper.pubkey()
     }
@@ -1335,6 +1453,40 @@ enum CrankResult {
     Ready(Box<Prepared>),
     /// Finished without submitting (no work, or a failure).
     Done(Outcome, StateUpdate),
+}
+
+/// A step-by-step account of what the turner decided about one condition.
+#[derive(Debug, Clone)]
+pub struct Explanation {
+    pub key: CondKey,
+    pub program: Pubkey,
+    pub registrar: Pubkey,
+    pub condition: spec::ConditionV0,
+    pub clock: ClockSnapshot,
+    /// The change-wake's watched bytes as they read now. `None` for wakes
+    /// that are not change-based.
+    pub watched_now: Option<Vec<u8>>,
+    /// This turner has no tick history, so change-wakes read as due and
+    /// per-process suppression cannot be reported.
+    pub stateless: bool,
+    pub verdict: Verdict,
+}
+
+/// Where a condition got to.
+#[derive(Debug, Clone)]
+pub enum Verdict {
+    /// Never attempted, and why.
+    Skipped(SkipReason),
+    /// Attempted; the resolver reported nothing to do.
+    NoWork,
+    /// Attempted; simulated clean and would be submitted.
+    WouldSend {
+        min_payment: u64,
+        units: u64,
+        instructions: Vec<Instruction>,
+    },
+    /// Attempted and failed.
+    Failed { stage: Stage, error: String },
 }
 
 /// A condition whose wake came due, carried into the concurrent phase.

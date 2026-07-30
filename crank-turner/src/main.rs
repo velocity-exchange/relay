@@ -321,6 +321,7 @@ fn with_local_sim<S: ChainSource + 'static>(
             source,
             LocalSimConfig {
                 pool_size: args.concurrency.max(1),
+                ..LocalSimConfig::default()
             },
         ))
     }

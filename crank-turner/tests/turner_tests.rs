@@ -18,7 +18,7 @@ use relay_crank_turner::{
     feed_channel, watch_filter_sets, watch_subscription, AccountFilter, AccountUpdate,
     BlockhashInfo, CachedSource, CachedSourceConfig, ChainSource, ClockSnapshot, LagSnapshot,
     Outcome, ProfitSnapshot, RejectReason, SignatureOutcome, SimOutcome, SkipReason, Stage,
-    SubmitterHandle, Turner, TurnerConfig, WatchFilter,
+    SubmitterHandle, Turner, TurnerConfig, Verdict, WatchFilter,
 };
 use relay_spec as spec;
 use sha2::{Digest, Sha256};
@@ -44,6 +44,8 @@ const DEMO_SO: &str = concat!(
 // Mirrors of demo-book layout constants, hand-pinned (see module docs).
 const BOOK_ACCOUNT_LEN: usize = 2792;
 const CONDITIONS_OFFSET: u32 = 912;
+/// demo-book's sweep condition — the timestamp-waked one.
+const SWEEP: u8 = 0;
 const ENTRY_COUNT_OFFSET: usize = 72;
 const NEXT_EXPIRY_OFFSET: usize = 64;
 const STAGING_OFFSET: usize = 1768;
@@ -1473,7 +1475,10 @@ async fn all_simulation_happens_locally() {
     };
     let local = relay_crank_turner::LocalSimSource::new(
         guarded,
-        relay_crank_turner::LocalSimConfig { pool_size: 2 },
+        relay_crank_turner::LocalSimConfig {
+            pool_size: 2,
+            ..Default::default()
+        },
     );
     let mut turner = Turner::new(local, Keypair::new(), trusting(TurnerConfig::default()));
     {
@@ -2416,5 +2421,259 @@ async fn clearing_the_delay_releases_held_work() {
         sent(&outcomes).len(),
         1,
         "work stayed held after the delay cleared: {outcomes:?}"
+    );
+}
+
+// --- explain: the API the debugging CLI is built on ---
+
+/// `explain` must reach the same verdict the daemon reaches, because that is
+/// the entire value of the CLI: if an operator is told a condition is ready
+/// and the daemon disagrees, the tool has made the problem worse. So these
+/// assert the pair together — `tick` and `explain` on the same state.
+#[tokio::test]
+async fn explain_agrees_with_tick_on_a_ready_condition() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    h.refresh().await;
+    let t0 = h.t0;
+    h.add_entry(t0 + 100);
+    h.warp(t0 + 200, 2);
+
+    let key = (h.book, CONDITIONS_OFFSET, SWEEP);
+    let explanation = h.turner.explain(key).await.unwrap();
+    assert!(
+        matches!(explanation.verdict, Verdict::WouldSend { .. }),
+        "{:?}",
+        explanation.verdict
+    );
+    // Explaining must not have consumed the work.
+    assert_eq!(h.entry_count(), 1, "explain sent something");
+
+    // And the daemon does what the explanation promised.
+    assert_eq!(sent(&h.tick().await).len(), 1);
+    assert_eq!(h.entry_count(), 0);
+}
+
+/// The most common real question — "why isn't this firing?" — where the
+/// answer is that the wake simply is not due yet.
+#[tokio::test]
+async fn explain_reports_a_wake_that_is_not_due() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    h.refresh().await;
+    let t0 = h.t0;
+    h.add_entry(t0 + 10_000);
+    h.warp(t0 + 100, 2);
+
+    let explanation = h
+        .turner
+        .explain((h.book, CONDITIONS_OFFSET, SWEEP))
+        .await
+        .unwrap();
+    assert!(matches!(
+        explanation.verdict,
+        Verdict::Skipped(SkipReason::NotDue)
+    ));
+    // The two numbers an operator needs are both on the explanation: what
+    // the wake wants, and what the chain reads.
+    let spec::WakeView::AtTimestamp { unix_ts } = explanation.condition.wake().unwrap() else {
+        panic!("sweep should be a timestamp wake");
+    };
+    assert!(
+        unix_ts > explanation.clock.unix_timestamp,
+        "{unix_ts} vs {}",
+        explanation.clock.unix_timestamp
+    );
+}
+
+/// A condition the target program switched off.
+#[tokio::test]
+async fn explain_reports_an_inactive_condition() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    h.refresh().await;
+    let t0 = h.t0;
+    h.add_entry(t0 + 100);
+    h.warp(t0 + 200, 2);
+
+    let mut conditions = h.conditions();
+    conditions[SWEEP as usize].active = 0;
+    h.write_conditions(&conditions);
+
+    let explanation = h
+        .turner
+        .explain((h.book, CONDITIONS_OFFSET, SWEEP))
+        .await
+        .unwrap();
+    assert!(matches!(
+        explanation.verdict,
+        Verdict::Skipped(SkipReason::Inactive)
+    ));
+    assert!(!explanation.condition.is_active());
+}
+
+/// A condition priced below what this turner will work for.
+///
+/// Reaching this verdict at all takes some care, and the reason is worth
+/// knowing: the registry filter drops a watch whose *every* condition is
+/// under the bar, so raising `--min-crank-payment` past the whole block
+/// makes `explain` report "not registered" rather than "below min payment".
+/// The skip is only reachable when a sibling condition still clears the bar
+/// — here, a program that cut this one's price after registering.
+#[tokio::test]
+async fn explain_reports_work_priced_below_the_minimum() {
+    let mut h = setup(
+        PAYMENT,
+        100,
+        TurnerConfig {
+            min_crank_payment: PAYMENT,
+            ..TurnerConfig::default()
+        },
+    );
+    h.refresh().await;
+    let t0 = h.t0;
+    h.add_entry(t0 + 100);
+    h.warp(t0 + 200, 2);
+
+    let mut conditions = h.conditions();
+    conditions[SWEEP as usize].min_payment = PAYMENT - 1;
+    h.write_conditions(&conditions);
+
+    let explanation = h
+        .turner
+        .explain((h.book, CONDITIONS_OFFSET, SWEEP))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            explanation.verdict,
+            Verdict::Skipped(SkipReason::BelowMinPayment)
+        ),
+        "{:?}",
+        explanation.verdict
+    );
+}
+
+/// Raising the bar past every condition in a block removes the watch
+/// altogether, which is a different diagnosis and has to read as one: the
+/// target stops being fetched and subscribed at all.
+#[tokio::test]
+async fn explain_reports_a_watch_filtered_out_entirely() {
+    let mut h = setup(
+        PAYMENT,
+        100,
+        TurnerConfig {
+            min_crank_payment: PAYMENT + 1,
+            ..TurnerConfig::default()
+        },
+    );
+    assert_eq!(h.refresh().await, 0, "the watch should have been dropped");
+
+    let err = h
+        .turner
+        .explain((h.book, CONDITIONS_OFFSET, SWEEP))
+        .await
+        .expect_err("a filtered-out watch cannot be explained");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("filtered out"),
+        "the error must point at configuration: {message}"
+    );
+}
+
+/// A wake that fired with nothing behind it. This is the designed cheap
+/// path, and the CLI has to name it clearly, because it is the case where
+/// the bug is in the target program's resolver rather than in relay.
+#[tokio::test]
+async fn explain_reports_a_wake_with_no_work_behind_it() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    h.refresh().await;
+    let t0 = h.t0;
+    // Sweep's wake is due, but no entry has expired.
+    h.add_entry(t0 + 10_000);
+    let mut conditions = h.conditions();
+    conditions[SWEEP as usize].wake_ts = t0;
+    h.write_conditions(&conditions);
+    h.warp(t0 + 200, 2);
+
+    let explanation = h
+        .turner
+        .explain((h.book, CONDITIONS_OFFSET, SWEEP))
+        .await
+        .unwrap();
+    assert!(
+        matches!(explanation.verdict, Verdict::NoWork),
+        "{:?}",
+        explanation.verdict
+    );
+}
+
+/// Asking about something that was never registered is itself a diagnosis,
+/// and the error has to say so rather than looking like a transport failure.
+#[tokio::test]
+async fn explain_rejects_an_unregistered_target() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    h.refresh().await;
+    let stranger = Pubkey::new_unique();
+
+    let err = h
+        .turner
+        .explain((stranger, CONDITIONS_OFFSET, 0))
+        .await
+        .expect_err("an unregistered target must not explain");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("no watch registered"),
+        "unhelpful error: {message}"
+    );
+}
+
+/// An index past the end of the block is how the CLI discovers how many
+/// conditions a target has, so the error must be reliable rather than a
+/// panic or a bogus verdict.
+#[tokio::test]
+async fn explain_rejects_an_index_past_the_end_of_the_block() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    h.refresh().await;
+
+    let err = h
+        .turner
+        .explain((h.book, CONDITIONS_OFFSET, 200))
+        .await
+        .expect_err("index 200 does not exist");
+    assert!(format!("{err:#}").contains("past the end"), "{err:#}");
+}
+
+/// The security gate, reachable through `explain` so an operator can see it
+/// without waiting for the daemon to log it.
+#[tokio::test]
+async fn explain_reports_a_missing_safe_payout() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    let t0 = h.t0;
+    h.add_entry(t0 + 100);
+
+    // Untrusted (the harness default trusts demo-book; this one does not)
+    // and no payout configured.
+    let mut turner = Turner::new(
+        LiteSvmSource::new(&h.svm, &h.watch_keys),
+        Keypair::new(),
+        TurnerConfig::default(),
+    );
+    h.svm
+        .lock()
+        .unwrap()
+        .airdrop(&turner.keeper_pubkey(), 1_000_000_000)
+        .unwrap();
+    turner.refresh_watches().await.unwrap();
+    h.warp(t0 + 200, 2);
+
+    let explanation = turner
+        .explain((h.book, CONDITIONS_OFFSET, SWEEP))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            explanation.verdict,
+            Verdict::Skipped(SkipReason::NoSafePayout)
+        ),
+        "{:?}",
+        explanation.verdict
     );
 }

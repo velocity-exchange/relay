@@ -56,7 +56,7 @@ pub use submit::{
     SubmitterHandle, TxResult,
 };
 pub use turner::{
-    names_transaction_signer, CondKey, Outcome, SkipReason, Stage, Turner, TurnerConfig, Watch,
-    RELAY_PROGRAM_ID,
+    names_transaction_signer, CondKey, Explanation, Outcome, SkipReason, Stage, Turner,
+    TurnerConfig, Verdict, Watch, RELAY_PROGRAM_ID,
 };
 pub use watches::{watch_filter_sets, watch_subscription};

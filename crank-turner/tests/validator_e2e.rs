@@ -395,7 +395,10 @@ impl Client {
 fn build_turner(url: String, keeper: Keypair) -> Turner<Arc<dyn ChainSource>> {
     let source: Arc<dyn ChainSource> = Arc::new(LocalSimSource::new(
         RpcSource::new(url),
-        LocalSimConfig { pool_size: 4 },
+        LocalSimConfig {
+            pool_size: 4,
+            ..LocalSimConfig::default()
+        },
     ));
     Turner::new(
         source,
@@ -597,7 +600,10 @@ async fn wrapped_sol_payout_is_paid_and_synced() {
 
     let source: Arc<dyn ChainSource> = Arc::new(LocalSimSource::new(
         RpcSource::new(validator.url()),
-        LocalSimConfig { pool_size: 4 },
+        LocalSimConfig {
+            pool_size: 4,
+            ..LocalSimConfig::default()
+        },
     ));
     let mut turner = Turner::new(
         source,
@@ -1761,4 +1767,165 @@ async fn a_losing_turner_delays_itself_and_recovers_when_the_rival_dies() {
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+/// The `relay` CLI against a live book: list, explain, and actually crank.
+///
+/// This lives here rather than in the CLI's own suite because it needs a real
+/// target program with real conditions, and demo-book plus its layout mirrors
+/// already live in this file. What it proves is the part string assertions on
+/// a synthetic registry cannot: that `explain` reaches READY on a genuinely
+/// due condition, and that `run --send` does the work — the CLI is not just a
+/// viewer.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs solana-test-validator; run scripts/e2e.sh"]
+async fn the_cli_explains_and_cranks_a_real_condition() {
+    let validator = Validator::start().await;
+    let client = Client::new(validator.url()).await;
+    let keeper = Keypair::new();
+    client.fund(&keeper.pubkey(), 10_000_000_000).await;
+    let dir = std::env::temp_dir().join(format!("relay-cli-live-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let keypair_path = dir.join("keeper.json").to_string_lossy().into_owned();
+    keeper.write_to_file(&keypair_path).expect("write keypair");
+
+    let book = client.create_book(100).await;
+    let now = client.unix_timestamp().await;
+    client.post_quote(&book, now - 1, 100, SIDE_BID).await; // already expired
+    assert_eq!(client.entry_count(&book).await, 1);
+
+    let url = validator.url();
+    let target = book.to_string();
+    let demo = demo_id().to_string();
+
+    // Listed, with the sweep condition showing as ready to crank.
+    let (stdout, stderr, ok) = cli(&[
+        "--rpc-url",
+        &url,
+        "--trusted-program",
+        &demo,
+        "condition",
+        "list",
+    ]);
+    assert!(ok, "condition list failed: {stderr}{stdout}");
+    assert!(stdout.contains("at-timestamp"), "{stdout}");
+    assert!(
+        stdout.contains("READY"),
+        "an expired quote should leave the sweep ready:\n{stdout}"
+    );
+
+    // Explained: the gates, then the verdict, then the transaction.
+    let (stdout, stderr, ok) = cli(&[
+        "--rpc-url",
+        &url,
+        "--trusted-program",
+        &demo,
+        "condition",
+        "explain",
+        &target,
+    ]);
+    assert!(ok, "explain failed: {stderr}{stdout}");
+    ["gates", "wake due", "VERDICT", "ready to crank"]
+        .iter()
+        .for_each(|needle| {
+            assert!(stdout.contains(needle), "explain omits {needle}:\n{stdout}");
+        });
+    // Explaining must never do the work.
+    assert_eq!(
+        client.entry_count(&book).await,
+        1,
+        "explain cranked something"
+    );
+
+    // Dry run is the default, and says so.
+    let (stdout, _, ok) = cli(&[
+        "--rpc-url",
+        &url,
+        "--trusted-program",
+        &demo,
+        "condition",
+        "run",
+        &target,
+    ]);
+    assert!(ok, "{stdout}");
+    assert!(stdout.contains("dry run"), "{stdout}");
+    assert_eq!(client.entry_count(&book).await, 1, "dry run sent");
+
+    // And --send actually cranks it.
+    let (stdout, stderr, ok) = cli(&[
+        "--rpc-url",
+        &url,
+        "--keypair",
+        &keypair_path,
+        "--trusted-program",
+        &demo,
+        "condition",
+        "run",
+        &target,
+        "--send",
+    ]);
+    assert!(ok, "run --send failed: {stderr}{stdout}");
+    assert!(stdout.contains("sent "), "{stdout}");
+    assert!(
+        wait_for(Duration::from_secs(30), || async {
+            client.entry_count(&book).await == 0
+        })
+        .await,
+        "the CLI's crank never landed:\n{stdout}"
+    );
+
+    // With the work gone the same condition reads as not due, because
+    // demo-book pushes its wake out to i64::MAX once no entry is live. That
+    // is the shape of a healthy idle condition, and worth pinning: an
+    // operator looking at a quiet system needs "nothing to do yet" to be
+    // distinguishable from "stuck".
+    let (stdout, _, ok) = cli(&[
+        "--rpc-url",
+        &url,
+        "--trusted-program",
+        &demo,
+        "condition",
+        "explain",
+        &target,
+    ]);
+    assert!(ok, "{stdout}");
+    assert!(
+        stdout.contains("not due"),
+        "expected an idle verdict after sweeping:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("ready to crank"),
+        "the swept condition should not still read as ready:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("9223372036854775807"),
+        "the wake should have been pushed out to i64::MAX:\n{stdout}"
+    );
+}
+
+/// Run the `relay` binary from the shared workspace target directory.
+///
+/// `CARGO_BIN_EXE_` only covers the current package, so this resolves the
+/// sibling crate's binary by path and fails loudly if it is missing rather
+/// than skipping — a test that quietly does nothing is worse than none.
+fn cli(args: &[&str]) -> (String, String, bool) {
+    let path = format!("{}/../target/debug/relay", env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        std::path::Path::new(&path).exists(),
+        "{path} is missing — build it first (`cargo build -p relay-cli`); \
+         scripts/e2e.sh does this for you"
+    );
+    let output = Command::new(&path)
+        .args(args)
+        .env_remove("RELAY_RPC_URL")
+        .env_remove("RELAY_PROGRAM_ID")
+        .env_remove("RELAY_KEEPER_KEYPAIR")
+        .env_remove("RELAY_METRICS_URL")
+        .output()
+        .expect("run relay cli");
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+        output.status.success(),
+    )
 }

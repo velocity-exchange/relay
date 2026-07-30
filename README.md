@@ -68,4 +68,25 @@ Safety flags: `--payout-address <PUBKEY>` is where executors pay, and **must not
 
 Operational flags: `--concurrency` (cranks in flight per tick), `--min-program-profit` (skip programs whose recent cranks lost money), `--contention-step-slots` / `--max-contention-slots` (hold a program's cranks back when its transactions keep reverting, so races lost to a faster turner cost nothing instead of a fee each; decays back to zero as cranks land again — `0` disables), `--metrics-port` (Prometheus `/metrics` + `/health`, default 9899), `--max-cranks-per-tx` (pack cranks into shared transactions, default 3), `--max-priority-fee`.
 
+## Debugging (`relay` CLI)
+
+`cli/` ships a second binary, `relay`, for when a condition is not being cranked and you think it should be. Every verdict it prints comes from `Turner::explain`, which runs the daemon's own `decide` and crank path rather than a reimplementation — so the CLI cannot disagree with production about whether a condition is due.
+
+```
+relay watch list [--rejected]        # what is registered, and what this config threw away
+relay watch get <TARGET>             # one watch, conditions decoded
+relay condition list [--due]         # every condition, with what the turner would do
+relay condition explain <TARGET>     # walk every gate: why is this cranking, or not
+relay condition run <TARGET> [--send]  # resolve + simulate; --send actually cranks
+relay guard <PAYOUT>                 # guard state
+relay clock                          # what timestamp and slot wakes compare against
+relay doctor                         # one-shot sweep: registry, conditions, rejects
+```
+
+`explain` is the one to reach for. It prints the gates in the order the daemon applies them, the two numbers whose comparison decides a wake (`waiting for unix_ts 1785374956, chain reads clock 1785374955`), the verdict, and what to do about it. `--json` on any command for a runbook.
+
+Two classes of reason need different tools, and the CLI is explicit about which is which. **On chain** — inactive, below min payment, wake not due, filtered out of the registry, resolver reports no work, simulation fails, executor asks for a signature — is all visible directly. **Per-process** — failure backoff, post-send suppression, adaptive contention delay, the rolling profitability window — lives in the running daemon, so pass `--metrics-url http://host:9899/metrics` and `explain` reports those too instead of pretending they do not exist.
+
+Mirror the daemon's config flags (`--min-crank-payment`, `--target-program`, `--trusted-program`, `--payout-address`, `--no-guard`) when you run it, or you are debugging a different turner than the one deployed. The most common trap is a watch rejected at refresh — an unreadable condition block, owner drift, a program not on the allowlist — which makes it invisible to every other view while being plainly present on chain. `relay watch list --rejected` and `relay doctor` name those with the reason and the fix; asking about one directly reports "IS registered … but this turner rejected it" rather than "not found".
+
 Every flag also reads from env (`RELAY_RPC_URL`, `RELAY_KEEPER_KEYPAIR`, `RELAY_TRANSPORT`, `RELAY_GRPC_ENDPOINT`, `RELAY_MIN_CRANK_PAYMENT`, `RELAY_TICK_MS`, ...). Subscriptions only replace account reads; simulation and submission always go over RPC.

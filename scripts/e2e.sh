@@ -13,6 +13,9 @@ if ! command -v solana-test-validator >/dev/null; then
 fi
 
 ./scripts/build-programs.sh >/dev/null
+# The CLI is exercised by one scenario here, by path from the shared target
+# directory, so it has to exist before the tests run.
+cargo build -p relay-cli >/dev/null
 
 # --nocapture so the validator's startup wait and turner progress are
 # visible; the test owns the validator's lifetime and kills it on drop.

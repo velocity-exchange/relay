@@ -3541,6 +3541,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "relay-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "relay-chain-source",
+ "relay-crank-turner",
+ "relay-spec",
+ "serde_json",
+ "sha2 0.10.9",
+ "solana-client",
+ "solana-commitment-config",
+ "solana-sdk",
+ "solana-system-interface 3.3.0",
+ "tokio",
+]
+
+[[package]]
 name = "relay-crank-turner"
 version = "0.1.0"
 dependencies = [

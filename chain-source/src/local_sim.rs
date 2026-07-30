@@ -67,11 +67,23 @@ pub struct LocalSimConfig {
     /// program cache, so reusing them avoids re-verifying ELFs (the
     /// expensive part — velocity's is megabytes).
     pub pool_size: usize,
+    /// Credit the fee payer this many lamports **inside the simulation
+    /// bank** when it has no account on chain.
+    ///
+    /// Off by default, and it must stay off for a turner: a keeper that has
+    /// run out of SOL should fail loudly rather than simulate as though it
+    /// had not. It exists for read-only inspection, where the caller holds
+    /// no key at all and a synthetic payer is the only way to reach the
+    /// interesting part of the simulation.
+    pub synthetic_fee_payer_lamports: Option<u64>,
 }
 
 impl Default for LocalSimConfig {
     fn default() -> Self {
-        Self { pool_size: 8 }
+        Self {
+            pool_size: 8,
+            synthetic_fee_payer_lamports: None,
+        }
     }
 }
 
@@ -160,6 +172,21 @@ impl<Inner: ChainSource> LocalSimSource<Inner> {
             unix_timestamp: clock.unix_timestamp,
             ..Default::default()
         });
+
+        // A fee payer with no account cannot pay, and litesvm rejects the
+        // transaction before any instruction runs.
+        if let Some(lamports) = self.config.synthetic_fee_payer_lamports {
+            let payer_missing = accounts.first().is_none_or(Option::is_none);
+            if let (true, Some(payer)) = (payer_missing, keys.first()) {
+                let synthetic = Account {
+                    lamports,
+                    ..Default::default()
+                };
+                if let Err(err) = instance.svm.set_account(*payer, synthetic) {
+                    warn!(account = %payer, error = ?err, "could not seed a synthetic fee payer");
+                }
+            }
+        }
 
         for (key, account) in keys.iter().zip(accounts) {
             let Some(account) = account else { continue };

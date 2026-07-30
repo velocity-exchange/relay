@@ -1,0 +1,27 @@
+[package]
+name = "relay-cli"
+description = "Debugging CLI for relay: inspect the watch registry, explain why a condition is or is not cranking, and run one by hand"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "relay"
+path = "src/main.rs"
+
+[dependencies]
+relay-spec = { path = "../spec" }
+relay-chain-source = { path = "../chain-source" }
+relay-crank-turner = { path = "../crank-turner" }
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+serde_json = "1"
+solana-sdk = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
+
+[dev-dependencies]
+sha2 = "0.10"
+solana-client = "3"
+solana-commitment-config = "3"
+solana-system-interface = { version = "3", features = ["bincode"] }

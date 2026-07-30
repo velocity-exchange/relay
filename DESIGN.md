@@ -134,6 +134,12 @@ wake hint due? → sim resolver → work? → read staged payload from post-sim 
 
 Failure modes accepted by design: stale local view ⇒ tx lands-and-fails (tx fee, same exposure as any keeper — and the adaptive delay above is what stops it repeating indefinitely), hint fires early ⇒ wasted sim (cheap). Hints firing late is the only design bug; conditions should include an `EverySlots` fallback when in doubt.
 
+## Debugging surface
+
+`Turner::explain` is the whole of it: it runs `decide` and the crank path for one condition and reports where it got to, stopping at a prepared transaction so it never sends. Everything the `relay` CLI prints is a rendering of that, which is deliberate — a debugging tool that reimplements the predicate it is debugging will eventually disagree with production, and the disagreement will land exactly when someone is relying on it. Two limits are inherent and are surfaced rather than hidden: a fresh process has no `last_seen`, so change-wakes read as due, and per-process suppression (backoff, contention delay, profitability) is invisible to it, so the CLI scrapes the daemon's metrics endpoint for those.
+
+The failure mode worth designing for is a watch rejected at refresh. It never enters the tracked set — not fetched, not subscribed, not cranked — so it is absent from every view while being plainly registered on chain, which is the one situation where an operator is right and the tool looks wrong. `RefreshSummary` carries `(Watch, RejectReason)` for exactly this, and every command that answers "why isn't this cranking" checks it before concluding anything.
+
 ## What stays out
 
 Discovery over unbounded account sets (finding liquidatable users) is not expressible as a resolver — resolvers enumerate from watched accounts; searching stays in bespoke bots. That boundary is intentional.
