@@ -156,6 +156,8 @@ impl SubmitterHandle {
 struct Tracked {
     pending: PendingTx,
     resends: u32,
+    /// When it was handed to the cluster, for confirmation latency.
+    submitted: std::time::Instant,
 }
 
 /// Spawn the submitter: a blockhash refresher, and a send/confirm loop.
@@ -248,7 +250,14 @@ async fn run<S: ChainSource + ?Sized>(
                         warn!(signature = %pending.signature, error = %format!("{err:#}"), "send failed");
                     }
                     metrics::IN_FLIGHT.with_label_values(&["transactions"]).inc();
-                    tracked.insert(pending.signature, Tracked { pending, resends: 0 });
+                    tracked.insert(
+                        pending.signature,
+                        Tracked {
+                            pending,
+                            resends: 0,
+                            submitted: std::time::Instant::now(),
+                        },
+                    );
                 }
                 None => {
                     debug!("submitter outbox closed");
@@ -297,6 +306,9 @@ async fn sweep<S: ChainSource + ?Sized>(
 
     settled.iter().for_each(|(signature, result)| {
         if let Some(entry) = tracked.remove(signature) {
+            metrics::CONFIRM_SECONDS
+                .with_label_values(&[result_label(result)])
+                .observe(entry.submitted.elapsed().as_secs_f64());
             record(&entry.pending, result, history, profit, lag, config);
         }
     });
@@ -316,6 +328,9 @@ async fn sweep<S: ChainSource + ?Sized>(
         entry.resends += 1;
         if entry.resends > config.max_resends {
             let entry = tracked.remove(&signature).expect("just looked up");
+            metrics::CONFIRM_SECONDS
+                .with_label_values(&["expired"])
+                .observe(entry.submitted.elapsed().as_secs_f64());
             record(
                 &entry.pending,
                 &TxResult::Expired,
@@ -327,6 +342,14 @@ async fn sweep<S: ChainSource + ?Sized>(
         } else if let Err(err) = source.send_transaction(&entry.pending.transaction).await {
             warn!(%signature, error = %format!("{err:#}"), "resend failed");
         }
+    }
+}
+
+fn result_label(result: &TxResult) -> &'static str {
+    match result {
+        TxResult::Landed => "landed",
+        TxResult::Failed(_) => "failed",
+        TxResult::Expired => "expired",
     }
 }
 
@@ -367,12 +390,9 @@ fn record(
         .with_label_values(&["transactions"])
         .dec();
     let program = metrics::program_label(&pending.program);
-    let label = match result {
-        TxResult::Landed => "landed",
-        TxResult::Failed(_) => "failed",
-        TxResult::Expired => "expired",
-    };
-    metrics::TRANSACTIONS.with_label_values(&[label]).inc();
+    metrics::TRANSACTIONS
+        .with_label_values(&[result_label(result)])
+        .inc();
     if let TxResult::Failed(err) = result {
         info!(signature = %pending.signature, error = %err, "transaction failed on chain");
     }

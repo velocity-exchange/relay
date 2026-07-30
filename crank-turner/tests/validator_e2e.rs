@@ -841,6 +841,47 @@ async fn shipped_daemon_cranks_over_websocket() {
         "no covered cache reads, so the feed was not doing the work:\n{metrics}"
     );
 
+    // The series the Grafana dashboard is built on, asserted present with
+    // their labels. Metric names are an API: a rename that compiles fine
+    // silently empties a panel, and nobody notices until they are staring
+    // at the dashboard during an incident. `grafana/relay-dashboard.json`
+    // is the consumer.
+    [
+        r#"relay_evaluations_total{program="#,
+        r#"relay_skips_total{program="#,
+        r#"relay_stage_seconds_count{program="#,
+        r#"relay_compute_units_count{program="#,
+        r#"relay_due_per_tick_count{program="#,
+        r#"relay_refresh_seconds_count{phase="total"}"#,
+        r#"relay_confirm_seconds_count{result="#,
+        r#"relay_tick_seconds_count{phase="total"}"#,
+        r#"relay_wake_lag_seconds_count{program="#,
+        r#"chain_rpc_seconds_count{method="get_multiple_accounts"}"#,
+        r#"chain_rpc_accounts_total{method="get_multiple_accounts"}"#,
+        r#"chain_cached_accounts{kind="accounts"}"#,
+        r#"chain_cache_reads_total{outcome="#,
+        r#"chain_update_source_total{source="#,
+    ]
+    .iter()
+    .for_each(|series| {
+        assert!(
+            metrics.contains(series),
+            "dashboard series missing: {series}\n{metrics}"
+        );
+    });
+    // And the two label values that carry the load breakdown, which is the
+    // whole point of splitting evaluations by wake kind.
+    assert!(
+        metrics.contains(r#"wake="at_timestamp""#)
+            && metrics.contains(r#"wake="on_account_change""#),
+        "wake-kind breakdown missing:\n{metrics}"
+    );
+    // Skips must be broken out by reason, not lumped under one outcome.
+    assert!(
+        metrics.contains(r#"reason="not_due""#),
+        "skip reasons missing:\n{metrics}"
+    );
+
     // Fork detection is live. Reads run at `processed`, so a write can be
     // taken back with no correcting notification ever arriving; the slot
     // stream is the only thing that would tell us. Failing to subscribe is

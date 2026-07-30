@@ -81,6 +81,151 @@ pub static PACKS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("metric registers")
 });
 
+/// Skips broken out by reason. `relay_cranks_total{outcome="skipped"}`
+/// counts them all together, which is nearly useless on a dashboard: a
+/// turner skipping everything because nothing is due looks identical to one
+/// skipping because a target program is trying to steal its signature. This
+/// is the series to graph, and the reasons that matter are not the common
+/// ones — `not_due` and `backoff` are the healthy baseline, while
+/// `executor_named_signer`, `parse_failed`, and `no_safe_payout` should be
+/// flat zero and mean something is wrong when they are not.
+pub static SKIPS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec_with_registry!(
+        "relay_skips_total",
+        "Conditions skipped, by reason",
+        &["reason", "program"],
+        REGISTRY
+    )
+    .expect("metric registers")
+});
+
+/// Conditions evaluated, by the kind of wake that put them up for
+/// evaluation. This is the load metric: it counts every condition looked at
+/// on every tick, whether or not anything came of it, so it answers "what is
+/// generating all this work" — and the wake kind is usually the answer,
+/// since a tight `EverySlots` or a change-wake on a hot account costs a
+/// resolve simulation every time it fires.
+pub static EVALUATIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec_with_registry!(
+        "relay_evaluations_total",
+        "Conditions evaluated, by wake kind",
+        &["wake", "program"],
+        REGISTRY
+    )
+    .expect("metric registers")
+});
+
+/// Wall time of one condition's resolve and execute simulations, and of its
+/// submission. Per-condition, not per-tick, so a single expensive resolver
+/// is visible rather than averaged into the tick.
+pub static STAGE_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec_with_registry!(
+        "relay_stage_seconds",
+        "Wall time of one crank's stages",
+        &["stage", "program"],
+        // Local simulation should be sub-millisecond; anything past ~50ms
+        // means it is reaching the network, which is the bug this catches.
+        vec![0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0],
+        REGISTRY
+    )
+    .expect("metric registers")
+});
+
+/// Compute units a crank's simulations consumed. The cost side of the same
+/// question `relay_lamports_total` answers on the revenue side: a resolver
+/// whose CU keeps climbing will eventually stop fitting in a packed
+/// transaction, and this is the early warning.
+pub static COMPUTE_UNITS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec_with_registry!(
+        "relay_compute_units",
+        "Compute units consumed in simulation, by stage",
+        &["stage", "program"],
+        vec![
+            1_000.0,
+            5_000.0,
+            20_000.0,
+            50_000.0,
+            100_000.0,
+            200_000.0,
+            400_000.0,
+            800_000.0,
+            1_400_000.0
+        ],
+        REGISTRY
+    )
+    .expect("metric registers")
+});
+
+/// Conditions found due in one tick. Compare against `--concurrency`: a
+/// distribution pressed against the cap means the turner is the bottleneck
+/// and work is waiting on a slot, not on the chain.
+pub static DUE_PER_TICK: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec_with_registry!(
+        "relay_due_per_tick",
+        "Conditions due in one tick",
+        &["program"],
+        vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 512.0],
+        REGISTRY
+    )
+    .expect("metric registers")
+});
+
+/// Ticks in which more conditions were due than could run at once. The
+/// single clearest saturation signal: while this climbs, cranks are late for
+/// no reason but the turner's own limits.
+pub static SATURATED_TICKS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec_with_registry!(
+        "relay_saturated_ticks_total",
+        "Ticks where due conditions exceeded the concurrency limit",
+        &["kind"],
+        REGISTRY
+    )
+    .expect("metric registers")
+});
+
+/// Watches dropped at registry refresh, by reason — the same reasons
+/// `relay watch list --rejected` prints. A rejected watch is invisible
+/// everywhere else, so a step change here (a target program upgrading its
+/// layout, say, and turning every block unparseable) is otherwise silent.
+pub static REGISTRY_REJECTED: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec_with_registry!(
+        "relay_registry_rejected_total",
+        "Watches rejected at refresh, by reason",
+        &["reason"],
+        REGISTRY
+    )
+    .expect("metric registers")
+});
+
+/// How long a registry refresh takes. It scans every watch the provider
+/// will return, so it grows with the whole registry rather than with this
+/// turner's share of it.
+pub static REFRESH_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec_with_registry!(
+        "relay_refresh_seconds",
+        "Wall time of a registry refresh",
+        &["phase"],
+        vec![0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0],
+        REGISTRY
+    )
+    .expect("metric registers")
+});
+
+/// Submission to settlement, by what it settled as. Separating this from
+/// `relay_wake_lag_seconds` splits "we were slow to decide" from "the
+/// cluster was slow to confirm", which are different problems with
+/// different fixes.
+pub static CONFIRM_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec_with_registry!(
+        "relay_confirm_seconds",
+        "Time from submission to settlement",
+        &["result"],
+        vec![0.5, 1.0, 2.0, 4.0, 8.0, 15.0, 30.0, 60.0],
+        REGISTRY
+    )
+    .expect("metric registers")
+});
+
 pub static WATCHES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec_with_registry!(
         "relay_watches",

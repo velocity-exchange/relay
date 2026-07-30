@@ -445,6 +445,7 @@ impl<S: ChainSource> Turner<S> {
     /// fetched for the size / owner / fee checks. A watch dropped here
     /// stops being fetched and subscribed entirely until the next refresh.
     pub async fn refresh_watches(&mut self) -> Result<RefreshSummary> {
+        let started = Instant::now();
         let filter = self.config.filter.clone();
         let accounts = self
             .source
@@ -517,6 +518,16 @@ impl<S: ChainSource> Turner<S> {
         metrics::WATCHES
             .with_label_values(&["rejected"])
             .set(summary.rejected.len() as i64);
+        // Counters as well as the gauges: a watch that flaps in and out of
+        // admission is invisible in a gauge sampled every 15 seconds.
+        summary.rejected.iter().for_each(|(_, reason)| {
+            metrics::REGISTRY_REJECTED
+                .with_label_values(&[crate::filter::reject_label(reason)])
+                .inc();
+        });
+        metrics::REFRESH_SECONDS
+            .with_label_values(&["total"])
+            .observe(started.elapsed().as_secs_f64());
         self.watches = kept.to_vec();
         // Forget state for watches we no longer track, so a re-admitted
         // watch starts clean rather than inheriting a stale backoff.
@@ -594,6 +605,12 @@ impl<S: ChainSource> Turner<S> {
         let mut updates: Vec<(CondKey, StateUpdate)> = Vec::new();
         for (watch, conditions) in &parsed {
             let Some(conditions) = conditions else {
+                metrics::SKIPS
+                    .with_label_values(&[
+                        skip_label(&SkipReason::ParseFailed),
+                        &metrics::program_label(&watch.target_program),
+                    ])
+                    .inc();
                 outcomes.push(Outcome::Skipped(
                     (watch.target, watch.offset, 0),
                     SkipReason::ParseFailed,
@@ -614,9 +631,18 @@ impl<S: ChainSource> Turner<S> {
                     ),
                     _ => None,
                 };
+                let program_label = metrics::program_label(&watch.target_program);
+                metrics::EVALUATIONS
+                    .with_label_values(&[wake_label(condition), &program_label])
+                    .inc();
                 match self.decide(key, watch, condition, &clock, watched_now) {
                     Ok(ready) => due.push(ready),
                     Err(outcome) => {
+                        if let Outcome::Skipped(_, reason) = &outcome {
+                            metrics::SKIPS
+                                .with_label_values(&[skip_label(reason), &program_label])
+                                .inc();
+                        }
                         // The one skip with bookkeeping: record when the
                         // wait started, so the delay is measured from
                         // first sight rather than from the latest tick.
@@ -638,6 +664,23 @@ impl<S: ChainSource> Turner<S> {
         metrics::IN_FLIGHT
             .with_label_values(&["cranks"])
             .set(due.len() as i64);
+        if !due.is_empty() {
+            // Bucketed per program so one busy protocol is distinguishable
+            // from a registry-wide surge.
+            let mut per_program: HashMap<Pubkey, u64> = HashMap::new();
+            due.iter()
+                .for_each(|d| *per_program.entry(d.program).or_default() += 1);
+            per_program.iter().for_each(|(program, count)| {
+                metrics::DUE_PER_TICK
+                    .with_label_values(&[&metrics::program_label(program)])
+                    .observe(*count as f64);
+            });
+            if due.len() > self.config.concurrency {
+                metrics::SATURATED_TICKS
+                    .with_label_values(&["concurrency"])
+                    .inc();
+            }
+        }
         // Explicit loops: the closure forms would need `&mut running`
         // alongside the `&self` the in-flight futures hold.
         let mut prepared: Vec<Prepared> = Vec::new();
@@ -832,6 +875,12 @@ impl<S: ChainSource> Turner<S> {
                             .inc();
                         "failed"
                     }
+                    Outcome::Skipped(_, reason) => {
+                        metrics::SKIPS
+                            .with_label_values(&[skip_label(reason), &program])
+                            .inc();
+                        "skipped"
+                    }
                     _ => "skipped",
                 };
                 metrics::CRANKS.with_label_values(&[label, &program]).inc();
@@ -876,11 +925,21 @@ impl<S: ChainSource> Turner<S> {
                 .collect(),
             data: condition.resolver_disc.to_vec(),
         };
+        let program_label = metrics::program_label(&Pubkey::from(condition.resolver_program));
         let sim = {
+            let started = Instant::now();
             let (tx, _) = self.signed_tx(&[resolver_ix]).await?;
-            self.source
+            let sim = self
+                .source
                 .simulate_transaction(&tx, &resolver_accounts)
-                .await?
+                .await?;
+            metrics::STAGE_SECONDS
+                .with_label_values(&["resolve_sim", &program_label])
+                .observe(started.elapsed().as_secs_f64());
+            metrics::COMPUTE_UNITS
+                .with_label_values(&["resolve", &program_label])
+                .observe(sim.units_consumed as f64);
+            sim
         };
         if let Some(err) = sim.err {
             return Ok(CrankResult::Done(
@@ -958,9 +1017,17 @@ impl<S: ChainSource> Turner<S> {
         // Simulate with a generous budget to learn the real cost, then let
         // the packing phase re-sign with a tight limit — the fee is charged
         // on the limit you request, not the units you burn.
+        let executor_label = metrics::program_label(&program);
+        let started = Instant::now();
         let probe = self.with_compute_budget(ixs.clone(), MAX_COMPUTE_UNITS, 0);
         let (probe_tx, _) = self.signed_tx(&probe).await?;
         let sim = self.source.simulate_transaction(&probe_tx, &[]).await?;
+        metrics::STAGE_SECONDS
+            .with_label_values(&["execute_sim", &executor_label])
+            .observe(started.elapsed().as_secs_f64());
+        metrics::COMPUTE_UNITS
+            .with_label_values(&["execute", &executor_label])
+            .observe(sim.units_consumed as f64);
         if let Some(err) = sim.err {
             return Ok(CrankResult::Done(
                 Outcome::Failed {
@@ -1496,6 +1563,33 @@ struct Due {
     program: Pubkey,
     condition: spec::ConditionV0,
     watched_now: Option<Vec<u8>>,
+}
+
+/// Stable metric label for a skip reason. Spelled out rather than derived
+/// so a rename in the enum cannot silently rename a dashboard series.
+fn skip_label(reason: &SkipReason) -> &'static str {
+    match reason {
+        SkipReason::NotDue => "not_due",
+        SkipReason::Backoff => "backoff",
+        SkipReason::Inactive => "inactive",
+        SkipReason::BelowMinPayment => "below_min_payment",
+        SkipReason::ParseFailed => "parse_failed",
+        SkipReason::Unprofitable => "unprofitable",
+        SkipReason::ContentionDelay => "contention_delay",
+        SkipReason::NoSafePayout => "no_safe_payout",
+        SkipReason::ExecutorNamedSigner => "executor_named_signer",
+    }
+}
+
+/// Stable metric label for a wake kind, for the load breakdown.
+fn wake_label(condition: &spec::ConditionV0) -> &'static str {
+    match condition.wake() {
+        Ok(spec::WakeView::AtTimestamp { .. }) => "at_timestamp",
+        Ok(spec::WakeView::AtSlot { .. }) => "at_slot",
+        Ok(spec::WakeView::EverySlots { .. }) => "every_slots",
+        Ok(spec::WakeView::OnAccountChange { .. }) => "on_account_change",
+        Err(_) => "unknown",
+    }
 }
 
 fn stage_label(stage: &Stage) -> &'static str {

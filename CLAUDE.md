@@ -51,6 +51,14 @@ Reads, subscriptions, and simulation run at `processed`; the blockhash and signa
 
 `processed` means a cached write can be taken back with **no correcting notification**, because the canonical chain never writes that account. Fork detection (slot subscriptions → `SlotUpdate` → `CachedSource::drain_slots`) is the only thing covering that, so treat it as load-bearing. Two traps, both pinned by tests: only the *processed* slot status may move the fork tip (confirmed and finalized repeat slots already passed, and would read as a switch every slot, throwing the cache away continuously); and ordinary skipped slots are not switches, so the predicate must key on the parent being below the tip rather than on gaps. There is no way to make a single-node test validator fork, so the state machine is pinned by unit tests in `cached.rs`, and the e2e only asserts the subscription is live and never fires.
 
+## Metrics
+
+Metric names and label values are an API: `grafana/relay-dashboard.json` and the alerts in `grafana/README.md` consume them, and a rename that compiles fine silently empties a panel — which nobody notices until they are staring at the dashboard during an incident. So the label strings are spelled out in `skip_label`, `wake_label`, `stage_label`, and `filter::reject_label` rather than derived from enum variant names, and `shipped_daemon_cranks_over_websocket` asserts the dashboard's series are present with their labels.
+
+Cardinality is bounded deliberately. Programs are labelled by an 8-character prefix (`metrics::program_label`); conditions are never labelled, because a registry of 10,000 watches would become 30,000 series. Per-condition drilldown is the CLI's job — it reads the chain and has no cardinality budget. Do not add a pubkey-valued label.
+
+One asymmetry worth keeping: skips are counted in *both* the decide phase and the crank path, because the vast majority happen in decide (not due, backoff) and were previously invisible — `relay_cranks_total{outcome="skipped"}` only ever saw the handful that got as far as a simulation.
+
 ## The CLI
 
 `cli/` is a presentation layer over `Turner::explain`, and it must stay one. The value of the tool is that its verdicts come from the daemon's own `decide` and crank path, so a reimplementation of any gate — however small — is a bug even when it agrees today. `explain` stops at a prepared transaction (submission lives in `submit_packs`), which is what makes it read-only; `send_explained` submits exactly what was shown rather than re-deriving it.

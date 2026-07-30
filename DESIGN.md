@@ -134,6 +134,14 @@ wake hint due? → sim resolver → work? → read staged payload from post-sim 
 
 Failure modes accepted by design: stale local view ⇒ tx lands-and-fails (tx fee, same exposure as any keeper — and the adaptive delay above is what stops it repeating indefinitely), hint fires early ⇒ wasted sim (cheap). Hints firing late is the only design bug; conditions should include an `EverySlots` fallback when in doubt.
 
+## Observability
+
+Four questions, and the metrics exist to answer them rather than to describe the code: what is generating load (`relay_evaluations_total{wake, program}` — every condition looked at, not every crank done), why work is not happening (`relay_skips_total{reason}` — because `outcome="skipped"` lumped nine unrelated reasons into one series, and "nothing is due" and "a target program tried to take our signature" are not the same event), where the time goes (`relay_tick_seconds` per loop, `relay_stage_seconds` per condition, `chain_rpc_seconds` per provider call, `relay_saturated_ticks_total` for when `--concurrency` is the limit), and whether it pays (`relay_lamports_total`, `relay_compute_units`, `relay_contention_delay_slots`).
+
+Two splits are deliberate. Decision latency (`relay_wake_lag_seconds`, wake due → submitted) is separate from cluster latency (`relay_confirm_seconds`, submitted → settled), because they have different fixes and averaging them hides both. And per-condition stage timing is separate from per-tick timing, because a single expensive resolver is otherwise averaged into a tick that looks fine.
+
+Cardinality is capped by construction: programs are labelled by an 8-character prefix, conditions are not labelled at all. Per-condition drilldown belongs to the CLI, which reads the chain directly — a registry of 10,000 watches must not become 30,000 time series. `grafana/relay-dashboard.json` is the consumer, and the e2e asserts its series exist so a rename cannot silently empty a panel.
+
 ## Debugging surface
 
 `Turner::explain` is the whole of it: it runs `decide` and the crank path for one condition and reports where it got to, stopping at a prepared transaction so it never sends. Everything the `relay` CLI prints is a rendering of that, which is deliberate — a debugging tool that reimplements the predicate it is debugging will eventually disagree with production, and the disagreement will land exactly when someone is relying on it. Two limits are inherent and are surfaced rather than hidden: a fresh process has no `last_seen`, so change-wakes read as due, and per-process suppression (backoff, contention delay, profitability) is invisible to it, so the CLI scrapes the daemon's metrics endpoint for those.

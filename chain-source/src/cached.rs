@@ -200,6 +200,12 @@ impl<Inner: ChainSource> CachedSource<Inner> {
             }
         }
         Self::drain_slots(state);
+        metrics::CACHED_ACCOUNTS
+            .with_label_values(&["accounts"])
+            .set(state.accounts.len() as i64);
+        metrics::CACHED_ACCOUNTS
+            .with_label_values(&["indexed"])
+            .set(state.indexed_keys.len() as i64);
     }
 
     /// Track the fork the cluster is on, and drop provisional writes when it

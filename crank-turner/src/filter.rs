@@ -78,6 +78,23 @@ pub struct WatchFilter {
     pub max_watches: Option<usize>,
 }
 
+/// Stable metric label for a rejection. Spelled out rather than derived so
+/// renaming a variant cannot silently rename a dashboard series.
+pub fn reject_label(reason: &RejectReason) -> &'static str {
+    match reason {
+        RejectReason::ProgramNotAllowed => "program_not_allowed",
+        RejectReason::ProgramBlocked => "program_blocked",
+        RejectReason::RegistrarNotAllowed => "registrar_not_allowed",
+        RejectReason::TargetNotAllowed => "target_not_allowed",
+        RejectReason::TargetTooLarge => "target_too_large",
+        RejectReason::TargetMissing => "target_missing",
+        RejectReason::OwnerDrift => "owner_drift",
+        RejectReason::Unparseable => "unparseable",
+        RejectReason::PaysTooLittle => "pays_too_little",
+        RejectReason::OverCapacity => "over_capacity",
+    }
+}
+
 impl WatchFilter {
     /// Allowlist a single program — the common case for a protocol running
     /// a turner for its own cranks.

@@ -16,6 +16,8 @@ use futures_util::StreamExt;
 use solana_account_decoder::{UiAccountData, UiAccountEncoding};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
+
+use crate::metrics;
 use solana_rpc_client_api::config::{
     RpcAccountInfoConfig, RpcProgramAccountsConfig, RpcSendTransactionConfig,
     RpcSimulateTransactionAccountsConfig, RpcSimulateTransactionConfig,
@@ -240,27 +242,57 @@ fn decode_ui_account(ui: solana_account_decoder::UiAccount) -> Option<Account> {
     })
 }
 
+/// Time one RPC call and record it under `method`.
+///
+/// Wrapping rather than instrumenting each body inline keeps the label
+/// spelling in one place: a metric whose method names drift between call
+/// sites is worse than no metric, because a dashboard silently loses a
+/// series instead of failing.
+async fn timed<T>(
+    method: &'static str,
+    accounts: usize,
+    call: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let started = std::time::Instant::now();
+    let result = call.await;
+    metrics::RPC_SECONDS
+        .with_label_values(&[method])
+        .observe(started.elapsed().as_secs_f64());
+    if accounts > 0 {
+        metrics::RPC_ACCOUNTS
+            .with_label_values(&[method])
+            .inc_by(accounts as u64);
+    }
+    if result.is_err() {
+        metrics::RPC_ERRORS.with_label_values(&[method]).inc();
+    }
+    result
+}
+
 #[async_trait]
 impl ChainSource for RpcSource {
     async fn get_multiple_accounts(&self, pubkeys: &[Pubkey]) -> Result<Vec<Option<Account>>> {
-        // RPC rejects more than 100 keys per call, and a turner tracking a
-        // real registry passes that on every tick. `buffered` preserves
-        // input order, so concatenating the chunk replies keeps each slot
-        // aligned with the key that asked for it.
-        let chunks: Vec<Vec<Pubkey>> = pubkeys
-            .chunks(MAX_ACCOUNTS_PER_CALL)
-            .map(<[Pubkey]>::to_vec)
-            .collect();
-        let replies: Vec<_> = futures_util::stream::iter(chunks)
-            .map(|chunk| async move { self.client.get_multiple_accounts(&chunk).await })
-            .buffered(MAX_CONCURRENT_ACCOUNT_CALLS)
-            .collect()
-            .await;
-        replies
-            .into_iter()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("get_multiple_accounts")
-            .map(|chunks| chunks.into_iter().flatten().collect())
+        timed("get_multiple_accounts", pubkeys.len(), async {
+            // RPC rejects more than 100 keys per call, and a turner tracking a
+            // real registry passes that on every tick. `buffered` preserves
+            // input order, so concatenating the chunk replies keeps each slot
+            // aligned with the key that asked for it.
+            let chunks: Vec<Vec<Pubkey>> = pubkeys
+                .chunks(MAX_ACCOUNTS_PER_CALL)
+                .map(<[Pubkey]>::to_vec)
+                .collect();
+            let replies: Vec<_> = futures_util::stream::iter(chunks)
+                .map(|chunk| async move { self.client.get_multiple_accounts(&chunk).await })
+                .buffered(MAX_CONCURRENT_ACCOUNT_CALLS)
+                .collect()
+                .await;
+            replies
+                .into_iter()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("get_multiple_accounts")
+                .map(|chunks| chunks.into_iter().flatten().collect())
+        })
+        .await
     }
 
     async fn get_program_accounts(
@@ -268,61 +300,74 @@ impl ChainSource for RpcSource {
         program: &Pubkey,
         filter_sets: &[Vec<AccountFilter>],
     ) -> Result<Vec<(Pubkey, Account)>> {
-        let empty: Vec<Vec<AccountFilter>> = vec![Vec::new()];
-        let queries = if filter_sets.is_empty() {
-            &empty[..]
-        } else {
-            filter_sets
-        };
-        let mut out = Vec::new();
-        for set in queries {
-            let filters: Vec<RpcFilterType> = set.iter().map(AccountFilter::to_rpc).collect();
-            // Deprecated in favor of the ui-accounts variant, but this one
-            // returns `Account` directly, which is what the trait wants.
-            #[allow(deprecated)]
-            let accounts = self
-                .client
-                .get_program_accounts_with_config(
-                    program,
-                    RpcProgramAccountsConfig {
-                        filters: Some(filters),
-                        account_config: RpcAccountInfoConfig {
-                            encoding: Some(UiAccountEncoding::Base64),
+        timed("get_program_accounts", 0, async {
+            let empty: Vec<Vec<AccountFilter>> = vec![Vec::new()];
+            let queries = if filter_sets.is_empty() {
+                &empty[..]
+            } else {
+                filter_sets
+            };
+            let mut out = Vec::new();
+            for set in queries {
+                let filters: Vec<RpcFilterType> = set.iter().map(AccountFilter::to_rpc).collect();
+                // Deprecated in favor of the ui-accounts variant, but this one
+                // returns `Account` directly, which is what the trait wants.
+                #[allow(deprecated)]
+                let accounts = self
+                    .client
+                    .get_program_accounts_with_config(
+                        program,
+                        RpcProgramAccountsConfig {
+                            filters: Some(filters),
+                            account_config: RpcAccountInfoConfig {
+                                encoding: Some(UiAccountEncoding::Base64),
+                                ..Default::default()
+                            },
                             ..Default::default()
                         },
-                        ..Default::default()
-                    },
-                )
-                .await
-                .context("get_program_accounts")?;
-            out.extend(accounts);
-        }
-        Ok(out)
+                    )
+                    .await
+                    .context("get_program_accounts")?;
+                out.extend(accounts);
+            }
+            metrics::RPC_ACCOUNTS
+                .with_label_values(&["get_program_accounts"])
+                .inc_by(out.len() as u64);
+            Ok(out)
+        })
+        .await
     }
 
     async fn clock(&self) -> Result<ClockSnapshot> {
-        let account = self
-            .client
-            .get_account(&sysvar::clock::id())
-            .await
-            .context("get clock sysvar")?;
-        let clock: Clock = bincode::deserialize(&account.data).context("decode clock sysvar")?;
-        Ok(ClockSnapshot {
-            slot: clock.slot,
-            unix_timestamp: clock.unix_timestamp,
+        timed("clock", 1, async {
+            let account = self
+                .client
+                .get_account(&sysvar::clock::id())
+                .await
+                .context("get clock sysvar")?;
+            let clock: Clock =
+                bincode::deserialize(&account.data).context("decode clock sysvar")?;
+            Ok(ClockSnapshot {
+                slot: clock.slot,
+                unix_timestamp: clock.unix_timestamp,
+            })
         })
+        .await
     }
 
     async fn latest_blockhash(&self) -> Result<BlockhashInfo> {
-        let (hash, last_valid_block_height) = self
-            .client
-            .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
-            .await
-            .context("get_latest_blockhash")?;
-        Ok(BlockhashInfo {
-            hash,
-            last_valid_block_height,
+        timed("latest_blockhash", 0, async {
+            let (hash, last_valid_block_height) = self
+                .client
+                .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
+                .await
+                .context("get_latest_blockhash")?;
+            Ok(BlockhashInfo {
+                hash,
+                last_valid_block_height,
+            })
         })
+        .await
     }
 
     async fn block_height(&self) -> Result<u64> {
@@ -333,39 +378,42 @@ impl ChainSource for RpcSource {
         &self,
         signatures: &[Signature],
     ) -> Result<Vec<Option<SignatureOutcome>>> {
-        // One call per 256 signatures is the RPC limit; batches this large
-        // are already unusual for a single turner.
-        let mut out = Vec::with_capacity(signatures.len());
-        for chunk in signatures.chunks(256) {
-            let statuses = self
-                .client
-                .get_signature_statuses(chunk)
-                .await
-                .context("get_signature_statuses")?
-                .value;
-            out.extend(statuses.into_iter().map(|status| {
-                // A `processed`-only status is not an outcome yet: the fork
-                // carrying it can still be abandoned, and the caller acts on
-                // these — booking payment, or ramping a contention delay off
-                // a revert. Leave it pending and let it settle. If the fork
-                // does get dropped it never confirms, the blockhash expires,
-                // and it comes back as a retryable `Expired` rather than a
-                // landed crank that never happened.
-                status
-                    .filter(|status| {
-                        matches!(
-                            status.confirmation_status,
-                            Some(TransactionConfirmationStatus::Confirmed)
-                                | Some(TransactionConfirmationStatus::Finalized)
-                        )
-                    })
-                    .map(|status| match status.err {
-                        Some(err) => SignatureOutcome::Failed(err.to_string()),
-                        None => SignatureOutcome::Landed,
-                    })
-            }));
-        }
-        Ok(out)
+        timed("signature_statuses", signatures.len(), async {
+            // One call per 256 signatures is the RPC limit; batches this large
+            // are already unusual for a single turner.
+            let mut out = Vec::with_capacity(signatures.len());
+            for chunk in signatures.chunks(256) {
+                let statuses = self
+                    .client
+                    .get_signature_statuses(chunk)
+                    .await
+                    .context("get_signature_statuses")?
+                    .value;
+                out.extend(statuses.into_iter().map(|status| {
+                    // A `processed`-only status is not an outcome yet: the fork
+                    // carrying it can still be abandoned, and the caller acts on
+                    // these — booking payment, or ramping a contention delay off
+                    // a revert. Leave it pending and let it settle. If the fork
+                    // does get dropped it never confirms, the blockhash expires,
+                    // and it comes back as a retryable `Expired` rather than a
+                    // landed crank that never happened.
+                    status
+                        .filter(|status| {
+                            matches!(
+                                status.confirmation_status,
+                                Some(TransactionConfirmationStatus::Confirmed)
+                                    | Some(TransactionConfirmationStatus::Finalized)
+                            )
+                        })
+                        .map(|status| match status.err {
+                            Some(err) => SignatureOutcome::Failed(err.to_string()),
+                            None => SignatureOutcome::Landed,
+                        })
+                }));
+            }
+            Ok(out)
+        })
+        .await
     }
 
     async fn simulate_transaction(

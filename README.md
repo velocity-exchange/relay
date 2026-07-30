@@ -68,6 +68,39 @@ Safety flags: `--payout-address <PUBKEY>` is where executors pay, and **must not
 
 Operational flags: `--concurrency` (cranks in flight per tick), `--min-program-profit` (skip programs whose recent cranks lost money), `--contention-step-slots` / `--max-contention-slots` (hold a program's cranks back when its transactions keep reverting, so races lost to a faster turner cost nothing instead of a fee each; decays back to zero as cranks land again — `0` disables), `--metrics-port` (Prometheus `/metrics` + `/health`, default 9899), `--max-cranks-per-tx` (pack cranks into shared transactions, default 3), `--max-priority-fee`.
 
+## Metrics
+
+Prometheus on `--metrics-port` (default 9899), `/metrics` and `/health`. A
+dashboard covering all of it is in [`grafana/`](./grafana), along with the
+alerts worth having and why some obvious-looking ones are not worth having.
+
+Four questions, and the series that answer them:
+
+- **What is generating load** — `relay_evaluations_total{wake, program}` counts
+  every condition looked at, whether or not anything came of it, so it says
+  what is making the turner busy rather than what it accomplished. Split by
+  wake kind because that is usually the answer: a tight `EverySlots` or a
+  change-wake on a hot account costs a resolve simulation every time it fires.
+- **Why work is not happening** — `relay_skips_total{reason, program}`.
+  `not_due` and `backoff` are the healthy baseline; `executor_named_signer`,
+  `parse_failed`, and `no_safe_payout` should be flat zero and mean something
+  is wrong when they are not.
+- **Where the time goes** — `relay_tick_seconds{phase}` for the whole loop,
+  `relay_stage_seconds{stage, program}` per condition (so one expensive
+  resolver is visible instead of averaged away), `chain_rpc_seconds{method}`
+  for time spent waiting on a provider, and `relay_saturated_ticks_total` for
+  when the limit is `--concurrency` rather than the chain.
+- **Whether it pays** — `relay_lamports_total{direction}`,
+  `relay_compute_units{stage}`, `relay_transactions_total{result}`, and
+  `relay_contention_delay_slots{program}`.
+
+Latency is split deliberately: `relay_wake_lag_seconds` is the turner's own
+decision latency, `relay_confirm_seconds` is the cluster's. "We were slow to
+decide" and "the cluster was slow to confirm" want different fixes.
+
+Label cardinality is bounded on purpose — programs by an 8-character prefix,
+conditions not at all. Per-condition drilldown is the `relay` CLI's job.
+
 ## Debugging (`relay` CLI)
 
 `cli/` ships a second binary, `relay`, for when a condition is not being cranked and you think it should be. Every verdict it prints comes from `Turner::explain`, which runs the daemon's own `decide` and crank path rather than a reimplementation — so the CLI cannot disagree with production about whether a condition is due.
