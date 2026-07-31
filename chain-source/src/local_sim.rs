@@ -22,7 +22,7 @@
 //! cache freshness, which is the same bound the decision already had —
 //! and the chain re-runs everything authoritatively at land time anyway.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use anyhow::Result;
@@ -34,7 +34,7 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use solana_sdk::transaction::Transaction;
 use tokio::sync::Mutex;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::metrics;
 use crate::source::{
@@ -57,6 +57,8 @@ static BPF_LOADER_UPGRADEABLE: LazyLock<Pubkey> = LazyLock::new(|| {
 /// Offset of the ELF inside an upgradeable programdata account:
 /// `enum tag (4) + slot (8) + Option<Pubkey> authority (1 + 32)`.
 const PROGRAMDATA_ELF_OFFSET: usize = 45;
+/// Slot inside an upgradeable programdata account, right after the tag.
+const PROGRAMDATA_SLOT_OFFSET: usize = 4;
 /// Offset of the programdata address inside a `Program` account:
 /// `enum tag (4)`.
 const PROGRAM_PROGRAMDATA_OFFSET: usize = 4;
@@ -91,6 +93,11 @@ impl Default for LocalSimConfig {
 struct Instance {
     svm: LiteSVM,
     programs: HashSet<Pubkey>,
+    /// Tracks the most recent on-chain slot at which each upgradeable
+    /// program's ELF was loaded. Compared on every cache lookup to detect
+    /// upgrades — if the slot in the programdata account has advanced, the
+    /// program was redeployed and must be re-loaded.
+    program_slots: HashMap<Pubkey, u64>,
 }
 
 impl Instance {
@@ -103,6 +110,7 @@ impl Instance {
                 .with_sigverify(false)
                 .with_blockhash_check(false),
             programs: HashSet::new(),
+            program_slots: HashMap::new(),
         }
     }
 }
@@ -226,12 +234,57 @@ impl<Inner: ChainSource> LocalSimSource<Inner> {
         })
     }
 
-    /// Load a program's ELF into the bank once. Programs are the expensive
-    /// thing to install (verification), so pooled instances keep them.
+    /// Read the upgrade slot from an upgradeable program's programdata
+    /// account. The slot sits at offset 4 of the programdata account data
+    /// (`enum tag (4) + slot (8) + ...`) and advances every time the program
+    /// is redeployed on chain.
+    fn read_program_slot(&self, instance: &Instance, account: &Account) -> Option<u64> {
+        let address = account
+            .data
+            .get(PROGRAM_PROGRAMDATA_OFFSET..PROGRAM_PROGRAMDATA_OFFSET + 32)?;
+        let address = Pubkey::try_from(address).ok()?;
+        let programdata = instance.svm.get_account(&address)?;
+        let bytes = programdata
+            .data
+            .get(PROGRAMDATA_SLOT_OFFSET..PROGRAMDATA_SLOT_OFFSET + 8)?;
+        Some(u64::from_le_bytes(bytes.try_into().ok()?))
+    }
+
+    /// Load a program's ELF into the bank. Programs are the expensive
+    /// thing to install (verification), so pooled instances keep them
+    /// across ticks. For upgradeable programs, the on-chain slot in the
+    /// programdata account is compared against a cached value to detect
+    /// redeploys and trigger a re-load.
     fn load_program(&self, instance: &mut Instance, program_id: &Pubkey, account: &Account) {
+        // ── cache check ─────────────────────────────────────────────
         if instance.programs.contains(program_id) {
-            return;
+            match account.owner {
+                id if id == *BPF_LOADER_UPGRADEABLE => {
+                    let current_slot = self.read_program_slot(instance, account);
+                    let cached_slot = instance.program_slots.get(program_id).copied();
+                    if cached_slot == current_slot {
+                        return; // still the same version
+                    }
+                    // Slot advanced → program was redeployed on chain.
+                    // Evict the stale cache entry so the code below
+                    // re-loads with the fresh ELF.
+                    instance.programs.remove(program_id);
+                    instance.program_slots.remove(program_id);
+                    info!(
+                        program = %program_id,
+                        old_slot = cached_slot,
+                        new_slot = current_slot,
+                        "program upgrade detected, re-loading ELF"
+                    );
+                    metrics::PROGRAM_RELOADS.inc();
+                }
+                // Non-upgradeable programs (BPFLoader) and builtins can
+                // never be redeployed — their cache entry is permanent.
+                _ => return,
+            }
         }
+
+        // ── load (or re-load) ───────────────────────────────────────
         let elf = if account.owner == *BPF_LOADER_UPGRADEABLE {
             // The program account only names its programdata; fetching that
             // is the caller's job (it is in the transaction's account keys
@@ -255,6 +308,12 @@ impl<Inner: ChainSource> LocalSimSource<Inner> {
         {
             Ok(()) => {
                 instance.programs.insert(*program_id);
+                // Record the slot so future lookups can detect upgrades.
+                if account.owner == *BPF_LOADER_UPGRADEABLE {
+                    if let Some(slot) = self.read_program_slot(instance, account) {
+                        instance.program_slots.insert(*program_id, slot);
+                    }
+                }
                 debug!(program = %program_id, bytes = elf.len(), "loaded program into local sim");
             }
             Err(err) => warn!(program = %program_id, error = ?err, "local sim program load failed"),
