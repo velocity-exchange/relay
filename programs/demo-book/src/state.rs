@@ -16,8 +16,8 @@
 
 use anchor_lang_v2::prelude::*;
 use relay_spec::{
-    AccountRefV0, ConditionBlockHeaderV0, ConditionV0, CrankSpecV0, ResolvedCrankV0,
-    ResponsePointerV0, KEEPER_PLACEHOLDER, RESPONSE_POINTER_LEN,
+    AccountRefV0, ConditionBlock, ConditionV0, CrankSpecV0, ResolvedCrankV0, ResponsePointerV0,
+    KEEPER_PLACEHOLDER, RESPONSE_POINTER_LEN,
 };
 use static_assertions::const_assert_eq;
 
@@ -66,11 +66,11 @@ pub struct BookV0 {
     pub entry_live: [u8; MAX_ENTRIES],
     /// [`SIDE_BID`] or [`SIDE_ASK`].
     pub entry_sides: [u8; MAX_ENTRIES],
-    /// The condition block a `WatchV0` points at, embedded as typed pod
-    /// state. MUST stay contiguous and 8-aligned (`cond_header` then
-    /// `conditions`, nothing between).
-    pub cond_header: ConditionBlockHeaderV0,
-    pub conditions: [ConditionV0; NUM_CONDITIONS],
+    /// The condition block a `WatchV0` points at, as the opaque byte
+    /// region [`relay_spec::ConditionBlock`] operates on. MUST stay
+    /// 8-aligned (the zero-copy readers require it). Same bytes as the
+    /// header-then-conditions layout it replaced — see the impl below.
+    pub block: [u8; relay_spec::BLOCK_HEADER_LEN + NUM_CONDITIONS * relay_spec::CONDITION_LEN],
     /// Resolver staging region (see [`STAGING_BYTES`]).
     pub staging: [u8; STAGING_BYTES],
 }
@@ -79,12 +79,10 @@ const_assert_eq!(core::mem::size_of::<BookV0>(), 2808);
 
 /// Account-data offset of the condition block (what to register the watch
 /// at). 8-aligned, as the zero-copy read path requires.
-pub const CONDITIONS_OFFSET: usize = 8 + core::mem::offset_of!(BookV0, cond_header);
+pub const CONDITIONS_OFFSET: usize = 8 + core::mem::offset_of!(BookV0, block);
 const_assert_eq!(CONDITIONS_OFFSET % 8, 0);
-const_assert_eq!(
-    core::mem::offset_of!(BookV0, conditions),
-    core::mem::offset_of!(BookV0, cond_header) + relay_spec::BLOCK_HEADER_LEN
-);
+// The block is one region now; the reader's only requirement is alignment.
+const_assert_eq!(CONDITIONS_OFFSET % 8, 0);
 
 /// Account-data offset of the staging region — the `offset` a resolver's
 /// [`ResponsePointerV0`] carries.
@@ -136,7 +134,7 @@ impl BookV0 {
         if expiry_ts < self.next_expiry_ts {
             self.next_expiry_ts = expiry_ts;
             // The single-store wake update the pod layout exists for.
-            self.conditions[SWEEP_CONDITION as usize].wake_ts = expiry_ts;
+            let _ = self.update_condition(SWEEP_CONDITION as usize, |c| c.wake_ts = expiry_ts);
         }
         Ok(id)
     }
@@ -164,7 +162,8 @@ impl BookV0 {
     /// Repair the sweep hint to the true minimum (executor-side).
     pub fn repair_next_expiry(&mut self) {
         self.next_expiry_ts = self.true_next_expiry();
-        self.conditions[SWEEP_CONDITION as usize].wake_ts = self.next_expiry_ts;
+        let next = self.next_expiry_ts;
+        let _ = self.update_condition(SWEEP_CONDITION as usize, |c| c.wake_ts = next);
     }
 
     /// Live entry with the smallest id (the eviction victim).
@@ -199,17 +198,15 @@ impl BookV0 {
             .then_some((self.entry_ids[bid], self.entry_ids[ask]))
     }
 
-    /// Stage a resolver payload and return the pointer to it. The turner
-    /// reads `staging[..len]` out of the simulation's post-execution
-    /// account state.
-    pub fn stage(&mut self, resolved: &ResolvedCrankV0) -> Result<[u8; RESPONSE_POINTER_LEN]> {
-        let len = resolved
-            .write_into(&mut self.staging)
-            .map_err(|_| DemoError::StagingOverflow)?;
-        Ok(
-            ResponsePointerV0::new(STAGING_ACCOUNT_INDEX, STAGING_OFFSET as u32, len as u32)
-                .to_bytes(),
-        )
+    /// Stage a resolver payload and return the pointer to it, mapping the
+    /// spec error into the program's own. The turner reads
+    /// `staging[..len]` out of the simulation's post-execution account
+    /// state.
+    pub fn stage_payload(
+        &mut self,
+        resolved: &ResolvedCrankV0,
+    ) -> Result<[u8; RESPONSE_POINTER_LEN]> {
+        Ok(ConditionBlock::stage(self, resolved).map_err(|_| DemoError::StagingOverflow)?)
     }
 
     /// One-time condition block initialization (wake inputs are updated in
@@ -219,48 +216,84 @@ impl BookV0 {
         let book: [u8; 32] = *own_address.as_array();
         // Writable: resolvers stage their payload into the book itself.
         let resolver_accounts = [AccountRefV0::writable(book)];
-        let spec = |resolver: &'static [u8], executor: &'static [u8]| CrankSpecV0 {
+        // Copied out: the closure below is used while `self` is borrowed
+        // mutably by the condition writes.
+        let min_payment = self.payment_per_crank;
+        let next_expiry_ts = self.next_expiry_ts;
+        let spec = move |resolver: &'static [u8], executor: &'static [u8]| CrankSpecV0 {
             resolver_program: program,
             resolver_disc: disc(resolver),
             executor_program: program,
             executor_disc: disc(executor),
-            min_payment: self.payment_per_crank,
+            min_payment,
         };
-        self.cond_header = ConditionBlockHeaderV0::new(NUM_CONDITIONS as u8);
-        // Element-by-element: a `[ConditionV0; 3]` literal materializes the
-        // whole 3 x 1.5KB array in the caller's stack frame, past the 4KB
-        // limit. One temporary at a time stays comfortably inside it.
-        self.conditions[SWEEP_CONDITION as usize] = ConditionV0::at_timestamp(
-            self.next_expiry_ts,
-            spec(
-                crate::instruction::ResolveSweepV0::DISCRIMINATOR,
-                crate::instruction::SweepV0::DISCRIMINATOR,
+        let _ = self.init_header();
+        // One condition at a time: an array literal would materialize
+        // every condition in the caller's stack frame at once, which past
+        // a few slots blows the 4KB limit.
+        let _ = self.write_condition(
+            SWEEP_CONDITION as usize,
+            &ConditionV0::at_timestamp(
+                next_expiry_ts,
+                spec(
+                    crate::instruction::ResolveSweepV0::DISCRIMINATOR,
+                    crate::instruction::SweepV0::DISCRIMINATOR,
+                ),
+                &resolver_accounts,
             ),
-            &resolver_accounts,
         );
-        self.conditions[EVICT_CONDITION as usize] = ConditionV0::on_account_change(
-            book,
-            ENTRY_COUNT_OFFSET as u32,
-            4,
-            spec(
-                crate::instruction::ResolveEvictV0::DISCRIMINATOR,
-                crate::instruction::EvictV0::DISCRIMINATOR,
+        let _ = self.write_condition(
+            EVICT_CONDITION as usize,
+            &ConditionV0::on_account_change(
+                book,
+                ENTRY_COUNT_OFFSET as u32,
+                4,
+                spec(
+                    crate::instruction::ResolveEvictV0::DISCRIMINATOR,
+                    crate::instruction::EvictV0::DISCRIMINATOR,
+                ),
+                &resolver_accounts,
             ),
-            &resolver_accounts,
         );
         // Cross: any change to the book at all.
-        self.conditions[CROSS_CONDITION as usize] = ConditionV0::on_account_change(
-            book,
-            VERSION_OFFSET as u32,
-            8,
-            spec(
-                crate::instruction::ResolveCrossV0::DISCRIMINATOR,
-                crate::instruction::CrossV0::DISCRIMINATOR,
+        let _ = self.write_condition(
+            CROSS_CONDITION as usize,
+            &ConditionV0::on_account_change(
+                book,
+                VERSION_OFFSET as u32,
+                8,
+                spec(
+                    crate::instruction::ResolveCrossV0::DISCRIMINATOR,
+                    crate::instruction::CrossV0::DISCRIMINATOR,
+                ),
+                &resolver_accounts,
             ),
-            &resolver_accounts,
         );
     }
+}
 
+/// The block region + staging contract, from the spec. Everything the
+/// program calls on it (`init_header`, `write_condition`,
+/// `update_condition`, `stage`) is a provided method.
+impl ConditionBlock for BookV0 {
+    const NUM_CONDITIONS: usize = NUM_CONDITIONS;
+    const STAGING_OFFSET: u32 = STAGING_OFFSET as u32;
+    const STAGING_ACCOUNT_INDEX: u8 = STAGING_ACCOUNT_INDEX;
+
+    fn block(&self) -> &[u8] {
+        &self.block
+    }
+
+    fn block_mut(&mut self) -> &mut [u8] {
+        &mut self.block
+    }
+
+    fn staging_mut(&mut self) -> &mut [u8] {
+        &mut self.staging
+    }
+}
+
+impl BookV0 {
     /// Executor account list shared by every resolver: keeper placeholder
     /// (writable, receives payment) then the book (writable).
     pub fn executor_accounts(own_address: &Address) -> Vec<AccountRefV0> {

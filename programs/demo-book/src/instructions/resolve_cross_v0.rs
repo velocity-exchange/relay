@@ -27,7 +27,7 @@ pub fn handle_resolve_cross_v0(
                 .into_iter()
                 .chain(ask_id.to_le_bytes())
                 .collect();
-            book.stage(&ResolvedCrankV0 {
+            book.stage_payload(&ResolvedCrankV0 {
                 accounts: BookV0::executor_accounts(&own_address),
                 data,
             })

@@ -23,7 +23,7 @@ pub fn handle_resolve_evict_v0(
         .flatten();
 
     match victim {
-        Some((_, id)) => book.stage(&ResolvedCrankV0 {
+        Some((_, id)) => book.stage_payload(&ResolvedCrankV0 {
             accounts: BookV0::executor_accounts(&own_address),
             // Executor args: the borsh wire of `EvictArgsV0 { id: u64 }`.
             data: id.to_le_bytes().to_vec(),

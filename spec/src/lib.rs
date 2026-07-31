@@ -538,6 +538,123 @@ pub fn write_block(region: &mut [u8], conditions: &[ConditionV0]) -> Result<usiz
     Ok(total)
 }
 
+/// A program account that hosts a condition block plus a resolver staging
+/// region — the shape every relay-integrated program repeats.
+///
+/// Implement the three accessors and the two consts; everything a program
+/// actually calls (stamp the header, write/read a condition slot,
+/// deactivate one, stage a resolved crank) comes for free. Without this,
+/// each hosting account hand-rolls the same sixty lines of offset
+/// arithmetic — and an off-by-one in it is a silently unreadable block.
+///
+/// The block must live at an 8-aligned account-data offset (see
+/// [`read_block`]); `STAGING_OFFSET` is the *account-data* offset of the
+/// staging region, because that is the frame a [`ResponsePointerV0`] is
+/// interpreted in.
+pub trait ConditionBlock {
+    /// Conditions the block holds. Slots are addressed by index, so this
+    /// is fixed per account type.
+    const NUM_CONDITIONS: usize;
+    /// Account-data offset of the staging region.
+    const STAGING_OFFSET: u32;
+    /// Index, within the resolver's own account list, of the account the
+    /// staged payload is written to. Almost always 0 — resolvers put their
+    /// conditions account first by convention.
+    const STAGING_ACCOUNT_INDEX: u8 = 0;
+
+    fn block(&self) -> &[u8];
+    fn block_mut(&mut self) -> &mut [u8];
+    fn staging_mut(&mut self) -> &mut [u8];
+
+    /// Stamp the spec header. Conditions are written separately, by index,
+    /// so a freshly zeroed account is a valid (inactive) block from the
+    /// first write.
+    fn init_header(&mut self) -> Result<(), SpecError> {
+        let header = ConditionBlockHeaderV0::new(Self::NUM_CONDITIONS as u8);
+        let block = self.block_mut();
+        if block.len() < BLOCK_HEADER_LEN {
+            return Err(SpecError::Truncated);
+        }
+        block[..BLOCK_HEADER_LEN].copy_from_slice(bytemuck::bytes_of(&header));
+        Ok(())
+    }
+
+    /// Overwrite one condition slot.
+    fn write_condition(&mut self, index: usize, condition: &ConditionV0) -> Result<(), SpecError> {
+        let start = Self::slot_start(index)?;
+        let block = self.block_mut();
+        if start + CONDITION_LEN > block.len() {
+            return Err(SpecError::Truncated);
+        }
+        block[start..start + CONDITION_LEN].copy_from_slice(bytemuck::bytes_of(condition));
+        Ok(())
+    }
+
+    /// Read one condition slot back (copying — the region may be
+    /// unaligned in an account's data).
+    fn read_condition(&self, index: usize) -> Result<ConditionV0, SpecError> {
+        let start = Self::slot_start(index)?;
+        let block = self.block();
+        if start + CONDITION_LEN > block.len() {
+            return Err(SpecError::Truncated);
+        }
+        let mut condition = ConditionV0::zeroed();
+        bytemuck::bytes_of_mut(&mut condition)
+            .copy_from_slice(&block[start..start + CONDITION_LEN]);
+        Ok(condition)
+    }
+
+    /// Zero a slot — the way work that is done goes quiet. A
+    /// level-triggered wake (see [`WakeKind::OnValueCross`]) that is left
+    /// active after its work is finished keeps waking turners, so
+    /// releasing the slot is part of the executor's job, not an
+    /// optimization.
+    fn deactivate_condition(&mut self, index: usize) -> Result<(), SpecError> {
+        let start = Self::slot_start(index)?;
+        let block = self.block_mut();
+        if start + CONDITION_LEN > block.len() {
+            return Err(SpecError::Truncated);
+        }
+        block[start..start + CONDITION_LEN].fill(0);
+        Ok(())
+    }
+
+    /// Mutate one slot's wake inputs in place (the min-fold/repair
+    /// pattern): read, apply, write back.
+    fn update_condition(
+        &mut self,
+        index: usize,
+        f: impl FnOnce(&mut ConditionV0),
+    ) -> Result<(), SpecError> {
+        let mut condition = self.read_condition(index)?;
+        f(&mut condition);
+        self.write_condition(index, &condition)
+    }
+
+    /// Write a resolver's payload into the staging region and return the
+    /// pointer bytes to set as return data.
+    fn stage(
+        &mut self,
+        resolved: &ResolvedCrankV0,
+    ) -> Result<[u8; RESPONSE_POINTER_LEN], SpecError> {
+        let len = resolved.write_into(self.staging_mut())?;
+        Ok(ResponsePointerV0::new(
+            Self::STAGING_ACCOUNT_INDEX,
+            Self::STAGING_OFFSET,
+            len as u32,
+        )
+        .to_bytes())
+    }
+
+    #[doc(hidden)]
+    fn slot_start(index: usize) -> Result<usize, SpecError> {
+        if index >= Self::NUM_CONDITIONS {
+            return Err(SpecError::TooLarge);
+        }
+        Ok(BLOCK_HEADER_LEN + index * CONDITION_LEN)
+    }
+}
+
 /// Copying reader for arbitrary (possibly unaligned) buffers — the
 /// off-chain path. 280 bytes copied per condition; negligible off-chain.
 pub fn read_conditions_unaligned(
@@ -1029,5 +1146,99 @@ mod tests {
         assert_eq!(&assert_paid[..8], &ASSERT_PAID_V0_DISCRIMINATOR);
         assert_eq!(&assert_paid[8..16], &50_000u64.to_le_bytes());
         assert_eq!(assert_paid[16], 3);
+    }
+}
+
+#[cfg(test)]
+mod condition_block_tests {
+    use super::*;
+
+    /// A minimal host: header+conditions region, then staging.
+    struct Host {
+        block: [u8; BLOCK_HEADER_LEN + 3 * CONDITION_LEN],
+        staging: [u8; 512],
+    }
+
+    impl ConditionBlock for Host {
+        const NUM_CONDITIONS: usize = 3;
+        const STAGING_OFFSET: u32 = (8 + BLOCK_HEADER_LEN + 3 * CONDITION_LEN) as u32;
+        fn block(&self) -> &[u8] {
+            &self.block
+        }
+        fn block_mut(&mut self) -> &mut [u8] {
+            &mut self.block
+        }
+        fn staging_mut(&mut self) -> &mut [u8] {
+            &mut self.staging
+        }
+    }
+
+    fn host() -> Host {
+        Host {
+            block: [0; BLOCK_HEADER_LEN + 3 * CONDITION_LEN],
+            staging: [0; 512],
+        }
+    }
+
+    fn spec() -> CrankSpecV0 {
+        CrankSpecV0 {
+            resolver_program: [1; 32],
+            resolver_disc: [2; 8],
+            executor_program: [1; 32],
+            executor_disc: [3; 8],
+            min_payment: 7,
+        }
+    }
+
+    #[test]
+    fn provided_methods_round_trip_through_the_readers() {
+        let mut host = host();
+        host.init_header().unwrap();
+        host.write_condition(1, &ConditionV0::every_slots(42, spec(), &[]))
+            .unwrap();
+
+        // The canonical reader accepts what the trait wrote.
+        let (header, conditions) = read_block(host.block(), 0).unwrap();
+        assert_eq!(header.num_conditions, 3);
+        assert_eq!(conditions[1].wake_slot, 42);
+        assert_eq!(conditions[0].active, 0);
+        assert_eq!(host.read_condition(1).unwrap().wake_slot, 42);
+
+        // In-place wake updates (the min-fold/repair pattern).
+        host.update_condition(1, |c| c.wake_slot = 9).unwrap();
+        assert_eq!(host.read_condition(1).unwrap().wake_slot, 9);
+
+        // Deactivation is what makes a level-triggered wake go quiet.
+        host.write_condition(
+            2,
+            &ConditionV0::on_value_cross([5; 32], 8, 8, 100, 0, spec(), &[]),
+        )
+        .unwrap();
+        assert_eq!(host.read_condition(2).unwrap().active, 1);
+        host.deactivate_condition(2).unwrap();
+        assert_eq!(host.read_condition(2).unwrap().active, 0);
+
+        // Out-of-range slots are rejected, not silently wrapped.
+        assert!(host
+            .write_condition(3, &ConditionV0::every_slots(1, spec(), &[]))
+            .is_err());
+        assert!(host.read_condition(3).is_err());
+    }
+
+    #[test]
+    fn staging_returns_a_pointer_the_turner_can_follow() {
+        let mut host = host();
+        let resolved = ResolvedCrankV0 {
+            accounts: vec![AccountRefV0::writable([9; 32])],
+            data: vec![1, 2, 3],
+        };
+        let pointer_bytes = host.stage(&resolved).unwrap();
+        let pointer = ResponsePointerV0::read(&pointer_bytes).unwrap();
+        assert!(pointer.has_work());
+        assert_eq!(pointer.offset(), Host::STAGING_OFFSET);
+        assert_eq!(
+            ResolvedCrankV0::read(&host.staging[..pointer.len() as usize]).unwrap(),
+            resolved
+        );
     }
 }
