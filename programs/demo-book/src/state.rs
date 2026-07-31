@@ -75,7 +75,7 @@ pub struct BookV0 {
     pub staging: [u8; STAGING_BYTES],
 }
 
-const_assert_eq!(core::mem::size_of::<BookV0>(), 6360);
+const_assert_eq!(core::mem::size_of::<BookV0>(), 2808);
 
 /// Account-data offset of the condition block (what to register the watch
 /// at). 8-aligned, as the zero-copy read path requires.

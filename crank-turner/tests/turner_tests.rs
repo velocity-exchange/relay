@@ -42,13 +42,13 @@ const DEMO_SO: &str = concat!(
 );
 
 // Mirrors of demo-book layout constants, hand-pinned (see module docs).
-const BOOK_ACCOUNT_LEN: usize = 6368;
+const BOOK_ACCOUNT_LEN: usize = 2816;
 const CONDITIONS_OFFSET: u32 = 912;
 /// demo-book's sweep condition — the timestamp-waked one.
 const SWEEP: u8 = 0;
 const ENTRY_COUNT_OFFSET: usize = 72;
 const NEXT_EXPIRY_OFFSET: usize = 64;
-const STAGING_OFFSET: usize = 5344;
+const STAGING_OFFSET: usize = 1792;
 
 const PAYMENT: u64 = 50_000;
 const TREASURY: u64 = 1_000_000;
@@ -2676,4 +2676,166 @@ async fn explain_reports_a_missing_safe_payout() {
         "{:?}",
         explanation.verdict
     );
+}
+
+// --- on-value-cross wakes ---
+
+/// A value-threshold wake is level-triggered on the watched bytes read as
+/// a signed LE integer: not due while the value sits short of the
+/// threshold — no resolver simulation, which is the whole point for
+/// price-like watches — and due (work fires) once it crosses.
+#[tokio::test]
+async fn on_value_cross_fires_only_past_the_threshold() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    h.refresh().await;
+    let t0 = h.t0;
+    h.add_entry(t0 - 10); // work exists whenever the wake fires
+
+    // Watch an oracle-like account: an i64 price at offset 8.
+    let oracle = Pubkey::new_unique();
+    let write_price = |h: &Harness, price: i64| {
+        let mut data = vec![0u8; 16];
+        data[8..16].copy_from_slice(&price.to_le_bytes());
+        let mut svm = h.svm.lock().unwrap();
+        svm.set_account(
+            oracle,
+            Account {
+                lamports: 1_000_000,
+                data,
+                owner: Pubkey::default(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    };
+    write_price(&h, 95);
+
+    let mut conditions = h.conditions();
+    conditions[0].wake_kind = spec::WakeKind::OnValueCross as u8;
+    conditions[0].wake_account = oracle.to_bytes();
+    conditions[0].wake_offset = 8;
+    conditions[0].wake_len = 8;
+    conditions[0].wake_ts = 100; // threshold
+    conditions[0].wake_cmp = 0; // due when value >= 100
+    h.write_conditions(&conditions);
+    assert_eq!(
+        h.conditions()[0].wake(),
+        Ok(spec::WakeView::OnValueCross {
+            address: oracle.to_bytes(),
+            offset: 8,
+            len: 8,
+            threshold: 100,
+            cmp: 0,
+        })
+    );
+
+    // Below the threshold: not due, despite work being available.
+    let outcomes = h.tick().await;
+    assert!(sent(&outcomes).is_empty(), "{outcomes:?}");
+    assert!(
+        outcomes
+            .iter()
+            .any(|o| matches!(o, Outcome::Skipped((_, _, 0), SkipReason::NotDue))),
+        "{outcomes:?}"
+    );
+
+    // Still below after a move that changed the bytes (an OnAccountChange
+    // would have fired here — the value wake must not).
+    write_price(&h, 99);
+    let outcomes = h.tick().await;
+    assert!(sent(&outcomes).is_empty(), "{outcomes:?}");
+
+    // Crossed: fires.
+    write_price(&h, 100);
+    let outcomes = h.tick().await;
+    assert_eq!(sent(&outcomes).len(), 1, "{outcomes:?}");
+    assert_eq!(h.entry_count(), 0);
+}
+
+/// The `<=` comparator: due when the value drops to or below the
+/// threshold (a stop-loss shaped watch).
+#[tokio::test]
+async fn on_value_cross_below_comparator() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    h.refresh().await;
+    let t0 = h.t0;
+    h.add_entry(t0 - 10);
+
+    let oracle = Pubkey::new_unique();
+    let write_price = |h: &Harness, price: i64| {
+        let mut data = vec![0u8; 16];
+        data[8..16].copy_from_slice(&price.to_le_bytes());
+        let mut svm = h.svm.lock().unwrap();
+        svm.set_account(
+            oracle,
+            Account {
+                lamports: 1_000_000,
+                data,
+                owner: Pubkey::default(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    };
+    write_price(&h, -5);
+
+    let mut conditions = h.conditions();
+    conditions[0].wake_kind = spec::WakeKind::OnValueCross as u8;
+    conditions[0].wake_account = oracle.to_bytes();
+    conditions[0].wake_offset = 8;
+    conditions[0].wake_len = 8;
+    conditions[0].wake_ts = -10; // negative threshold: signed compare
+    conditions[0].wake_cmp = 1; // due when value <= -10
+    h.write_conditions(&conditions);
+
+    let outcomes = h.tick().await;
+    assert!(sent(&outcomes).is_empty(), "{outcomes:?}");
+
+    write_price(&h, -10);
+    let outcomes = h.tick().await;
+    assert_eq!(sent(&outcomes).len(), 1, "{outcomes:?}");
+}
+
+/// An indirect resolver account list — `resolver_list_offset` pointing at
+/// `AccountRefV0`s stored next to the block on the same account — resolves
+/// and cranks exactly like the inline list it replaces.
+#[tokio::test]
+async fn indirect_resolver_list_is_read_from_the_block_account() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    h.refresh().await;
+    let t0 = h.t0;
+    h.add_entry(t0 - 10);
+
+    // Store the sweep resolver's one-account list ([book, writable]) in
+    // the staging region (scratch space on the same account) and point the
+    // condition at it.
+    let mut conditions = h.conditions();
+    let inline = conditions[0].resolver_accounts().to_vec();
+    assert_eq!(inline.len(), 1);
+    {
+        let mut svm = h.svm.lock().unwrap();
+        let mut account = svm.get_account(&h.book).unwrap();
+        let refs: Vec<u8> = inline
+            .iter()
+            .flat_map(|r| {
+                let mut bytes = r.address.to_vec();
+                bytes.push(r.writable);
+                bytes
+            })
+            .collect();
+        account.data[STAGING_OFFSET..STAGING_OFFSET + refs.len()].copy_from_slice(&refs);
+        svm.set_account(h.book, account).unwrap();
+    }
+    conditions[0].set_indirect_resolver_accounts(STAGING_OFFSET as u32, 1);
+    // Poison the inline slots: the turner must not fall back to them.
+    conditions[0].resolver_accounts =
+        [spec::AccountRefV0::readonly([0xEE; 32]); spec::MAX_RESOLVER_ACCOUNTS];
+    h.write_conditions(&conditions);
+
+    h.warp(t0, 10);
+    let outcomes = h.tick().await;
+    assert_eq!(sent(&outcomes).len(), 1, "{outcomes:?}");
+    assert_eq!(h.entry_count(), 0);
 }

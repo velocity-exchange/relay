@@ -61,6 +61,35 @@ pub fn wake_detail(
             ),
             remaining: None,
         },
+        Ok(relay_spec::WakeView::OnValueCross {
+            address,
+            offset,
+            len,
+            threshold,
+            cmp,
+        }) => {
+            let value = watched_now.and_then(relay_spec::read_watched_value);
+            WakeDetail {
+                kind: "on-value-cross",
+                waiting_for: format!(
+                    "{}[{offset}..{}] {} {threshold}",
+                    Pubkey::from(address),
+                    offset as u64 + len as u64,
+                    if cmp == 0 { ">=" } else { "<=" },
+                ),
+                chain_reads: value.map_or_else(
+                    || "unreadable".to_string(),
+                    |value| format!("value {value}"),
+                ),
+                remaining: value.map(|value| {
+                    if cmp == 0 {
+                        threshold as i128 - value as i128
+                    } else {
+                        value as i128 - threshold as i128
+                    }
+                }),
+            }
+        }
         Err(_) => WakeDetail {
             kind: "unknown",
             waiting_for: format!("wake kind {}", condition.wake_kind),

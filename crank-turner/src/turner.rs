@@ -362,6 +362,12 @@ impl<S: ChainSource> Turner<S> {
                 address,
                 offset,
                 len,
+            })
+            | Ok(spec::WakeView::OnValueCross {
+                address,
+                offset,
+                len,
+                ..
             }) => {
                 let watched = Pubkey::from(address);
                 let data = if watched == target {
@@ -377,7 +383,16 @@ impl<S: ChainSource> Turner<S> {
             _ => None,
         };
 
-        let verdict = match self.decide(key, &watch, &condition, &clock, watched_now.clone()) {
+        let resolver_accounts = materialize_resolver_accounts(&condition, &account.data)
+            .ok_or_else(|| anyhow::anyhow!("condition's indirect resolver list is unreadable"))?;
+        let verdict = match self.decide(
+            key,
+            &watch,
+            &condition,
+            &clock,
+            watched_now.clone(),
+            resolver_accounts,
+        ) {
             Err(Outcome::Skipped(_, reason)) => Verdict::Skipped(reason),
             Err(other) => Verdict::Failed {
                 stage: Stage::ResolveSim,
@@ -587,7 +602,8 @@ impl<S: ChainSource> Turner<S> {
             .filter_map(|(_, conditions)| conditions.as_ref())
             .flat_map(|conditions| conditions.iter())
             .filter_map(|c| match c.wake() {
-                Ok(spec::WakeView::OnAccountChange { address, .. }) => {
+                Ok(spec::WakeView::OnAccountChange { address, .. })
+                | Ok(spec::WakeView::OnValueCross { address, .. }) => {
                     let pk = Pubkey::from(address);
                     (!target_accounts.contains_key(&pk)).then_some(pk)
                 }
@@ -624,6 +640,12 @@ impl<S: ChainSource> Turner<S> {
                         address,
                         offset,
                         len,
+                    })
+                    | Ok(spec::WakeView::OnValueCross {
+                        address,
+                        offset,
+                        len,
+                        ..
                     }) => Some(
                         account_of(&Pubkey::from(address))
                             .map(|acc| slice_or_empty(&acc.data, offset, len))
@@ -635,7 +657,24 @@ impl<S: ChainSource> Turner<S> {
                 metrics::EVALUATIONS
                     .with_label_values(&[wake_label(condition), &program_label])
                     .inc();
-                match self.decide(key, watch, condition, &clock, watched_now) {
+                let Some(resolver_accounts) = target_accounts
+                    .get(&watch.target)
+                    .and_then(|acc| materialize_resolver_accounts(condition, &acc.data))
+                else {
+                    metrics::SKIPS
+                        .with_label_values(&[skip_label(&SkipReason::ParseFailed), &program_label])
+                        .inc();
+                    outcomes.push(Outcome::Skipped(key, SkipReason::ParseFailed));
+                    continue;
+                };
+                match self.decide(
+                    key,
+                    watch,
+                    condition,
+                    &clock,
+                    watched_now,
+                    resolver_accounts,
+                ) {
                     Ok(ready) => due.push(ready),
                     Err(outcome) => {
                         if let Outcome::Skipped(_, reason) = &outcome {
@@ -735,6 +774,7 @@ impl<S: ChainSource> Turner<S> {
         condition: &spec::ConditionV0,
         clock: &ClockSnapshot,
         watched_now: Option<Vec<u8>>,
+        resolver_accounts: Vec<spec::AccountRefV0>,
     ) -> Result<Due, Outcome> {
         if !condition.is_active() {
             return Err(Outcome::Skipped(key, SkipReason::Inactive));
@@ -766,6 +806,10 @@ impl<S: ChainSource> Turner<S> {
             spec::WakeView::OnAccountChange { .. } => {
                 state.last_seen.as_deref() != watched_now.as_deref()
             }
+            spec::WakeView::OnValueCross { threshold, cmp, .. } => watched_now
+                .as_deref()
+                .and_then(spec::read_watched_value)
+                .is_some_and(|value| spec::value_crossed(value, threshold, cmp)),
         };
         if !due {
             return Err(Outcome::Skipped(key, SkipReason::NotDue));
@@ -808,6 +852,7 @@ impl<S: ChainSource> Turner<S> {
             program: watch.target_program,
             condition: *condition,
             watched_now,
+            resolver_accounts,
         })
     }
 
@@ -911,18 +956,14 @@ impl<S: ChainSource> Turner<S> {
 
         // Simulate the resolver, asking for its accounts back so the staged
         // payload can be read out of post-execution state.
-        let resolver_accounts: Vec<Pubkey> = condition
-            .resolver_accounts()
+        let resolver_accounts: Vec<Pubkey> = due
+            .resolver_accounts
             .iter()
             .map(|a| Pubkey::from(a.address))
             .collect();
         let resolver_ix = Instruction {
             program_id: Pubkey::from(condition.resolver_program),
-            accounts: condition
-                .resolver_accounts()
-                .iter()
-                .map(account_ref_meta)
-                .collect(),
+            accounts: due.resolver_accounts.iter().map(account_ref_meta).collect(),
             data: condition.resolver_disc.to_vec(),
         };
         let program_label = metrics::program_label(&Pubkey::from(condition.resolver_program));
@@ -1563,6 +1604,40 @@ struct Due {
     program: Pubkey,
     condition: spec::ConditionV0,
     watched_now: Option<Vec<u8>>,
+    /// The resolver's account list, materialized at decide time — inline
+    /// refs copied out, or an indirect list read from the block's own
+    /// account (`resolver_list_offset`), so downstream stages never need
+    /// the account bytes again.
+    resolver_accounts: Vec<spec::AccountRefV0>,
+}
+
+/// Materialize a condition's resolver account list: the inline slots, or —
+/// when `resolver_list_offset` is set — `num_resolver_accounts` refs read
+/// from the block account's data at that offset. `None` when the indirect
+/// region is unreadable (out of bounds / count over the cap).
+fn materialize_resolver_accounts(
+    condition: &spec::ConditionV0,
+    block_account_data: &[u8],
+) -> Option<Vec<spec::AccountRefV0>> {
+    if condition.resolver_list_offset == 0 {
+        return Some(condition.resolver_accounts().to_vec());
+    }
+    let count = condition.num_resolver_accounts as usize;
+    if count > spec::MAX_INDIRECT_RESOLVER_ACCOUNTS {
+        return None;
+    }
+    let start = condition.resolver_list_offset as usize;
+    let end = start.checked_add(count.checked_mul(spec::ACCOUNT_REF_LEN)?)?;
+    let region = block_account_data.get(start..end)?;
+    Some(
+        region
+            .chunks_exact(spec::ACCOUNT_REF_LEN)
+            .map(|chunk| spec::AccountRefV0 {
+                address: chunk[..32].try_into().unwrap(),
+                writable: chunk[32],
+            })
+            .collect(),
+    )
 }
 
 /// Stable metric label for a skip reason. Spelled out rather than derived
@@ -1588,6 +1663,7 @@ fn wake_label(condition: &spec::ConditionV0) -> &'static str {
         Ok(spec::WakeView::AtSlot { .. }) => "at_slot",
         Ok(spec::WakeView::EverySlots { .. }) => "every_slots",
         Ok(spec::WakeView::OnAccountChange { .. }) => "on_account_change",
+        Ok(spec::WakeView::OnValueCross { .. }) => "on_value_cross",
         Err(_) => "unknown",
     }
 }

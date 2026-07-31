@@ -58,15 +58,17 @@ pub const SPEC_VERSION: u8 = 0;
 /// replaces with its keeper (payment recipient) before submitting.
 pub const KEEPER_PLACEHOLDER: [u8; 32] = *b"relay/keeper/placeholder\0\0\0\0\0\0\0\0";
 
-/// Fixed slots for a resolver's account list. A resolver's primary job is
-/// to *output* the executor's accounts, but discovering some work takes
-/// real inputs: a resolver that prices an external quoter generically has
-/// to CPI its registered `quote_v0` surface under simulation, which means
-/// carrying that surface — the registry entry, its declared account list
-/// (up to 32 in velocity's registry), and the quoter program — in its own
-/// account list. Sized for that: a handful of named accounts plus a full
-/// registered CPI surface.
-pub const MAX_RESOLVER_ACCOUNTS: usize = 40;
+/// Fixed inline slots for a resolver's account list — sized for the common
+/// resolver (the conditions account, a couple of state inputs). A resolver
+/// needing more (e.g. one that CPIs an external quoter's registered
+/// `quote_v0` surface under simulation) stores its list *next to the
+/// condition block* on the same account and points at it with
+/// `resolver_list_offset` — one copy per account instead of a fat inline
+/// array per condition, read fresh by the turner on every attempt.
+pub const MAX_RESOLVER_ACCOUNTS: usize = 4;
+
+/// Ceiling on an indirect resolver account list (`resolver_list_offset`).
+pub const MAX_INDIRECT_RESOLVER_ACCOUNTS: usize = 64;
 
 /// Anchor instruction discriminators of relay's payment guards. Pinned
 /// here so turners don't need a hash dependency; the program's test suite
@@ -210,6 +212,22 @@ pub enum WakeKind {
     /// place the same way — for deadlines a program tracks in slots
     /// (activation delays, auction ends) rather than wall time.
     AtSlot = 3,
+    /// Due while the watched value sits at-or-beyond a threshold: the
+    /// bytes at `wake_account.data[wake_offset..wake_offset + wake_len]`
+    /// read as a little-endian signed integer (widths 1/2/4/8,
+    /// sign-extended), compared against `wake_ts` reinterpreted as the
+    /// threshold, in the direction `wake_cmp` selects (0 = due when
+    /// value >= threshold, 1 = due when value <= threshold).
+    ///
+    /// This is the wake for price-like conditions — trigger orders,
+    /// liquidation thresholds — where `OnAccountChange` would wake on
+    /// every oracle tick and burn a resolver simulation per condition per
+    /// tick even when the price is nowhere near. Level-triggered: the
+    /// condition stays due while the value is beyond the threshold, so the
+    /// program must deactivate or re-point the condition once the work is
+    /// done (and the turner's no-work backoff bounds the cost of a due
+    /// condition whose resolver finds nothing).
+    OnValueCross = 4,
 }
 
 /// Copied, alloc-free view of a condition's wake for evaluation.
@@ -229,6 +247,35 @@ pub enum WakeView {
     AtSlot {
         slot: u64,
     },
+    OnValueCross {
+        address: [u8; 32],
+        offset: u32,
+        len: u32,
+        threshold: i64,
+        /// 0 = due when value >= threshold, 1 = due when value <= threshold.
+        cmp: u8,
+    },
+}
+
+/// Read a watched region as the signed little-endian integer
+/// [`WakeKind::OnValueCross`] compares (widths 1/2/4/8, sign-extended).
+/// `None` for any other width — an unreadable value is never due.
+pub fn read_watched_value(bytes: &[u8]) -> Option<i64> {
+    match bytes.len() {
+        1 => Some(i8::from_le_bytes(bytes.try_into().ok()?) as i64),
+        2 => Some(i16::from_le_bytes(bytes.try_into().ok()?) as i64),
+        4 => Some(i32::from_le_bytes(bytes.try_into().ok()?) as i64),
+        8 => Some(i64::from_le_bytes(bytes.try_into().ok()?)),
+        _ => None,
+    }
+}
+
+/// Whether an [`WakeKind::OnValueCross`] condition is due for `value`.
+pub fn value_crossed(value: i64, threshold: i64, cmp: u8) -> bool {
+    match cmp {
+        0 => value >= threshold,
+        _ => value <= threshold,
+    }
 }
 
 /// Everything about a condition except its wake — the arguments shared by
@@ -281,11 +328,20 @@ pub struct ConditionV0 {
     pub wake_kind: u8,
     /// 0 = inactive (skipped by turners, rejected by `crank_v0`).
     pub active: u8,
-    pub _pad: [u8; 5],
+    /// [`WakeKind::OnValueCross`] comparator: 0 = due when value >=
+    /// threshold (`wake_ts`), 1 = due when value <= threshold.
+    pub wake_cmp: u8,
+    /// 0 = the inline `resolver_accounts` are the list. Nonzero = the list
+    /// is `num_resolver_accounts` [`AccountRefV0`]s read from *this
+    /// condition block's own account* at this data offset — for resolvers
+    /// whose account list outgrows the inline slots (stored once per
+    /// account, next to the block, instead of inflating every condition).
+    pub resolver_list_offset: u32,
+    pub _pad: [u8; 4],
 }
 
 pub const CONDITION_LEN: usize = core::mem::size_of::<ConditionV0>();
-const _: () = assert!(CONDITION_LEN == 1472);
+const _: () = assert!(CONDITION_LEN == 288);
 const _: () = assert!(core::mem::align_of::<ConditionV0>() == 8);
 
 impl ConditionV0 {
@@ -307,7 +363,9 @@ impl ConditionV0 {
             num_resolver_accounts: resolver_accounts.len() as u8,
             wake_kind: 0,
             active: 1,
-            _pad: [0; 5],
+            wake_cmp: 0,
+            resolver_list_offset: 0,
+            _pad: [0; 4],
         }
     }
 
@@ -334,6 +392,29 @@ impl ConditionV0 {
         c.wake_account = watched;
         c.wake_offset = offset;
         c.wake_len = len;
+        c
+    }
+
+    /// Level-triggered value threshold (see [`WakeKind::OnValueCross`]):
+    /// due while the watched value is at-or-beyond `threshold` in the
+    /// direction `cmp` selects (0 = >=, 1 = <=).
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_value_cross(
+        watched: [u8; 32],
+        offset: u32,
+        len: u32,
+        threshold: i64,
+        cmp: u8,
+        spec: CrankSpecV0,
+        resolver_accounts: &[AccountRefV0],
+    ) -> Self {
+        let mut c = Self::base(spec, resolver_accounts);
+        c.wake_kind = WakeKind::OnValueCross as u8;
+        c.wake_account = watched;
+        c.wake_offset = offset;
+        c.wake_len = len;
+        c.wake_ts = threshold;
+        c.wake_cmp = cmp;
         c
     }
 
@@ -371,8 +452,22 @@ impl ConditionV0 {
             3 => Ok(WakeView::AtSlot {
                 slot: self.wake_slot,
             }),
+            4 => Ok(WakeView::OnValueCross {
+                address: self.wake_account,
+                offset: self.wake_offset,
+                len: self.wake_len,
+                threshold: self.wake_ts,
+                cmp: self.wake_cmp,
+            }),
             _ => Err(SpecError::BadWakeKind),
         }
+    }
+
+    /// Point the condition's resolver account list at an indirect region on
+    /// the block's own account: `count` [`AccountRefV0`]s at `offset`.
+    pub fn set_indirect_resolver_accounts(&mut self, offset: u32, count: u8) {
+        self.resolver_list_offset = offset;
+        self.num_resolver_accounts = count;
     }
 
     pub fn resolver_accounts(&self) -> &[AccountRefV0] {
@@ -697,11 +792,11 @@ mod tests {
 
     #[test]
     fn layout_is_pinned() {
-        assert_eq!(CONDITION_LEN, 280);
+        assert_eq!(CONDITION_LEN, 288);
         assert_eq!(BLOCK_HEADER_LEN, 16);
         assert_eq!(ACCOUNT_REF_LEN, 33);
         assert_eq!(RESPONSE_POINTER_LEN, 10);
-        assert_eq!(block_space(2), 576);
+        assert_eq!(block_space(2), 592);
     }
 
     #[test]
