@@ -40,7 +40,7 @@ const FAUCET_PORT: u16 = 9900;
 
 // Layout mirrors, hand-pinned like the other turner tests so this suite
 // doubles as an ABI check on demo-book.
-const BOOK_ACCOUNT_LEN: usize = 2792;
+const BOOK_ACCOUNT_LEN: usize = 6368;
 const CONDITIONS_OFFSET: u32 = 912;
 const ENTRY_COUNT_OFFSET: usize = 72;
 const LIVE_OFFSET: usize = 848;

@@ -42,13 +42,13 @@ const DEMO_SO: &str = concat!(
 );
 
 // Mirrors of demo-book layout constants, hand-pinned (see module docs).
-const BOOK_ACCOUNT_LEN: usize = 2792;
+const BOOK_ACCOUNT_LEN: usize = 6368;
 const CONDITIONS_OFFSET: u32 = 912;
 /// demo-book's sweep condition — the timestamp-waked one.
 const SWEEP: u8 = 0;
 const ENTRY_COUNT_OFFSET: usize = 72;
 const NEXT_EXPIRY_OFFSET: usize = 64;
-const STAGING_OFFSET: usize = 1768;
+const STAGING_OFFSET: usize = 5344;
 
 const PAYMENT: u64 = 50_000;
 const TREASURY: u64 = 1_000_000;

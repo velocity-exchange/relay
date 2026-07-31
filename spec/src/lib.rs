@@ -58,11 +58,15 @@ pub const SPEC_VERSION: u8 = 0;
 /// replaces with its keeper (payment recipient) before submitting.
 pub const KEEPER_PLACEHOLDER: [u8; 32] = *b"relay/keeper/placeholder\0\0\0\0\0\0\0\0";
 
-/// Fixed slots for a resolver's account list. A resolver reads the
-/// condition account and stages its payload there (or in a sibling
-/// scratch account) — its job is to *output* the executor's accounts, not
-/// to take many itself.
-pub const MAX_RESOLVER_ACCOUNTS: usize = 4;
+/// Fixed slots for a resolver's account list. A resolver's primary job is
+/// to *output* the executor's accounts, but discovering some work takes
+/// real inputs: a resolver that prices an external quoter generically has
+/// to CPI its registered `quote_v0` surface under simulation, which means
+/// carrying that surface — the registry entry, its declared account list
+/// (up to 32 in velocity's registry), and the quoter program — in its own
+/// account list. Sized for that: a handful of named accounts plus a full
+/// registered CPI surface.
+pub const MAX_RESOLVER_ACCOUNTS: usize = 40;
 
 /// Anchor instruction discriminators of relay's payment guards. Pinned
 /// here so turners don't need a hash dependency; the program's test suite
@@ -277,11 +281,11 @@ pub struct ConditionV0 {
     pub wake_kind: u8,
     /// 0 = inactive (skipped by turners, rejected by `crank_v0`).
     pub active: u8,
-    pub _pad: [u8; 1],
+    pub _pad: [u8; 5],
 }
 
 pub const CONDITION_LEN: usize = core::mem::size_of::<ConditionV0>();
-const _: () = assert!(CONDITION_LEN == 280);
+const _: () = assert!(CONDITION_LEN == 1472);
 const _: () = assert!(core::mem::align_of::<ConditionV0>() == 8);
 
 impl ConditionV0 {
@@ -303,7 +307,7 @@ impl ConditionV0 {
             num_resolver_accounts: resolver_accounts.len() as u8,
             wake_kind: 0,
             active: 1,
-            _pad: [0],
+            _pad: [0; 5],
         }
     }
 

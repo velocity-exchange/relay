@@ -75,7 +75,7 @@ pub struct BookV0 {
     pub staging: [u8; STAGING_BYTES],
 }
 
-const_assert_eq!(core::mem::size_of::<BookV0>(), 2784);
+const_assert_eq!(core::mem::size_of::<BookV0>(), 6360);
 
 /// Account-data offset of the condition block (what to register the watch
 /// at). 8-aligned, as the zero-copy read path requires.
@@ -227,39 +227,38 @@ impl BookV0 {
             min_payment: self.payment_per_crank,
         };
         self.cond_header = ConditionBlockHeaderV0::new(NUM_CONDITIONS as u8);
-        self.conditions = [
-            // SWEEP_CONDITION
-            ConditionV0::at_timestamp(
-                self.next_expiry_ts,
-                spec(
-                    crate::instruction::ResolveSweepV0::DISCRIMINATOR,
-                    crate::instruction::SweepV0::DISCRIMINATOR,
-                ),
-                &resolver_accounts,
+        // Element-by-element: a `[ConditionV0; 3]` literal materializes the
+        // whole 3 x 1.5KB array in the caller's stack frame, past the 4KB
+        // limit. One temporary at a time stays comfortably inside it.
+        self.conditions[SWEEP_CONDITION as usize] = ConditionV0::at_timestamp(
+            self.next_expiry_ts,
+            spec(
+                crate::instruction::ResolveSweepV0::DISCRIMINATOR,
+                crate::instruction::SweepV0::DISCRIMINATOR,
             ),
-            // EVICT_CONDITION
-            ConditionV0::on_account_change(
-                book,
-                ENTRY_COUNT_OFFSET as u32,
-                4,
-                spec(
-                    crate::instruction::ResolveEvictV0::DISCRIMINATOR,
-                    crate::instruction::EvictV0::DISCRIMINATOR,
-                ),
-                &resolver_accounts,
+            &resolver_accounts,
+        );
+        self.conditions[EVICT_CONDITION as usize] = ConditionV0::on_account_change(
+            book,
+            ENTRY_COUNT_OFFSET as u32,
+            4,
+            spec(
+                crate::instruction::ResolveEvictV0::DISCRIMINATOR,
+                crate::instruction::EvictV0::DISCRIMINATOR,
             ),
-            // CROSS_CONDITION: any change to the book at all.
-            ConditionV0::on_account_change(
-                book,
-                VERSION_OFFSET as u32,
-                8,
-                spec(
-                    crate::instruction::ResolveCrossV0::DISCRIMINATOR,
-                    crate::instruction::CrossV0::DISCRIMINATOR,
-                ),
-                &resolver_accounts,
+            &resolver_accounts,
+        );
+        // Cross: any change to the book at all.
+        self.conditions[CROSS_CONDITION as usize] = ConditionV0::on_account_change(
+            book,
+            VERSION_OFFSET as u32,
+            8,
+            spec(
+                crate::instruction::ResolveCrossV0::DISCRIMINATOR,
+                crate::instruction::CrossV0::DISCRIMINATOR,
             ),
-        ];
+            &resolver_accounts,
+        );
     }
 
     /// Executor account list shared by every resolver: keeper placeholder
