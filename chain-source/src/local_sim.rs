@@ -238,7 +238,13 @@ impl<Inner: ChainSource> LocalSimSource<Inner> {
             // only for upgrades, so we look it up lazily below).
             match self.programdata_elf(instance, account) {
                 Some(elf) => elf,
-                None => return,
+                None => {
+                    warn!(
+                        program = %program_id,
+                        "programdata not seeded; program will be uninvokable in local sim"
+                    );
+                    return;
+                }
             }
         } else if account.owner == *BPF_LOADER {
             account.data.clone()
@@ -367,20 +373,11 @@ impl<Inner: ChainSource> ChainSource for LocalSimSource<Inner> {
         tx: &Transaction,
         return_accounts: &[Pubkey],
     ) -> Result<SimOutcome> {
-        // Programs invoked by the transaction may need their programdata
-        // seeded before their ELF can be recovered.
-        let program_ids: Vec<Pubkey> = tx
-            .message
-            .instructions
-            .iter()
-            .filter_map(|ix| {
-                tx.message
-                    .account_keys
-                    .get(ix.program_id_index as usize)
-                    .copied()
-            })
-            .collect();
-        if let Err(err) = self.seed_programdata(&program_ids).await {
+        // Programs the transaction can reach may need their programdata
+        // seeded before their ELF can be recovered. That is every
+        // executable account in the key list, not just top-level program
+        // ids — a CPI target rides along as a plain account meta.
+        if let Err(err) = self.seed_programdata(&tx.message.account_keys).await {
             warn!(error = %format!("{err:#}"), "programdata seed failed; simulating anyway");
         }
         let outcome = self.simulate_locally(tx, return_accounts).await;
@@ -392,5 +389,148 @@ impl<Inner: ChainSource> ChainSource for LocalSimSource<Inner> {
 
     async fn send_transaction(&self, tx: &Transaction) -> Result<Signature> {
         self.inner.send_transaction(tx).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use solana_sdk::hash::Hash;
+    use solana_sdk::instruction::{AccountMeta, Instruction};
+    use solana_sdk::signature::{Keypair, Signer};
+
+    use super::*;
+    use crate::source::{
+        AccountFilter, BlockhashInfo, ClockSnapshot, SignatureOutcome, SimOutcome,
+    };
+
+    /// A fixed account map; everything else is unreachable in these tests.
+    struct MapSource(HashMap<Pubkey, Account>);
+
+    #[async_trait]
+    impl ChainSource for MapSource {
+        async fn get_multiple_accounts(&self, pubkeys: &[Pubkey]) -> Result<Vec<Option<Account>>> {
+            Ok(pubkeys.iter().map(|pk| self.0.get(pk).cloned()).collect())
+        }
+        async fn get_program_accounts(
+            &self,
+            _program: &Pubkey,
+            _filter_sets: &[Vec<AccountFilter>],
+        ) -> Result<Vec<(Pubkey, Account)>> {
+            unreachable!()
+        }
+        async fn clock(&self) -> Result<ClockSnapshot> {
+            Ok(ClockSnapshot {
+                slot: 1,
+                unix_timestamp: 1,
+            })
+        }
+        async fn latest_blockhash(&self) -> Result<BlockhashInfo> {
+            unreachable!()
+        }
+        async fn block_height(&self) -> Result<u64> {
+            unreachable!()
+        }
+        async fn signature_statuses(
+            &self,
+            _signatures: &[Signature],
+        ) -> Result<Vec<Option<SignatureOutcome>>> {
+            unreachable!()
+        }
+        async fn simulate_transaction(
+            &self,
+            _tx: &Transaction,
+            _return_accounts: &[Pubkey],
+        ) -> Result<SimOutcome> {
+            unreachable!("local sim must never fall through to the provider")
+        }
+        async fn send_transaction(&self, _tx: &Transaction) -> Result<Signature> {
+            unreachable!()
+        }
+        async fn recent_priority_fee(&self, _accounts: &[Pubkey]) -> Result<u64> {
+            unreachable!()
+        }
+    }
+
+    /// An upgradeable-loader (program, programdata) pair holding `elf`.
+    fn upgradeable_program(elf: &[u8]) -> (Account, Pubkey, Account) {
+        let programdata_key = Pubkey::new_unique();
+        let mut program_data = vec![2, 0, 0, 0];
+        program_data.extend_from_slice(programdata_key.as_ref());
+        let program = Account {
+            lamports: 1,
+            data: program_data,
+            owner: *BPF_LOADER_UPGRADEABLE,
+            executable: true,
+            rent_epoch: 0,
+        };
+        let mut pd_data = vec![0u8; PROGRAMDATA_ELF_OFFSET];
+        pd_data.extend_from_slice(elf);
+        let programdata = Account {
+            lamports: 1,
+            data: pd_data,
+            owner: *BPF_LOADER_UPGRADEABLE,
+            executable: false,
+            rent_epoch: 0,
+        };
+        (program, programdata_key, programdata)
+    }
+
+    /// An upgradeable program reachable only as a CPI target — an account
+    /// meta on some instruction, never a top-level program id — still gets
+    /// its programdata seeded and its ELF loaded. This is exactly the shape
+    /// of a staged executor that CPIs into a registered quoter program: the
+    /// old top-level-only seeding left the target uninvokable and every
+    /// executor simulation failing `UnsupportedProgramId`.
+    #[tokio::test]
+    async fn cpi_target_programs_get_their_programdata_seeded() {
+        let elf = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../programs/target/deploy/demo_book.so"
+        ))
+        .expect("demo_book.so missing — run scripts/build-programs.sh first");
+
+        let payer = Keypair::new();
+        let cpi_target = Pubkey::new_unique();
+        let (program, programdata_key, programdata) = upgradeable_program(&elf);
+        let mut accounts = HashMap::new();
+        accounts.insert(
+            payer.pubkey(),
+            Account {
+                lamports: 1_000_000_000,
+                ..Default::default()
+            },
+        );
+        accounts.insert(cpi_target, program);
+        accounts.insert(programdata_key, programdata);
+        let local = LocalSimSource::new(MapSource(accounts), LocalSimConfig::default());
+
+        // The target rides along as a plain meta, the way an executor's
+        // account list carries the program it will CPI. The instruction
+        // itself is a compute-budget builtin, which ignores its accounts —
+        // the point is only that `cpi_target` is never a top-level program.
+        let ix = Instruction {
+            program_id: "ComputeBudget111111111111111111111111111111"
+                .parse()
+                .unwrap(),
+            accounts: vec![AccountMeta::new_readonly(cpi_target, false)],
+            // SetComputeUnitLimit(1_000_000)
+            data: vec![2, 0x40, 0x42, 0x0F, 0x00],
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            Hash::default(),
+        );
+
+        let outcome = local.simulate_transaction(&tx, &[]).await.unwrap();
+        assert_eq!(outcome.err, None, "logs: {:?}", outcome.logs);
+        let instance = local.pool.lock().await.pop().expect("instance pooled");
+        assert!(
+            instance.programs.contains(&cpi_target),
+            "CPI-target ELF was not loaded into the local sim"
+        );
     }
 }
