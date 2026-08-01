@@ -11,7 +11,7 @@ use relay_crank_turner::{
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::EncodableKey;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 fn submitter_config(args: &Args) -> SubmitterConfig {
     SubmitterConfig {
@@ -342,11 +342,24 @@ async fn run<S: ChainSource>(mut turner: Turner<S>, args: &Args) -> Result<()> {
         }
         if ticks.is_multiple_of(args.refresh_ticks) {
             match turner.refresh_watches().await {
-                Ok(summary) => info!(
-                    watches = summary.admitted,
-                    filtered_out = summary.rejected.len(),
-                    "registry refreshed"
-                ),
+                Ok(summary) => {
+                    info!(
+                        watches = summary.admitted,
+                        filtered_out = summary.rejected.len(),
+                        "registry refreshed"
+                    );
+                    // A dropped watch is invisible work: the target looks
+                    // registered on chain and simply never cranks. Say which
+                    // one and why, or operating this is guesswork.
+                    for (watch, reason) in &summary.rejected {
+                        debug!(
+                            target = %watch.target,
+                            offset = watch.offset,
+                            ?reason,
+                            "watch filtered out"
+                        );
+                    }
+                }
                 Err(e) => warn!(error = %format!("{e:#}"), "registry refresh failed"),
             }
         }

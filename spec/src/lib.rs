@@ -65,7 +65,19 @@ pub const KEEPER_PLACEHOLDER: [u8; 32] = *b"relay/keeper/placeholder\0\0\0\0\0\0
 /// condition block* on the same account and points at it with
 /// `resolver_list_offset` — one copy per account instead of a fat inline
 /// array per condition, read fresh by the turner on every attempt.
-pub const MAX_RESOLVER_ACCOUNTS: usize = 4;
+/// Where a condition's resolver account list lives: `count`
+/// [`AccountRefV0`]s at `offset` bytes into the account holding the block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolverListV0 {
+    pub offset: u32,
+    pub count: u8,
+}
+
+impl ResolverListV0 {
+    pub fn new(offset: u32, count: u8) -> Self {
+        Self { offset, count }
+    }
+}
 
 /// Ceiling on an indirect resolver account list (`resolver_list_offset`).
 pub const MAX_INDIRECT_RESOLVER_ACCOUNTS: usize = 64;
@@ -319,10 +331,8 @@ pub struct ConditionV0 {
     /// and trailing args come from the resolver's staged payload.
     pub executor_program: [u8; 32],
     pub executor_disc: [u8; 8],
-    /// The resolver's own (fixed) account list; first
-    /// `num_resolver_accounts` entries are live. The staging account must
-    /// be among them and marked writable.
-    pub resolver_accounts: [AccountRefV0; MAX_RESOLVER_ACCOUNTS],
+    /// How many [`AccountRefV0`]s make up the resolver's account list. The
+    /// list itself lives at `resolver_list_offset`; see there.
     pub num_resolver_accounts: u8,
     /// A [`WakeKind`] value.
     pub wake_kind: u8,
@@ -331,23 +341,30 @@ pub struct ConditionV0 {
     /// [`WakeKind::OnValueCross`] comparator: 0 = due when value >=
     /// threshold (`wake_ts`), 1 = due when value <= threshold.
     pub wake_cmp: u8,
-    /// 0 = the inline `resolver_accounts` are the list. Nonzero = the list
-    /// is `num_resolver_accounts` [`AccountRefV0`]s read from *this
-    /// condition block's own account* at this data offset — for resolvers
-    /// whose account list outgrows the inline slots (stored once per
-    /// account, next to the block, instead of inflating every condition).
+    /// Byte offset, within *this condition block's own account*, of the
+    /// `num_resolver_accounts` [`AccountRefV0`]s that form the resolver's
+    /// account list. The staging account must be among them and marked
+    /// writable.
+    ///
+    /// The list is always indirect. Conditions used to carry four inline
+    /// refs, which cost 132 of every condition's 288 bytes whether or not
+    /// they were used — and any resolver needing more than four had to
+    /// point somewhere anyway. One list per account, shared by every
+    /// condition that wants it, is both smaller and the only mechanism to
+    /// reason about.
     pub resolver_list_offset: u32,
-    pub _pad: [u8; 4],
+    /// Reserved. Zero on write, ignored on read — room to add fields
+    /// without moving every existing one or resizing every account that
+    /// holds a block.
+    pub _reserved: [u8; 40],
 }
 
 pub const CONDITION_LEN: usize = core::mem::size_of::<ConditionV0>();
-const _: () = assert!(CONDITION_LEN == 288);
+const _: () = assert!(CONDITION_LEN == 192);
 const _: () = assert!(core::mem::align_of::<ConditionV0>() == 8);
 
 impl ConditionV0 {
-    fn base(spec: CrankSpecV0, resolver_accounts: &[AccountRefV0]) -> Self {
-        let mut fixed = [AccountRefV0::zeroed(); MAX_RESOLVER_ACCOUNTS];
-        fixed[..resolver_accounts.len()].copy_from_slice(resolver_accounts);
+    fn base(spec: CrankSpecV0, resolvers: ResolverListV0) -> Self {
         Self {
             min_payment: spec.min_payment,
             wake_ts: 0,
@@ -359,22 +376,17 @@ impl ConditionV0 {
             resolver_disc: spec.resolver_disc,
             executor_program: spec.executor_program,
             executor_disc: spec.executor_disc,
-            resolver_accounts: fixed,
-            num_resolver_accounts: resolver_accounts.len() as u8,
+            num_resolver_accounts: resolvers.count,
             wake_kind: 0,
             active: 1,
             wake_cmp: 0,
-            resolver_list_offset: 0,
-            _pad: [0; 4],
+            resolver_list_offset: resolvers.offset,
+            _reserved: [0; 40],
         }
     }
 
-    pub fn at_timestamp(
-        unix_ts: i64,
-        spec: CrankSpecV0,
-        resolver_accounts: &[AccountRefV0],
-    ) -> Self {
-        let mut c = Self::base(spec, resolver_accounts);
+    pub fn at_timestamp(unix_ts: i64, spec: CrankSpecV0, resolvers: ResolverListV0) -> Self {
+        let mut c = Self::base(spec, resolvers);
         c.wake_kind = WakeKind::AtTimestamp as u8;
         c.wake_ts = unix_ts;
         c
@@ -385,9 +397,9 @@ impl ConditionV0 {
         offset: u32,
         len: u32,
         spec: CrankSpecV0,
-        resolver_accounts: &[AccountRefV0],
+        resolvers: ResolverListV0,
     ) -> Self {
-        let mut c = Self::base(spec, resolver_accounts);
+        let mut c = Self::base(spec, resolvers);
         c.wake_kind = WakeKind::OnAccountChange as u8;
         c.wake_account = watched;
         c.wake_offset = offset;
@@ -406,9 +418,9 @@ impl ConditionV0 {
         threshold: i64,
         cmp: u8,
         spec: CrankSpecV0,
-        resolver_accounts: &[AccountRefV0],
+        resolvers: ResolverListV0,
     ) -> Self {
-        let mut c = Self::base(spec, resolver_accounts);
+        let mut c = Self::base(spec, resolvers);
         c.wake_kind = WakeKind::OnValueCross as u8;
         c.wake_account = watched;
         c.wake_offset = offset;
@@ -418,15 +430,15 @@ impl ConditionV0 {
         c
     }
 
-    pub fn every_slots(slots: u64, spec: CrankSpecV0, resolver_accounts: &[AccountRefV0]) -> Self {
-        let mut c = Self::base(spec, resolver_accounts);
+    pub fn every_slots(slots: u64, spec: CrankSpecV0, resolvers: ResolverListV0) -> Self {
+        let mut c = Self::base(spec, resolvers);
         c.wake_kind = WakeKind::EverySlots as u8;
         c.wake_slot = slots;
         c
     }
 
-    pub fn at_slot(slot: u64, spec: CrankSpecV0, resolver_accounts: &[AccountRefV0]) -> Self {
-        let mut c = Self::base(spec, resolver_accounts);
+    pub fn at_slot(slot: u64, spec: CrankSpecV0, resolvers: ResolverListV0) -> Self {
+        let mut c = Self::base(spec, resolvers);
         c.wake_kind = WakeKind::AtSlot as u8;
         c.wake_slot = slot;
         c
@@ -462,17 +474,27 @@ impl ConditionV0 {
             _ => Err(SpecError::BadWakeKind),
         }
     }
+}
 
-    /// Point the condition's resolver account list at an indirect region on
-    /// the block's own account: `count` [`AccountRefV0`]s at `offset`.
-    pub fn set_indirect_resolver_accounts(&mut self, offset: u32, count: u8) {
-        self.resolver_list_offset = offset;
-        self.num_resolver_accounts = count;
-    }
-
-    pub fn resolver_accounts(&self) -> &[AccountRefV0] {
-        &self.resolver_accounts[..(self.num_resolver_accounts as usize).min(MAX_RESOLVER_ACCOUNTS)]
-    }
+/// Write a resolved crank into a staging buffer and describe where it
+/// landed.
+///
+/// Staging does not have to live on the block's own account. It is written
+/// only under simulation and read back out of the simulated post-state, so
+/// nothing about it needs to persist and concurrent turners cannot collide
+/// — which means one shared scratch account can serve every block instead
+/// of every account carrying its own kilobytes of scratch. `account_index`
+/// is the slot that account occupies in the resolver's account list, and
+/// `offset` is where in its data the payload starts; together they are
+/// what a [`ResponsePointerV0`] means.
+pub fn stage_into(
+    staging: &mut [u8],
+    account_index: u8,
+    offset: u32,
+    resolved: &ResolvedCrankV0,
+) -> Result<[u8; RESPONSE_POINTER_LEN], SpecError> {
+    let len = resolved.write_into(staging)?;
+    Ok(ResponsePointerV0::new(account_index, offset, len as u32).to_bytes())
 }
 
 /// Bytes a block of `n` conditions occupies.
@@ -637,13 +659,8 @@ pub trait ConditionBlock {
         &mut self,
         resolved: &ResolvedCrankV0,
     ) -> Result<[u8; RESPONSE_POINTER_LEN], SpecError> {
-        let len = resolved.write_into(self.staging_mut())?;
-        Ok(ResponsePointerV0::new(
-            Self::STAGING_ACCOUNT_INDEX,
-            Self::STAGING_OFFSET,
-            len as u32,
-        )
-        .to_bytes())
+        let (index, offset) = (Self::STAGING_ACCOUNT_INDEX, Self::STAGING_OFFSET);
+        stage_into(self.staging_mut(), index, offset, resolved)
     }
 
     #[doc(hidden)]
@@ -895,25 +912,19 @@ mod tests {
 
     fn sample_conditions() -> Vec<ConditionV0> {
         vec![
-            ConditionV0::at_timestamp(i64::MAX, spec(5000), &[AccountRefV0::writable([2; 32])]),
-            ConditionV0::on_account_change(
-                [3; 32],
-                48,
-                4,
-                spec(1),
-                &[AccountRefV0::writable([2; 32])],
-            ),
-            ConditionV0::every_slots(300, spec(0), &[]),
+            ConditionV0::at_timestamp(i64::MAX, spec(5000), ResolverListV0::new(64, 1)),
+            ConditionV0::on_account_change([3; 32], 48, 4, spec(1), ResolverListV0::new(64, 1)),
+            ConditionV0::every_slots(300, spec(0), ResolverListV0::new(0, 0)),
         ]
     }
 
     #[test]
     fn layout_is_pinned() {
-        assert_eq!(CONDITION_LEN, 288);
+        assert_eq!(CONDITION_LEN, 192);
         assert_eq!(BLOCK_HEADER_LEN, 16);
         assert_eq!(ACCOUNT_REF_LEN, 33);
         assert_eq!(RESPONSE_POINTER_LEN, 10);
-        assert_eq!(block_space(2), 592);
+        assert_eq!(block_space(2), 400);
     }
 
     #[test]
@@ -966,7 +977,7 @@ mod tests {
             Ok(WakeView::EverySlots { slots: 300 })
         );
         assert_eq!(
-            ConditionV0::at_slot(500, spec(0), &[]).wake(),
+            ConditionV0::at_slot(500, spec(0), ResolverListV0::new(0, 0)).wake(),
             Ok(WakeView::AtSlot { slot: 500 })
         );
         let mut bad = conditions[0];
@@ -975,22 +986,12 @@ mod tests {
     }
 
     #[test]
-    fn resolver_accounts_view() {
-        let c = ConditionV0::at_timestamp(
-            0,
-            spec(0),
-            &[
-                AccountRefV0::writable([2; 32]),
-                AccountRefV0::readonly([3; 32]),
-            ],
-        );
-        assert_eq!(
-            c.resolver_accounts(),
-            &[
-                AccountRefV0::writable([2; 32]),
-                AccountRefV0::readonly([3; 32]),
-            ]
-        );
+    fn resolver_list_is_always_indirect() {
+        let c = ConditionV0::at_timestamp(0, spec(0), ResolverListV0::new(96, 7));
+        assert_eq!(c.resolver_list_offset, 96);
+        assert_eq!(c.num_resolver_accounts, 7);
+        // Reserved space stays zero so a future field can claim it.
+        assert_eq!(c._reserved, [0u8; 40]);
     }
 
     #[test]
@@ -1194,8 +1195,11 @@ mod condition_block_tests {
     fn provided_methods_round_trip_through_the_readers() {
         let mut host = host();
         host.init_header().unwrap();
-        host.write_condition(1, &ConditionV0::every_slots(42, spec(), &[]))
-            .unwrap();
+        host.write_condition(
+            1,
+            &ConditionV0::every_slots(42, spec(), ResolverListV0::new(0, 0)),
+        )
+        .unwrap();
 
         // The canonical reader accepts what the trait wrote.
         let (header, conditions) = read_block(host.block(), 0).unwrap();
@@ -1211,7 +1215,7 @@ mod condition_block_tests {
         // Deactivation is what makes a level-triggered wake go quiet.
         host.write_condition(
             2,
-            &ConditionV0::on_value_cross([5; 32], 8, 8, 100, 0, spec(), &[]),
+            &ConditionV0::on_value_cross([5; 32], 8, 8, 100, 0, spec(), ResolverListV0::new(0, 0)),
         )
         .unwrap();
         assert_eq!(host.read_condition(2).unwrap().active, 1);
@@ -1220,7 +1224,10 @@ mod condition_block_tests {
 
         // Out-of-range slots are rejected, not silently wrapped.
         assert!(host
-            .write_condition(3, &ConditionV0::every_slots(1, spec(), &[]))
+            .write_condition(
+                3,
+                &ConditionV0::every_slots(1, spec(), ResolverListV0::new(0, 0))
+            )
             .is_err());
         assert!(host.read_condition(3).is_err());
     }

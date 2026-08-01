@@ -73,9 +73,18 @@ pub struct BookV0 {
     pub block: [u8; relay_spec::BLOCK_HEADER_LEN + NUM_CONDITIONS * relay_spec::CONDITION_LEN],
     /// Resolver staging region (see [`STAGING_BYTES`]).
     pub staging: [u8; STAGING_BYTES],
+    /// The resolver's account list, read by turners straight off this
+    /// account (conditions carry only an offset + count, never the refs).
+    /// One 33-byte ref, rounded to the struct's 8-byte alignment so the
+    /// account carries no trailing padding.
+    pub resolvers: [u8; RESOLVERS_BYTES],
 }
 
-const_assert_eq!(core::mem::size_of::<BookV0>(), 2808);
+/// One [`relay_spec::AccountRefV0`], padded to the struct alignment.
+pub const RESOLVERS_BYTES: usize = 40;
+const _: () = assert!(RESOLVERS_BYTES >= relay_spec::ACCOUNT_REF_LEN);
+
+const_assert_eq!(core::mem::size_of::<BookV0>(), 2560);
 
 /// Account-data offset of the condition block (what to register the watch
 /// at). 8-aligned, as the zero-copy read path requires.
@@ -87,6 +96,7 @@ const_assert_eq!(CONDITIONS_OFFSET % 8, 0);
 /// Account-data offset of the staging region — the `offset` a resolver's
 /// [`ResponsePointerV0`] carries.
 pub const STAGING_OFFSET: usize = 8 + core::mem::offset_of!(BookV0, staging);
+pub const RESOLVERS_OFFSET: usize = 8 + core::mem::offset_of!(BookV0, resolvers);
 
 /// Account-data offset of `entry_count` — the evict condition's
 /// change-watch range.
@@ -215,7 +225,11 @@ impl BookV0 {
         let program: [u8; 32] = *crate::ID.as_array();
         let book: [u8; 32] = *own_address.as_array();
         // Writable: resolvers stage their payload into the book itself.
-        let resolver_accounts = [AccountRefV0::writable(book)];
+        // Store the list once, on this account; conditions point at it.
+        let book_ref = AccountRefV0::writable(book);
+        self.resolvers[..32].copy_from_slice(&book_ref.address);
+        self.resolvers[32] = book_ref.writable;
+        let resolvers = relay_spec::ResolverListV0::new(RESOLVERS_OFFSET as u32, 1);
         // Copied out: the closure below is used while `self` is borrowed
         // mutably by the condition writes.
         let min_payment = self.payment_per_crank;
@@ -239,7 +253,7 @@ impl BookV0 {
                     crate::instruction::ResolveSweepV0::DISCRIMINATOR,
                     crate::instruction::SweepV0::DISCRIMINATOR,
                 ),
-                &resolver_accounts,
+                resolvers,
             ),
         );
         let _ = self.write_condition(
@@ -252,7 +266,7 @@ impl BookV0 {
                     crate::instruction::ResolveEvictV0::DISCRIMINATOR,
                     crate::instruction::EvictV0::DISCRIMINATOR,
                 ),
-                &resolver_accounts,
+                resolvers,
             ),
         );
         // Cross: any change to the book at all.
@@ -266,7 +280,7 @@ impl BookV0 {
                     crate::instruction::ResolveCrossV0::DISCRIMINATOR,
                     crate::instruction::CrossV0::DISCRIMINATOR,
                 ),
-                &resolver_accounts,
+                resolvers,
             ),
         );
     }

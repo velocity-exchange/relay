@@ -2798,9 +2798,10 @@ async fn on_value_cross_below_comparator() {
     assert_eq!(sent(&outcomes).len(), 1, "{outcomes:?}");
 }
 
-/// An indirect resolver account list — `resolver_list_offset` pointing at
-/// `AccountRefV0`s stored next to the block on the same account — resolves
-/// and cranks exactly like the inline list it replaces.
+/// Resolver account lists are always indirect: the condition carries an
+/// offset + count and the refs live next to the block on the same account.
+/// Relocating that region has to keep working, so this points a condition
+/// at a list written somewhere else on the account entirely.
 #[tokio::test]
 async fn indirect_resolver_list_is_read_from_the_block_account() {
     let mut h = setup(PAYMENT, 100, TurnerConfig::default());
@@ -2812,8 +2813,8 @@ async fn indirect_resolver_list_is_read_from_the_block_account() {
     // the staging region (scratch space on the same account) and point the
     // condition at it.
     let mut conditions = h.conditions();
-    let inline = conditions[0].resolver_accounts().to_vec();
-    assert_eq!(inline.len(), 1);
+    let inline = vec![spec::AccountRefV0::writable(h.book.to_bytes())];
+    assert_eq!(conditions[0].num_resolver_accounts, 1);
     {
         let mut svm = h.svm.lock().unwrap();
         let mut account = svm.get_account(&h.book).unwrap();
@@ -2828,10 +2829,8 @@ async fn indirect_resolver_list_is_read_from_the_block_account() {
         account.data[STAGING_OFFSET..STAGING_OFFSET + refs.len()].copy_from_slice(&refs);
         svm.set_account(h.book, account).unwrap();
     }
-    conditions[0].set_indirect_resolver_accounts(STAGING_OFFSET as u32, 1);
-    // Poison the inline slots: the turner must not fall back to them.
-    conditions[0].resolver_accounts =
-        [spec::AccountRefV0::readonly([0xEE; 32]); spec::MAX_RESOLVER_ACCOUNTS];
+    conditions[0].resolver_list_offset = STAGING_OFFSET as u32;
+    conditions[0].num_resolver_accounts = 1;
     h.write_conditions(&conditions);
 
     h.warp(t0, 10);

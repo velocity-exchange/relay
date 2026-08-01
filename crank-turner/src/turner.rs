@@ -1611,17 +1611,13 @@ struct Due {
     resolver_accounts: Vec<spec::AccountRefV0>,
 }
 
-/// Materialize a condition's resolver account list: the inline slots, or —
-/// when `resolver_list_offset` is set — `num_resolver_accounts` refs read
-/// from the block account's data at that offset. `None` when the indirect
-/// region is unreadable (out of bounds / count over the cap).
+/// Materialize a condition's resolver account list: `num_resolver_accounts`
+/// refs read from the block account's data at `resolver_list_offset`.
+/// `None` when that region is unreadable (out of bounds / over the cap).
 fn materialize_resolver_accounts(
     condition: &spec::ConditionV0,
     block_account_data: &[u8],
 ) -> Option<Vec<spec::AccountRefV0>> {
-    if condition.resolver_list_offset == 0 {
-        return Some(condition.resolver_accounts().to_vec());
-    }
     let count = condition.num_resolver_accounts as usize;
     if count > spec::MAX_INDIRECT_RESOLVER_ACCOUNTS {
         return None;
