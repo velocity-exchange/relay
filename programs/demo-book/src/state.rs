@@ -16,8 +16,8 @@
 
 use anchor_lang_v2::prelude::*;
 use relay_spec::{
-    AccountRefV0, ConditionBlock, ConditionV0, CrankSpecV0, ResolvedCrankV0, ResponsePointerV0,
-    KEEPER_PLACEHOLDER, RESPONSE_POINTER_LEN,
+    AccountRefV0, ConditionBlock, ConditionV0, CrankSpecV0, RelayBlockV0, ResolvedCrankV0,
+    ResponsePointerV0, KEEPER_PLACEHOLDER, RESPONSE_POINTER_LEN,
 };
 use static_assertions::const_assert_eq;
 
@@ -66,37 +66,28 @@ pub struct BookV0 {
     pub entry_live: [u8; MAX_ENTRIES],
     /// [`SIDE_BID`] or [`SIDE_ASK`].
     pub entry_sides: [u8; MAX_ENTRIES],
-    /// The condition block a `WatchV0` points at, as the opaque byte
-    /// region [`relay_spec::ConditionBlock`] operates on. MUST stay
-    /// 8-aligned (the zero-copy readers require it). Same bytes as the
-    /// header-then-conditions layout it replaced — see the impl below.
-    pub block: [u8; relay_spec::BLOCK_HEADER_LEN + NUM_CONDITIONS * relay_spec::CONDITION_LEN],
-    /// Resolver staging region (see [`STAGING_BYTES`]).
+    /// Everything relay needs hosted, in one field: header, conditions,
+    /// and the resolver account list the conditions point at. The watch
+    /// registers at [`CONDITIONS_OFFSET`]; `init_conditions` stamps that
+    /// same offset into the field so its resolver list self-describes.
+    pub relay: RelayBlockV0<NUM_CONDITIONS, 8>,
+    /// Resolver staging region (see [`STAGING_BYTES`]). Deliberately the
+    /// host's own field, not part of [`RelayBlockV0`]: where a resolved
+    /// crank stages is the resolver's decision (a shared scratch account
+    /// works too), not a property of the account holding the conditions.
     pub staging: [u8; STAGING_BYTES],
-    /// The resolver's account list, read by turners straight off this
-    /// account (conditions carry only an offset + count, never the refs).
-    /// One 33-byte ref, rounded to the struct's 8-byte alignment so the
-    /// account carries no trailing padding.
-    pub resolvers: [u8; RESOLVERS_BYTES],
 }
 
-/// One [`relay_spec::AccountRefV0`], padded to the struct alignment.
-pub const RESOLVERS_BYTES: usize = 40;
-const _: () = assert!(RESOLVERS_BYTES >= relay_spec::ACCOUNT_REF_LEN);
-
-const_assert_eq!(core::mem::size_of::<BookV0>(), 2560);
+const_assert_eq!(core::mem::size_of::<BookV0>(), 2800);
 
 /// Account-data offset of the condition block (what to register the watch
 /// at). 8-aligned, as the zero-copy read path requires.
-pub const CONDITIONS_OFFSET: usize = relay_spec::block_offset!(BookV0, block);
-const_assert_eq!(CONDITIONS_OFFSET % 8, 0);
-// The block is one region now; the reader's only requirement is alignment.
+pub const CONDITIONS_OFFSET: usize = relay_spec::block_offset!(BookV0, relay);
 const_assert_eq!(CONDITIONS_OFFSET % 8, 0);
 
 /// Account-data offset of the staging region — the `offset` a resolver's
 /// [`ResponsePointerV0`] carries.
 pub const STAGING_OFFSET: usize = relay_spec::block_offset!(BookV0, staging);
-pub const RESOLVERS_OFFSET: usize = relay_spec::block_offset!(BookV0, resolvers);
 
 /// Account-data offset of `entry_count` — the evict condition's
 /// change-watch range.
@@ -144,7 +135,7 @@ impl BookV0 {
         if expiry_ts < self.next_expiry_ts {
             self.next_expiry_ts = expiry_ts;
             // The single-store wake update the pod layout exists for.
-            let _ = self.update_condition(SWEEP_CONDITION as usize, |c| {
+            let _ = self.relay.update_condition(SWEEP_CONDITION as usize, |c| {
                 c.set_wake(relay_spec::WakeView::AtTimestamp { unix_ts: expiry_ts })
             });
         }
@@ -175,7 +166,7 @@ impl BookV0 {
     pub fn repair_next_expiry(&mut self) {
         self.next_expiry_ts = self.true_next_expiry();
         let next = self.next_expiry_ts;
-        let _ = self.update_condition(SWEEP_CONDITION as usize, |c| {
+        let _ = self.relay.update_condition(SWEEP_CONDITION as usize, |c| {
             c.set_wake(relay_spec::WakeView::AtTimestamp { unix_ts: next })
         });
     }
@@ -238,11 +229,12 @@ impl BookV0 {
         let program: [u8; 32] = *crate::ID.as_array();
         let book: [u8; 32] = *own_address.as_array();
         // Writable: resolvers stage their payload into the book itself.
-        // Store the list once, on this account; conditions point at it.
-        let book_ref = AccountRefV0::writable(book);
-        self.resolvers[..32].copy_from_slice(&book_ref.address);
-        self.resolvers[32] = book_ref.writable;
-        let resolvers = relay_spec::ResolverListV0::new(RESOLVERS_OFFSET as u32, 1);
+        // Stored once, in the block's own region; conditions point at it.
+        let _ = self.relay.init(CONDITIONS_OFFSET as u32);
+        let resolvers = self
+            .relay
+            .write_resolvers(&[AccountRefV0::writable(book)])
+            .expect("one ref fits the region");
         // Copied out: the closure below is used while `self` is borrowed
         // mutably by the condition writes.
         let min_payment = self.payment_per_crank;
@@ -254,11 +246,10 @@ impl BookV0 {
             executor_disc: disc(executor),
             min_payment,
         };
-        let _ = self.init_header();
         // One condition at a time: an array literal would materialize
         // every condition in the caller's stack frame at once, which past
         // a few slots blows the 4KB limit.
-        let _ = self.write_condition(
+        let _ = self.relay.write_condition(
             SWEEP_CONDITION as usize,
             &ConditionV0::at_timestamp(
                 next_expiry_ts,
@@ -269,7 +260,7 @@ impl BookV0 {
                 resolvers,
             ),
         );
-        let _ = self.write_condition(
+        let _ = self.relay.write_condition(
             EVICT_CONDITION as usize,
             &ConditionV0::on_account_change(
                 book,
@@ -283,7 +274,7 @@ impl BookV0 {
             ),
         );
         // Cross: any change to the book at all.
-        let _ = self.write_condition(
+        let _ = self.relay.write_condition(
             CROSS_CONDITION as usize,
             &ConditionV0::on_account_change(
                 book,
@@ -298,11 +289,6 @@ impl BookV0 {
         );
     }
 }
-
-/// The block region + staging contract, from the spec. Everything the
-/// program calls on it (`init_header`, `write_condition`,
-/// `update_condition`, `stage`) is a provided method.
-relay_spec::condition_block!(BookV0, block, NUM_CONDITIONS);
 
 impl BookV0 {
     /// Executor account list shared by every resolver: keeper placeholder

@@ -13,7 +13,7 @@ Relay: generic condition-cranking for Solana programs — see [DESIGN.md](./DESI
 ## Build / test
 
 ```bash
-./scripts/build-programs.sh          # SBF build both programs (cargo-build-sbf --tools-version v1.52)
+./scripts/build-programs.sh          # SBF build both programs (cargo-build-sbf --tools-version v1.54 — v1.52 miscompiles both programs into runtime access violations, same pathology velocity documents)
 cd programs && cargo test            # program litesvm tests (need the SBF build first)
 cargo test                           # root workspace: spec + crank-turner (turner tests also need the SBF build)
 ./scripts/e2e.sh                     # end-to-end on a real validator (needs solana-test-validator);

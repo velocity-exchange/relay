@@ -8,6 +8,6 @@ if [[ "$(uname)" == "Darwin" && -z "${SDKROOT:-}" ]]; then
   export SDKROOT="$(xcrun --show-sdk-path)"
 fi
 
-cargo-build-sbf --tools-version v1.52 --manifest-path relay/Cargo.toml
-cargo-build-sbf --tools-version v1.52 --manifest-path demo-book/Cargo.toml
+cargo-build-sbf --tools-version v1.54 --manifest-path relay/Cargo.toml
+cargo-build-sbf --tools-version v1.54 --manifest-path demo-book/Cargo.toml
 ls -la target/deploy/*.so

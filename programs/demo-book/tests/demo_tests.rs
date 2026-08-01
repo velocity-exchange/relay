@@ -181,15 +181,28 @@ fn sweep_wake_ts(conditions: &[spec::ConditionV0]) -> i64 {
     }
 }
 
+/// A condition's resolver account list, followed from its indirect
+/// pointer into the book's account bytes — exactly what a turner does.
+fn resolver_refs(ctx: &Ctx, condition: &spec::ConditionV0) -> Vec<spec::AccountRefV0> {
+    let list = condition.resolvers();
+    let data = ctx.svm.get_account(&ctx.book).unwrap().data;
+    (0..list.count as usize)
+        .map(|i| {
+            let start = list.offset as usize + i * spec::ACCOUNT_REF_LEN;
+            bytemuck::pod_read_unaligned(&data[start..start + spec::ACCOUNT_REF_LEN])
+        })
+        .collect()
+}
+
 /// Simulate a resolver and read its staged payload back out of the
 /// simulation post-execution account state — exactly what a turner does.
 /// Returns `None` when the resolver reports no work.
 fn resolve(ctx: &mut Ctx, condition_index: u8) -> Option<spec::ResolvedCrankV0> {
     let conditions = read_conditions(ctx);
     let condition = &conditions[condition_index as usize];
-    assert_eq!(condition.resolver_program, demo_id().to_bytes());
-    let metas: Vec<AccountMeta> = condition
-        .resolver_accounts()
+    assert_eq!(condition.crank_spec().resolver_program, demo_id().to_bytes());
+    let refs = resolver_refs(ctx, condition);
+    let metas: Vec<AccountMeta> = refs
         .iter()
         .map(|a| AccountMeta {
             pubkey: Pubkey::new_from_array(a.address),
@@ -200,7 +213,7 @@ fn resolve(ctx: &mut Ctx, condition_index: u8) -> Option<spec::ResolvedCrankV0> 
     let ix = Instruction {
         program_id: demo_id(),
         accounts: metas,
-        data: condition.resolver_disc.to_vec(),
+        data: condition.crank_spec().resolver_disc.to_vec(),
     };
     ctx.svm.expire_blockhash();
     let blockhash = ctx.svm.latest_blockhash();
@@ -223,10 +236,7 @@ fn resolve(ctx: &mut Ctx, condition_index: u8) -> Option<spec::ResolvedCrankV0> 
     let staged = info
         .post_accounts
         .iter()
-        .find(|(address, _)| {
-            address.to_bytes()
-                == condition.resolver_accounts()[pointer.account_index as usize].address
-        })
+        .find(|(address, _)| address.to_bytes() == refs[pointer.account_index as usize].address)
         .map(|(_, account)| account.data().to_vec())
         .expect("staging account returned by simulation");
     let start = pointer.offset() as usize;
@@ -269,10 +279,10 @@ fn executor_ix(ctx: &Ctx, condition_index: u8, resolved: &spec::ResolvedCrankV0)
     let conditions = read_conditions(ctx);
     let condition = &conditions[condition_index as usize];
     let (metas, _) = executor_metas(resolved, ctx.keeper);
-    let mut data = condition.executor_disc.to_vec();
+    let mut data = condition.crank_spec().executor_disc.to_vec();
     data.extend_from_slice(&resolved.data);
     Instruction {
-        program_id: Pubkey::new_from_array(condition.executor_program),
+        program_id: Pubkey::new_from_array(condition.crank_spec().executor_program),
         accounts: metas,
         data,
     }
@@ -332,10 +342,10 @@ fn executor_ix_for(
     let conditions = read_conditions(ctx);
     let condition = &conditions[condition_index as usize];
     let (metas, _) = executor_metas(resolved, keeper);
-    let mut data = condition.executor_disc.to_vec();
+    let mut data = condition.crank_spec().executor_disc.to_vec();
     data.extend_from_slice(&resolved.data);
     Instruction {
-        program_id: Pubkey::new_from_array(condition.executor_program),
+        program_id: Pubkey::new_from_array(condition.crank_spec().executor_program),
         accounts: metas,
         data,
     }
@@ -356,18 +366,18 @@ fn init_writes_valid_condition_block() {
     let sweep = &conditions[SWEEP_CONDITION as usize];
     assert!(sweep.is_active());
     assert_eq!(sweep_wake_ts(&conditions), i64::MAX);
-    assert_eq!(sweep.min_payment, PAYMENT);
-    assert_eq!(sweep.resolver_program, demo_id().to_bytes());
+    assert_eq!(sweep.min_payment(), PAYMENT);
+    assert_eq!(sweep.crank_spec().resolver_program, demo_id().to_bytes());
     assert_eq!(
-        &sweep.resolver_disc[..],
+        &sweep.crank_spec().resolver_disc[..],
         instruction::ResolveSweepV0::DISCRIMINATOR
     );
     assert_eq!(
-        &sweep.executor_disc[..],
+        &sweep.crank_spec().executor_disc[..],
         instruction::SweepV0::DISCRIMINATOR
     );
-    assert_eq!(sweep.resolver_accounts().len(), 1);
-    assert_eq!(sweep.resolver_accounts()[0].address, ctx.book.to_bytes());
+    assert_eq!(resolver_refs(&ctx, sweep).len(), 1);
+    assert_eq!(resolver_refs(&ctx, sweep)[0].address, ctx.book.to_bytes());
 
     let evict = &conditions[EVICT_CONDITION as usize];
     assert!(evict.is_active());
@@ -384,7 +394,7 @@ fn init_writes_valid_condition_block() {
         other => panic!("evict wake should be OnAccountChange, got {other:?}"),
     }
     assert_eq!(
-        &evict.executor_disc[..],
+        &evict.crank_spec().executor_disc[..],
         instruction::EvictV0::DISCRIMINATOR
     );
 }

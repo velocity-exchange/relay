@@ -905,6 +905,141 @@ pub trait ConditionBlock {
     }
 }
 
+/// Everything an account must host for relay, in one field: the spec
+/// header, the condition slots, and a resolver account list region the
+/// conditions point at. Declare it, call [`Self::init`] once at account
+/// creation with the field's own account offset, and the offset arithmetic
+/// hosts used to hand-roll (three regions, each with its own length
+/// constant and alignment note) disappears:
+///
+/// ```ignore
+/// #[account(zero_copy)]
+/// pub struct MyThing {
+///     pub relay: RelayBlockV0<NUM_CONDITIONS, 8>,
+///     // ... host fields ...
+/// }
+/// // once, at account creation:
+/// my_thing.relay.init(relay_spec::block_offset!(MyThing, relay) as u32)?;
+/// // register the watch at my_thing.relay.account_offset()
+/// // point conditions at the built-in region:
+/// let list = my_thing.relay.write_resolvers(&refs)?;
+/// ```
+///
+/// Everything is stored as byte arrays, so the type is alignment-1 and
+/// carries no padding for any parameter choice — genuinely `Pod`, strict
+/// enough for anchor v2's `#[account]`. `RESOLVER_CAPACITY` is a capacity
+/// (live count is tracked separately, conditions carry their own counts)
+/// and must be a multiple of 8, which keeps the total size 8-divisible so
+/// the field never forces padding into its host.
+///
+/// The condition surface ([`ConditionBlock`]) is implemented on it, and
+/// [`Self::init`] stamps both the header and the field's account offset,
+/// which is what lets [`Self::write_resolvers`] return a
+/// [`ResolverListV0`] without the host doing offset math again. Hosts
+/// with extra list regions of their own (per-slot lists, oversized shared
+/// maps) keep building `ResolverListV0`s from [`block_offset!`] as before
+/// — the built-in region is the common case, not a limit.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RelayBlockV0<const CONDITIONS: usize, const RESOLVER_CAPACITY: usize> {
+    header: [u8; BLOCK_HEADER_LEN],
+    conditions: [[u8; CONDITION_LEN]; CONDITIONS],
+    resolvers: [[u8; ACCOUNT_REF_LEN]; RESOLVER_CAPACITY],
+    /// This field's own byte offset within its account (past the
+    /// discriminator), stamped by [`Self::init`].
+    self_offset: [u8; 4],
+    /// Live entries in `resolvers`.
+    resolver_count: u8,
+    _reserved: [u8; 11],
+}
+
+// Sound for any parameters: every field is a byte array, so the struct is
+// alignment-1 and can contain no padding.
+unsafe impl<const C: usize, const R: usize> Zeroable for RelayBlockV0<C, R> {}
+unsafe impl<const C: usize, const R: usize> Pod for RelayBlockV0<C, R> {}
+
+impl<const C: usize, const R: usize> Default for RelayBlockV0<C, R> {
+    fn default() -> Self {
+        Self::zeroed()
+    }
+}
+
+impl<const C: usize, const R: usize> RelayBlockV0<C, R> {
+    /// See the type docs: a capacity granularity of 8 keeps the total size
+    /// 8-divisible, so hosting this field never smuggles padding into a
+    /// strict-Pod account struct. Referenced by every method, so a bad
+    /// parameter fails compilation at the first use.
+    const LAYOUT: () = assert!(
+        R % 8 == 0,
+        "RelayBlockV0 resolver capacity must be a multiple of 8"
+    );
+
+    pub const SIZE: usize = BLOCK_HEADER_LEN + C * CONDITION_LEN + R * ACCOUNT_REF_LEN + 16;
+
+    /// Stamp the spec header and record where in its account this field
+    /// lives (`block_offset!(Host, field)`). Call once at account
+    /// creation; conditions are written separately, by index.
+    pub fn init(&mut self, account_offset: u32) -> Result<(), SpecError> {
+        #[allow(clippy::let_unit_value)]
+        let _ = Self::LAYOUT;
+        self.self_offset = account_offset.to_le_bytes();
+        self.init_header()
+    }
+
+    /// The account-data offset this block was initialized at — what a
+    /// `WatchV0` registration points at.
+    pub fn account_offset(&self) -> u32 {
+        u32::from_le_bytes(self.self_offset)
+    }
+
+    /// Store the resolver account list in the built-in region and describe
+    /// it the way a [`ConditionV0`] wants it. Requires [`Self::init`] to
+    /// have stamped the offset — an unstamped block cannot self-describe.
+    pub fn write_resolvers(&mut self, refs: &[AccountRefV0]) -> Result<ResolverListV0, SpecError> {
+        #[allow(clippy::let_unit_value)]
+        let _ = Self::LAYOUT;
+        if refs.len() > R || refs.len() > MAX_INDIRECT_RESOLVER_ACCOUNTS {
+            return Err(SpecError::TooLarge);
+        }
+        if self.account_offset() == 0 {
+            return Err(SpecError::Truncated);
+        }
+        for (slot, r) in self.resolvers.iter_mut().zip(refs) {
+            slot[..32].copy_from_slice(&r.address);
+            slot[32] = r.writable;
+        }
+        self.resolver_count = refs.len() as u8;
+        let region = BLOCK_HEADER_LEN + C * CONDITION_LEN;
+        Ok(ResolverListV0::new(
+            self.account_offset() + region as u32,
+            refs.len() as u8,
+        ))
+    }
+
+    /// The stored resolver list, as last written.
+    pub fn resolver_refs(&self) -> Vec<AccountRefV0> {
+        self.resolvers[..(self.resolver_count as usize).min(R)]
+            .iter()
+            .map(|slot| AccountRefV0 {
+                address: slot[..32].try_into().expect("32-byte address"),
+                writable: slot[32],
+            })
+            .collect()
+    }
+}
+
+impl<const C: usize, const R: usize> ConditionBlock for RelayBlockV0<C, R> {
+    const NUM_CONDITIONS: usize = C;
+
+    fn block(&self) -> &[u8] {
+        &bytemuck::bytes_of(self)[..BLOCK_HEADER_LEN + C * CONDITION_LEN]
+    }
+
+    fn block_mut(&mut self) -> &mut [u8] {
+        &mut bytemuck::bytes_of_mut(self)[..BLOCK_HEADER_LEN + C * CONDITION_LEN]
+    }
+}
+
 /// Copying reader for arbitrary (possibly unaligned) buffers — the
 /// off-chain path. 280 bytes copied per condition; negligible off-chain.
 pub fn read_conditions_unaligned(
@@ -1248,6 +1383,73 @@ mod tests {
         // The threshold did not survive as a stale timestamp.
         c.set_wake(WakeView::AtTimestamp { unix_ts: 5 });
         assert_eq!(c.wake(), Ok(WakeView::AtTimestamp { unix_ts: 5 }));
+    }
+
+    /// The one-field host: byte-exact size, no padding for the derives to
+    /// choke on, and a self-described resolver list a turner can follow
+    /// from the raw account bytes.
+    #[test]
+    fn relay_block_hosts_conditions_and_resolvers_in_one_field() {
+        type Block = RelayBlockV0<3, 8>;
+        assert_eq!(core::mem::size_of::<Block>(), Block::SIZE);
+        assert_eq!(core::mem::align_of::<Block>(), 1);
+        assert_eq!(Block::SIZE % 8, 0);
+
+        // A host account: discriminator, a field, then the block.
+        const BLOCK_OFFSET: usize = 8 + 16;
+        let mut block = Block::zeroed();
+        // Unstamped blocks refuse to self-describe.
+        assert!(block
+            .write_resolvers(&[AccountRefV0::writable([1; 32])])
+            .is_err());
+        block.init(BLOCK_OFFSET as u32).unwrap();
+        assert_eq!(block.account_offset(), BLOCK_OFFSET as u32);
+
+        let refs = [
+            AccountRefV0::writable([1; 32]),
+            AccountRefV0::readonly([2; 32]),
+        ];
+        let list = block.write_resolvers(&refs).unwrap();
+        assert_eq!(list.count, 2);
+        assert_eq!(
+            list.offset as usize,
+            BLOCK_OFFSET + BLOCK_HEADER_LEN + 3 * CONDITION_LEN
+        );
+        assert_eq!(block.resolver_refs(), refs.to_vec());
+
+        block
+            .write_condition(
+                0,
+                &ConditionV0::at_timestamp(
+                    42,
+                    CrankSpecV0 {
+                        resolver_program: [1; 32],
+                        resolver_disc: [2; 8],
+                        executor_program: [3; 32],
+                        executor_disc: [4; 8],
+                        min_payment: 5,
+                    },
+                    list,
+                ),
+            )
+            .unwrap();
+
+        // Turner-shaped read: raw account bytes, block at its offset, the
+        // resolver list followed from the condition's own pointer.
+        let mut account = alloc::vec![0u8; BLOCK_OFFSET + Block::SIZE];
+        account[BLOCK_OFFSET..BLOCK_OFFSET + Block::SIZE]
+            .copy_from_slice(bytemuck::bytes_of(&block));
+        let conditions = read_conditions_unaligned(&account, BLOCK_OFFSET).unwrap();
+        assert_eq!(conditions.len(), 3);
+        assert_eq!(
+            conditions[0].wake(),
+            Ok(WakeView::AtTimestamp { unix_ts: 42 })
+        );
+        let resolvers = conditions[0].resolvers();
+        let start = resolvers.offset as usize;
+        let first: AccountRefV0 =
+            bytemuck::pod_read_unaligned(&account[start..start + ACCOUNT_REF_LEN]);
+        assert_eq!(first, refs[0]);
     }
 
     /// An unsigned watched field with its top bit set must not read as
