@@ -5,13 +5,13 @@ use clap::{Parser, ValueEnum};
 use relay_crank_turner::{
     derive_ws_url, feed_channel, metrics, spawn_grpc_feed, spawn_submitter, spawn_ws_feed,
     watch_subscription, CachedSource, CachedSourceConfig, ChainSource, GrpcFeedConfig,
-    LocalSimConfig, LocalSimSource, Outcome, ProgramSubscription, RpcSource, SubmitterConfig,
-    Turner, TurnerConfig, WatchFilter,
+    LocalSimConfig, LocalSimSource, Outcome, ProgramSubscription, RpcSource, SkipReason,
+    SubmitterConfig, Turner, TurnerConfig, WatchFilter,
 };
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::EncodableKey;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 fn submitter_config(args: &Args) -> SubmitterConfig {
     SubmitterConfig {
@@ -383,7 +383,17 @@ async fn run<S: ChainSource>(mut turner: Turner<S>, args: &Args) -> Result<()> {
                     stage,
                     error,
                 } => warn!(?condition, ?stage, error, "crank failed"),
-                Outcome::NoWork(_) | Outcome::Skipped(..) => {}
+                // Loud enough to triage from, quiet enough to leave on:
+                // a wake that fired but resolved to nothing is the signal
+                // debugging always wants (RUST_LOG=debug); the every-tick
+                // not-due/backoff churn stays behind trace.
+                Outcome::NoWork(condition) => debug!(?condition, "resolved: no work"),
+                Outcome::Skipped(condition, reason) => match reason {
+                    SkipReason::NotDue | SkipReason::Backoff => {
+                        trace!(?condition, ?reason, "skipped")
+                    }
+                    _ => debug!(?condition, ?reason, "skipped"),
+                },
             }),
             Err(e) => warn!(error = %format!("{e:#}"), "tick failed"),
         }

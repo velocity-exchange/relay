@@ -1,0 +1,56 @@
+name: Manual Devnet Program Deploy
+
+# Devnet deploys are manual-only — pick the source branch from the Actions
+# tab. The workflow only PROPOSES the Squads upgrade on the devnet multisig;
+# a multisig signer must approve + execute it via the Squads UI. demo-book is
+# a test fixture and is never deployed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch (or ref) to build from"
+        required: true
+        default: master
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: stable
+  SOLANA_VERSION: 2.3.11
+  NODE_VERSION: "24.x.x"
+  RELAY_DEVNET_PROGRAM_ID: 4D5tPhw9sqkdkR5CpmP427TH6y9p9AMuKUukUEHn3Mpu
+
+jobs:
+  deploy:
+    name: Build + propose devnet upgrade
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.branch }}
+
+      - name: Build relay
+        uses: ./.github/actions/build-relay/
+
+      - name: Buffer deploy (devnet)
+        id: buffer-deploy
+        uses: ./.github/actions/buffer-deploy/
+        with:
+          program-id: ${{ env.RELAY_DEVNET_PROGRAM_ID }}
+          rpc-url: ${{ secrets.DEVNET_RPC_ENDPOINT }}
+          keypair: ${{ secrets.DEVNET_DEPLOYER_KEYPAIR }}
+          buffer-authority: ${{ secrets.DEVNET_MULTISIG_VAULT }}
+
+      - name: Propose Squads upgrade
+        uses: solana-foundation/squads-program-action@839c079c881344c2da0365ad6a6bb07892e08e2f # v0.4.3
+        with:
+          rpc: ${{ secrets.DEVNET_RPC_ENDPOINT }}
+          program: ${{ env.RELAY_DEVNET_PROGRAM_ID }}
+          multisig: ${{ secrets.DEVNET_MULTISIG }}
+          vault-index: "0"
+          buffer: ${{ steps.buffer-deploy.outputs.buffer }}
+          keypair: ${{ secrets.DEVNET_DEPLOYER_KEYPAIR }}

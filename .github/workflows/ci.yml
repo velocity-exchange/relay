@@ -1,0 +1,59 @@
+# Everything runs against the real program fixtures: the litesvm suites in
+# the root workspace (turner tests) and the programs workspace (relay +
+# demo-book) both load .so files from programs/target/deploy, so the SBF
+# build is a hard prerequisite, not an optional extra. This is the gate
+# that was missing when the sealed-API change broke demo-book's tests and
+# nobody noticed until the next feature tripped over them.
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: fmt, build fixtures, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Rust
+        uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+          components: rustfmt, clippy
+      - name: Cache build files
+        uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+        with:
+          workspaces: |
+            .
+            programs
+      - name: Cache Solana platform tools
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: ~/.cache/solana
+          key: platform-tools-v1.54
+      - name: Install Solana toolchain
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+      - name: Cargo fmt
+        run: |
+          cargo fmt --all --check
+          cargo fmt --all --check --manifest-path programs/Cargo.toml
+      - name: Build program fixtures (platform-tools v1.54)
+        # v1.52 miscompiles both programs into runtime access violations —
+        # see CLAUDE.md; the pin lives in the script.
+        run: ./scripts/build-programs.sh
+      - name: Test root workspace
+        run: cargo test --workspace
+      - name: Test programs workspace
+        run: cargo test --manifest-path programs/Cargo.toml
+      - name: Clippy
+        run: cargo clippy --workspace

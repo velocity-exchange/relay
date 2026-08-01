@@ -639,43 +639,6 @@ impl ConditionV0 {
     }
 }
 
-/// Implement [`ConditionBlock`] for an account that keeps its block in a
-/// byte field, and pin the invariants the reader depends on.
-///
-/// Hosts were writing this by hand: the impl, plus a set of offset
-/// constants derived by adding up the lengths of every preceding field.
-/// That arithmetic is the one part of hosting a block that is easy to get
-/// silently wrong — a stale summand puts a region's offset a few bytes off
-/// and the failure surfaces as a turner reading garbage, far away. Here it
-/// comes from `offset_of!` instead, so it cannot disagree with the struct.
-///
-/// ```ignore
-/// condition_block!(UserConditionsV0, block, USER_CONDITIONS);
-/// ```
-#[macro_export]
-macro_rules! condition_block {
-    ($ty:ty, $field:ident, $n:expr) => {
-        impl $crate::ConditionBlock for $ty {
-            const NUM_CONDITIONS: usize = $n;
-
-            fn block(&self) -> &[u8] {
-                &self.$field
-            }
-
-            fn block_mut(&mut self) -> &mut [u8] {
-                &mut self.$field
-            }
-        }
-
-        const _: () = {
-            // The block must be 8-aligned within the account for the
-            // zero-copy readers, and big enough for the conditions it
-            // claims to hold.
-            assert!($crate::block_offset!($ty, $field) % 8 == 0);
-        };
-    };
-}
-
 /// Account-data offset of a field: past anchor's 8-byte discriminator.
 /// Every region a condition points at — resolver lists, staging — must be
 /// described this way rather than by summing field lengths.
@@ -893,9 +856,6 @@ pub trait ConditionBlock {
         self.write_condition(index, &condition)
     }
 
-    /// Write a resolver's payload into the staging region and return the
-    /// pointer bytes to set as return data.
-
     #[doc(hidden)]
     fn slot_start(index: usize) -> Result<usize, SpecError> {
         if index >= Self::NUM_CONDITIONS {
@@ -939,6 +899,17 @@ pub trait ConditionBlock {
 /// with extra list regions of their own (per-slot lists, oversized shared
 /// maps) keep building `ResolverListV0`s from [`block_offset!`] as before
 /// — the built-in region is the common case, not a limit.
+///
+/// **Size the parameters with headroom.** Both are capacities: a zeroed
+/// condition slot is inactive (turners skip it, `crank_v0` rejects it) and
+/// unused resolver slots are just bytes, so adding a condition to an
+/// account with spare slots is a plain `write_condition` — no resize, no
+/// migration. Growing a parameter on a *deployed* account is a layout
+/// change: the conditions array expands into the resolver region and
+/// everything behind it (the region, this field's trailer, every host
+/// field after the field) shifts. [`Self::grow_in_place`] does that
+/// surgery when headroom runs out, but rent on a spare slot (192 bytes per
+/// condition, 33 per resolver ref) is cheaper than ever needing it.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct RelayBlockV0<const CONDITIONS: usize, const RESOLVER_CAPACITY: usize> {
@@ -983,7 +954,7 @@ impl<const C: usize, const R: usize> RelayBlockV0<C, R> {
     /// strict-Pod account struct. Referenced by every method, so a bad
     /// parameter fails compilation at the first use.
     const LAYOUT: () = assert!(
-        R % 8 == 0,
+        R.is_multiple_of(8),
         "RelayBlockV0 resolver capacity must be a multiple of 8"
     );
 
@@ -1038,6 +1009,99 @@ impl<const C: usize, const R: usize> RelayBlockV0<C, R> {
                 writable: slot[32],
             })
             .collect()
+    }
+
+    /// Grow a smaller block into this instantiation, in place, inside an
+    /// already-resized account.
+    ///
+    /// Growing `CONDITIONS` or `RESOLVER_CAPACITY` is a layout change: the
+    /// conditions array expands into the resolver region, and the region,
+    /// the trailer, and every host field behind this one all shift. This
+    /// does the whole move in one pass over the raw account bytes —
+    /// prefer sizing the parameters with headroom so it never runs.
+    ///
+    /// The caller reallocates the account by `Self::SIZE - old size`
+    /// first (the extra bytes land at the end; on-chain `realloc` zeroes
+    /// them) and redeclares the host struct with the new parameters; this
+    /// then shifts the old bytes into their new homes, zeroes the new
+    /// slots, restamps the header, and rewrites every condition's
+    /// `resolver_list_offset`: pointers into the built-in region are
+    /// rebased onto its new position, pointers past the old block end
+    /// (host-side regions) shift with their bytes, pointers before the
+    /// block are untouched.
+    ///
+    /// Two things stay the host's job, because the spec cannot know them:
+    /// any *hardcoded* offsets in host code pointing behind the block, and
+    /// any condition whose `wake_account` is this same account watching
+    /// bytes behind the block (the spec does not know the account's own
+    /// address). Registered watches keep working — they point at the block
+    /// itself, whose offset does not move.
+    pub fn grow_in_place(
+        data: &mut [u8],
+        block_offset: usize,
+        old_conditions: usize,
+        old_capacity: usize,
+    ) -> Result<(), SpecError> {
+        #[allow(clippy::let_unit_value)]
+        let _ = Self::LAYOUT;
+        if old_conditions > C || old_capacity > R || !old_capacity.is_multiple_of(8) {
+            return Err(SpecError::TooLarge);
+        }
+        let old_size =
+            BLOCK_HEADER_LEN + old_conditions * CONDITION_LEN + old_capacity * ACCOUNT_REF_LEN + 16;
+        let delta = Self::SIZE - old_size;
+        let old_end = block_offset
+            .checked_add(old_size)
+            .ok_or(SpecError::Truncated)?;
+        // The caller must have grown the account by exactly `delta`; the
+        // old bytes therefore end `delta` short of the new length.
+        if data.len() < old_end + delta {
+            return Err(SpecError::Truncated);
+        }
+        if delta == 0 {
+            return Ok(());
+        }
+
+        let old_region = block_offset + BLOCK_HEADER_LEN + old_conditions * CONDITION_LEN;
+        let new_region = block_offset + BLOCK_HEADER_LEN + C * CONDITION_LEN;
+        let old_trailer = old_region + old_capacity * ACCOUNT_REF_LEN;
+        let new_trailer = new_region + R * ACCOUNT_REF_LEN;
+
+        // Right-to-left, so nothing is read after its bytes are overwritten:
+        // the host's tail, then the trailer, then the resolver slots — each
+        // target sits at or past the previous move's source.
+        data.copy_within(old_end..data.len() - delta, old_end + delta);
+        data.copy_within(old_trailer..old_trailer + 16, new_trailer);
+        data.copy_within(
+            old_region..old_region + old_capacity * ACCOUNT_REF_LEN,
+            new_region,
+        );
+        // New capacity slots and new condition slots start zeroed (inactive).
+        data[new_region + old_capacity * ACCOUNT_REF_LEN..new_trailer].fill(0);
+        data[old_region..new_region].fill(0);
+
+        // Restamp the header for the new slot count.
+        data[block_offset + 9] = C as u8;
+
+        // Re-point every condition's resolver list. Offsets into the
+        // built-in region rebase onto its new position; offsets behind the
+        // old block end moved with their bytes; anything before the block
+        // (or the zero of an inactive slot) stands.
+        for index in 0..old_conditions {
+            let at = block_offset + BLOCK_HEADER_LEN + index * CONDITION_LEN;
+            let mut condition: ConditionV0 =
+                bytemuck::pod_read_unaligned(&data[at..at + CONDITION_LEN]);
+            let offset = condition.resolver_list_offset as usize;
+            if (old_region..old_trailer).contains(&offset) {
+                condition.resolver_list_offset = (new_region + (offset - old_region)) as u32;
+            } else if offset >= old_end {
+                condition.resolver_list_offset = (offset + delta) as u32;
+            } else {
+                continue;
+            }
+            data[at..at + CONDITION_LEN].copy_from_slice(bytemuck::bytes_of(&condition));
+        }
+        Ok(())
     }
 }
 
@@ -1396,6 +1460,87 @@ mod tests {
         // The threshold did not survive as a stale timestamp.
         c.set_wake(WakeView::AtTimestamp { unix_ts: 5 });
         assert_eq!(c.wake(), Ok(WakeView::AtTimestamp { unix_ts: 5 }));
+    }
+
+    /// Growing a block in place: a `<2, 8>` host becomes `<4, 16>`, the
+    /// host tail and built-in list survive the shift, pointers re-base,
+    /// and the new slots read as inactive conditions.
+    #[test]
+    fn grow_in_place_shifts_regions_and_repoints_lists() {
+        type Old = RelayBlockV0<2, 8>;
+        type New = RelayBlockV0<4, 16>;
+        const BLOCK_OFFSET: usize = 8;
+        const HOST_TAIL: &[u8; 5] = b"tail!";
+
+        let mut block = Old::zeroed();
+        block.init(BLOCK_OFFSET as u32).unwrap();
+        let refs = [
+            AccountRefV0::writable([1; 32]),
+            AccountRefV0::readonly([2; 32]),
+        ];
+        let list = block.write_resolvers(&refs).unwrap();
+        let spec = CrankSpecV0 {
+            resolver_program: [1; 32],
+            resolver_disc: [2; 8],
+            executor_program: [3; 32],
+            executor_disc: [4; 8],
+            min_payment: 5,
+        };
+        // Condition 0 points at the built-in region, condition 1 at a
+        // host-side list past the block (the per-slot pattern).
+        let host_list = (BLOCK_OFFSET + Old::SIZE) as u32;
+        block
+            .write_condition(0, &ConditionV0::at_timestamp(42, spec, list))
+            .unwrap();
+        block
+            .write_condition(
+                1,
+                &ConditionV0::at_slot(7, spec, ResolverListV0::new(host_list, 1)),
+            )
+            .unwrap();
+
+        // The account: discriminator, block, a host tail — then realloc'd
+        // by the size delta, new bytes zeroed at the end.
+        let mut account = alloc::vec![0u8; BLOCK_OFFSET + Old::SIZE];
+        account[BLOCK_OFFSET..].copy_from_slice(bytemuck::bytes_of(&block));
+        account.extend_from_slice(HOST_TAIL);
+        account.resize(account.len() + (New::SIZE - Old::SIZE), 0);
+
+        New::grow_in_place(&mut account, BLOCK_OFFSET, 2, 8).unwrap();
+
+        // The host tail moved wholesale.
+        assert_eq!(
+            &account[BLOCK_OFFSET + New::SIZE..BLOCK_OFFSET + New::SIZE + 5],
+            HOST_TAIL
+        );
+        let grown: New =
+            bytemuck::pod_read_unaligned(&account[BLOCK_OFFSET..BLOCK_OFFSET + New::SIZE]);
+        assert_eq!(grown.account_offset(), BLOCK_OFFSET as u32);
+        assert_eq!(grown.resolver_refs(), refs.to_vec());
+        let conditions = read_conditions_unaligned(&account, BLOCK_OFFSET).unwrap();
+        assert_eq!(conditions.len(), 4);
+        assert_eq!(
+            conditions[0].wake(),
+            Ok(WakeView::AtTimestamp { unix_ts: 42 })
+        );
+        // Built-in-region pointer re-based; the ref it points at reads back.
+        let moved = conditions[0].resolvers();
+        assert_eq!(
+            moved.offset as usize,
+            BLOCK_OFFSET + BLOCK_HEADER_LEN + 4 * CONDITION_LEN
+        );
+        let first: AccountRefV0 = bytemuck::pod_read_unaligned(
+            &account[moved.offset as usize..moved.offset as usize + ACCOUNT_REF_LEN],
+        );
+        assert_eq!(first, refs[0]);
+        // Host-side pointer shifted with its bytes.
+        assert_eq!(
+            conditions[1].resolvers().offset as usize,
+            BLOCK_OFFSET + New::SIZE
+        );
+        // New slots are inactive, not garbage.
+        assert!(!conditions[2].is_active());
+        assert!(!conditions[3].is_active());
     }
 
     /// The one-field host: byte-exact size, no padding for the derives to

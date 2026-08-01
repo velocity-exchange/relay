@@ -23,6 +23,12 @@ cargo fmt && cargo clippy            # run in BOTH workspaces before declaring w
 
 macOS: if the SBF build fails on missing `assert.h`, `export SDKROOT="$(xcrun --show-sdk-path)"`.
 
+## CI / deploys
+
+- `.github/workflows/ci.yml` runs on every push/PR: fmt across both workspaces, the SBF fixture build (v1.54 via `scripts/build-programs.sh`), root-workspace tests, programs-workspace tests, clippy. The programs suite is a hard gate — it is what was missing when a spec API change broke demo-book's tests silently.
+- Deploys mirror velocity's Squads flow and only ever PROPOSE: `manual-devnet-deploy.yaml` (workflow_dispatch, pick a branch) and `release-program.yaml` (`program-relay-<version>` tag) build relay.so with platform-tools v1.54, stage it in a buffer owned by the multisig vault, and propose the upgrade — signers approve + execute in the Squads UI. Required repo secrets: `DEVNET_RPC_ENDPOINT`, `DEVNET_DEPLOYER_KEYPAIR`, `DEVNET_MULTISIG`, `DEVNET_MULTISIG_VAULT`, and the `MAINNET_*` equivalents.
+- The deploy build is plain `cargo-build-sbf --tools-version v1.54` (the exact toolchain every test fixture validates), NOT the solana-verifiable-build image: the image's bundled cargo-build-sbf picks its own default platform-tools, and v1.52 miscompiles both programs here. Vet an image's default toolchain against that before moving to verifiable builds.
+
 ## Rust style
 
 Prefer declarative iterator chains (`map`/`filter`/`fold`/`try_fold`/`find`/`collect`) over imperative `for`/`while` loops wherever the two are performance-equivalent. Explicit loops are fine when they are genuinely better: hot paths where the imperative form saves real work, or indexed mutation across parallel structures that the borrow checker won't allow through closures. Avoid redundant recomputation in loops — hoist values that don't change across iterations.

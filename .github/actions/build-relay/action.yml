@@ -1,0 +1,42 @@
+name: "Build relay (deployable .so)"
+description: >
+  SBF-builds the relay program with platform-tools v1.54 — the version every
+  test fixture in this repo is built and validated with. Deliberately NOT the
+  solana-verifiable-build image for now: the image's bundled cargo-build-sbf
+  picks its own default platform-tools, and v1.52 is known to miscompile both
+  programs in this repo into runtime access violations (see CLAUDE.md). Move
+  to verifiable builds once an image whose default toolchain is vetted against
+  that miscompile is pinned here.
+runs:
+  using: "composite"
+  steps:
+    - name: Install Rust toolchain
+      uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # v1
+      with:
+        toolchain: ${{ env.RUST_TOOLCHAIN }}
+        profile: minimal
+        override: true
+    - name: Cache cargo
+      uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+      with:
+        workspaces: programs
+    - uses: ./.github/actions/setup-solana/
+    - name: Cache platform tools
+      uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+      with:
+        path: ~/.cache/solana
+        key: platform-tools-v1.54
+    - name: Build relay.so (platform-tools v1.54)
+      shell: bash
+      run: |
+        set -euo pipefail
+        cargo-build-sbf --tools-version v1.54 --manifest-path programs/relay/Cargo.toml
+        # The Solana Foundation buffer actions hardcode ./target/deploy/<program>.so.
+        mkdir -p target/deploy
+        cp programs/target/deploy/relay.so target/deploy/relay.so
+        ls -l target/deploy/relay.so
+    - name: Upload .so artifact
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      with:
+        name: relay-so
+        path: target/deploy/relay.so

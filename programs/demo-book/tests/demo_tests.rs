@@ -200,7 +200,10 @@ fn resolver_refs(ctx: &Ctx, condition: &spec::ConditionV0) -> Vec<spec::AccountR
 fn resolve(ctx: &mut Ctx, condition_index: u8) -> Option<spec::ResolvedCrankV0> {
     let conditions = read_conditions(ctx);
     let condition = &conditions[condition_index as usize];
-    assert_eq!(condition.crank_spec().resolver_program, demo_id().to_bytes());
+    assert_eq!(
+        condition.crank_spec().resolver_program,
+        demo_id().to_bytes()
+    );
     let refs = resolver_refs(ctx, condition);
     let metas: Vec<AccountMeta> = refs
         .iter()

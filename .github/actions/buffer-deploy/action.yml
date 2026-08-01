@@ -1,0 +1,84 @@
+name: "Buffer Deploy"
+description: >
+  Stages a Squads-controlled relay upgrade via the Solana Foundation
+  `prepare-squads-release` action: writes `target/deploy/relay.so` to a BPF
+  Upgradeable Loader buffer (resumable — retries re-send only the missing
+  chunks) and transfers its authority to the multisig vault, then emits the
+  verify-before-approving summary (on-chain buffer hash vs the local build's
+  hash) a multisig signer confirms before approving the Squads proposal.
+  No metadata buffer: relay publishes no on-chain IDL (its wire format is
+  relay-spec, consumed as a crate).
+inputs:
+  program-id:
+    description: "On-chain program ID being upgraded"
+    required: true
+  rpc-url:
+    description: "Solana RPC URL"
+    required: true
+  keypair:
+    description: "Deployer keypair JSON (raw [..] array string from a secret)"
+    required: true
+  buffer-authority:
+    description: "Address that should own the buffer after upload (the multisig vault PDA)"
+    required: true
+  priority-fee:
+    description: "Priority fee in microlamports for buffer-write transactions"
+    required: false
+    default: "100000"
+
+outputs:
+  buffer:
+    description: "BPF buffer address"
+    value: ${{ steps.prepare.outputs.buffer }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup node
+      uses: actions/setup-node@7c12f8017d5436eb855f1ed4399f037a36fbd9e8 # v2
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+
+    - name: Prepare Squads release (program buffer)
+      id: prepare
+      uses: solana-foundation/github-actions/prepare-squads-release@f0ddc2234ac4ac19c5c17f520b60bc2d7308744f # v0.2.11
+      with:
+        program-id: ${{ inputs.program-id }}
+        program: relay
+        rpc-url: ${{ inputs.rpc-url }}
+        keypair: ${{ inputs.keypair }}
+        squads-vault: ${{ inputs.buffer-authority }}
+        priority-fee: ${{ inputs.priority-fee }}
+        program-buffer-use-rpc: "true"
+        program-buffer-retry-attempts: "5"
+        program-buffer-max-sign-attempts: "50"
+
+    - name: Deploy summary + hashes
+      shell: bash
+      env:
+        RPC_URL: ${{ inputs.rpc-url }}
+        BUFFER: ${{ steps.prepare.outputs.buffer }}
+      # Non-fatal: a hashing hiccup must not fail an otherwise-good upload.
+      run: |
+        set -uo pipefail
+        LOCAL_HASH="$(sha256sum target/deploy/relay.so | cut -d' ' -f1)"
+        # Dump the buffer and hash its ELF bytes the same way (the loader
+        # pads buffers; compare over the .so's length).
+        DUMP=$(mktemp ./buffer-dump.XXXXXX.so)
+        BUFFER_HASH="(dump failed)"
+        if solana program dump --url "$RPC_URL" "$BUFFER" "$DUMP" >/dev/null 2>&1; then
+          SIZE=$(wc -c < target/deploy/relay.so)
+          BUFFER_HASH="$(head -c "$SIZE" "$DUMP" | sha256sum | cut -d' ' -f1)"
+        fi
+        rm -f "$DUMP"
+        if [ "$BUFFER_HASH" = "$LOCAL_HASH" ]; then VERDICT="✅ buffer hash matches local build"; else VERDICT="❌ MISMATCH — do not approve"; fi
+        {
+          echo "### relay buffer — verify before approving the Squads proposal"
+          echo ""
+          echo "| field | value |"
+          echo "| --- | --- |"
+          echo "| program buffer | \`${BUFFER}\` |"
+          echo "| on-chain buffer hash | \`${BUFFER_HASH}\` |"
+          echo "| local .so hash | \`${LOCAL_HASH}\` |"
+          echo "| verification | ${VERDICT} |"
+        } >> "$GITHUB_STEP_SUMMARY"
