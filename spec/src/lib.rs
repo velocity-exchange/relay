@@ -958,6 +958,19 @@ pub struct RelayBlockV0<const CONDITIONS: usize, const RESOLVER_CAPACITY: usize>
 unsafe impl<const C: usize, const R: usize> Zeroable for RelayBlockV0<C, R> {}
 unsafe impl<const C: usize, const R: usize> Pod for RelayBlockV0<C, R> {}
 
+/// A summary, not the kilobytes of wire bytes — hosts derive `Debug` on
+/// their account structs and this field would otherwise drown the output.
+impl<const C: usize, const R: usize> core::fmt::Debug for RelayBlockV0<C, R> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RelayBlockV0")
+            .field("conditions", &C)
+            .field("resolver_capacity", &R)
+            .field("resolver_count", &self.resolver_count)
+            .field("account_offset", &self.account_offset())
+            .finish()
+    }
+}
+
 impl<const C: usize, const R: usize> Default for RelayBlockV0<C, R> {
     fn default() -> Self {
         Self::zeroed()
