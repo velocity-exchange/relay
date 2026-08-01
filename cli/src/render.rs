@@ -92,7 +92,7 @@ pub fn wake_detail(
         }
         Err(_) => WakeDetail {
             kind: "unknown",
-            waiting_for: format!("wake kind {}", condition.wake_kind),
+            waiting_for: format!("wake kind {:?}", condition.wake()),
             chain_reads: String::new(),
             remaining: None,
         },

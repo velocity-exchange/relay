@@ -514,7 +514,7 @@ fn print_condition_table(explanations: &[Explanation]) {
                 wake.kind.to_string(),
                 wake.remaining
                     .map_or_else(|| "-".to_string(), |n| n.to_string()),
-                e.condition.min_payment.to_string(),
+                e.condition.min_payment().to_string(),
                 render::verdict_line(&e.verdict),
             ]
         })
@@ -538,7 +538,7 @@ fn explanation_json(e: &Explanation) -> serde_json::Value {
         "program": e.program.to_string(),
         "registrar": e.registrar.to_string(),
         "active": e.condition.is_active(),
-        "min_payment": e.condition.min_payment,
+        "min_payment": e.condition.min_payment(),
         "wake": {
             "kind": wake.kind,
             "waiting_for": wake.waiting_for,
@@ -591,13 +591,14 @@ async fn explain(common: &Common, target: Pubkey, index: u8, offset: Option<u32>
             "active flag CLEAR — the target program has switched this condition off"
         },
     );
-    let pays = e.condition.min_payment >= config.min_crank_payment;
+    let pays = e.condition.min_payment() >= config.min_crank_payment;
     gate(
         "pays enough",
         pays,
         &format!(
             "advertises {} lamports, this config requires {}",
-            e.condition.min_payment, config.min_crank_payment
+            e.condition.min_payment(),
+            config.min_crank_payment
         ),
     );
     let due = !matches!(

@@ -821,9 +821,7 @@ async fn at_slot_wake_fires_at_target_slot() {
 
     let target_slot = h.slot() + 50;
     let mut conditions = h.conditions();
-    conditions[0].wake_kind = spec::WakeKind::AtSlot as u8;
-    conditions[0].wake_slot = target_slot;
-    conditions[0].wake_ts = 0;
+    conditions[0].set_wake(spec::WakeView::AtSlot { slot: target_slot });
     h.write_conditions(&conditions);
     assert_eq!(
         h.conditions()[0].wake(),
@@ -2494,7 +2492,7 @@ async fn explain_reports_an_inactive_condition() {
     h.warp(t0 + 200, 2);
 
     let mut conditions = h.conditions();
-    conditions[SWEEP as usize].active = 0;
+    conditions[SWEEP as usize].deactivate();
     h.write_conditions(&conditions);
 
     let explanation = h
@@ -2533,7 +2531,7 @@ async fn explain_reports_work_priced_below_the_minimum() {
     h.warp(t0 + 200, 2);
 
     let mut conditions = h.conditions();
-    conditions[SWEEP as usize].min_payment = PAYMENT - 1;
+    conditions[SWEEP as usize].set_min_payment(PAYMENT - 1);
     h.write_conditions(&conditions);
 
     let explanation = h
@@ -2589,7 +2587,7 @@ async fn explain_reports_a_wake_with_no_work_behind_it() {
     // Sweep's wake is due, but no entry has expired.
     h.add_entry(t0 + 10_000);
     let mut conditions = h.conditions();
-    conditions[SWEEP as usize].wake_ts = t0;
+    conditions[SWEEP as usize].set_wake(spec::WakeView::AtTimestamp { unix_ts: t0 });
     h.write_conditions(&conditions);
     h.warp(t0 + 200, 2);
 
@@ -2712,12 +2710,13 @@ async fn on_value_cross_fires_only_past_the_threshold() {
     write_price(&h, 95);
 
     let mut conditions = h.conditions();
-    conditions[0].wake_kind = spec::WakeKind::OnValueCross as u8;
-    conditions[0].wake_account = oracle.to_bytes();
-    conditions[0].wake_offset = 8;
-    conditions[0].wake_len = 8;
-    conditions[0].wake_ts = 100; // threshold
-    conditions[0].wake_cmp = 0; // due when value >= 100
+    conditions[0].set_wake(spec::WakeView::OnValueCross {
+        address: oracle.to_bytes(),
+        offset: 8,
+        len: 8,
+        threshold: 100,
+        cmp: 0, // due when value >= 100
+    });
     h.write_conditions(&conditions);
     assert_eq!(
         h.conditions()[0].wake(),
@@ -2782,12 +2781,13 @@ async fn on_value_cross_below_comparator() {
     write_price(&h, -5);
 
     let mut conditions = h.conditions();
-    conditions[0].wake_kind = spec::WakeKind::OnValueCross as u8;
-    conditions[0].wake_account = oracle.to_bytes();
-    conditions[0].wake_offset = 8;
-    conditions[0].wake_len = 8;
-    conditions[0].wake_ts = -10; // negative threshold: signed compare
-    conditions[0].wake_cmp = 1; // due when value <= -10
+    conditions[0].set_wake(spec::WakeView::OnValueCross {
+        address: oracle.to_bytes(),
+        offset: 8,
+        len: 8,
+        threshold: -10, // negative threshold: signed compare
+        cmp: 1,         // due when value <= -10
+    });
     h.write_conditions(&conditions);
 
     let outcomes = h.tick().await;
@@ -2814,7 +2814,7 @@ async fn indirect_resolver_list_is_read_from_the_block_account() {
     // condition at it.
     let mut conditions = h.conditions();
     let inline = vec![spec::AccountRefV0::writable(h.book.to_bytes())];
-    assert_eq!(conditions[0].num_resolver_accounts, 1);
+    assert_eq!(conditions[0].resolvers().count, 1);
     {
         let mut svm = h.svm.lock().unwrap();
         let mut account = svm.get_account(&h.book).unwrap();
@@ -2829,8 +2829,7 @@ async fn indirect_resolver_list_is_read_from_the_block_account() {
         account.data[STAGING_OFFSET..STAGING_OFFSET + refs.len()].copy_from_slice(&refs);
         svm.set_account(h.book, account).unwrap();
     }
-    conditions[0].resolver_list_offset = STAGING_OFFSET as u32;
-    conditions[0].num_resolver_accounts = 1;
+    conditions[0].set_resolvers(spec::ResolverListV0::new(STAGING_OFFSET as u32, 1));
     h.write_conditions(&conditions);
 
     h.warp(t0, 10);

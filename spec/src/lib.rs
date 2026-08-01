@@ -312,35 +312,35 @@ pub struct ConditionV0 {
     /// Lamports the executor must pay the keeper. `crank_v0` asserts the
     /// keeper's balance grew by at least this much; turners use it to
     /// decide whether a crank is worth the fee.
-    pub min_payment: u64,
+    pub(crate) min_payment: u64,
     /// [`WakeKind::AtTimestamp`] input.
-    pub wake_ts: i64,
+    pub(crate) wake_ts: i64,
     /// [`WakeKind::EverySlots`] input (interval) or [`WakeKind::AtSlot`]
     /// input (absolute slot) — selected by `wake_kind`.
-    pub wake_slot: u64,
+    pub(crate) wake_slot: u64,
     /// [`WakeKind::OnAccountChange`] inputs.
-    pub wake_account: [u8; 32],
-    pub wake_offset: u32,
-    pub wake_len: u32,
+    pub(crate) wake_account: [u8; 32],
+    pub(crate) wake_offset: u32,
+    pub(crate) wake_len: u32,
     /// Instruction the turner simulates to discover work. Stages its
     /// payload in one of `resolver_accounts` and returns a
     /// [`ResponsePointerV0`].
-    pub resolver_program: [u8; 32],
-    pub resolver_disc: [u8; 8],
+    pub(crate) resolver_program: [u8; 32],
+    pub(crate) resolver_disc: [u8; 8],
     /// Instruction that does the work and pays the keeper. Its account list
     /// and trailing args come from the resolver's staged payload.
-    pub executor_program: [u8; 32],
-    pub executor_disc: [u8; 8],
+    pub(crate) executor_program: [u8; 32],
+    pub(crate) executor_disc: [u8; 8],
     /// How many [`AccountRefV0`]s make up the resolver's account list. The
     /// list itself lives at `resolver_list_offset`; see there.
-    pub num_resolver_accounts: u8,
+    pub(crate) num_resolver_accounts: u8,
     /// A [`WakeKind`] value.
-    pub wake_kind: u8,
+    pub(crate) wake_kind: u8,
     /// 0 = inactive (skipped by turners, rejected by `crank_v0`).
-    pub active: u8,
+    pub(crate) active: u8,
     /// [`WakeKind::OnValueCross`] comparator: 0 = due when value >=
     /// threshold (`wake_ts`), 1 = due when value <= threshold.
-    pub wake_cmp: u8,
+    pub(crate) wake_cmp: u8,
     /// Byte offset, within *this condition block's own account*, of the
     /// `num_resolver_accounts` [`AccountRefV0`]s that form the resolver's
     /// account list. The staging account must be among them and marked
@@ -352,11 +352,11 @@ pub struct ConditionV0 {
     /// point somewhere anyway. One list per account, shared by every
     /// condition that wants it, is both smaller and the only mechanism to
     /// reason about.
-    pub resolver_list_offset: u32,
+    pub(crate) resolver_list_offset: u32,
     /// Reserved. Zero on write, ignored on read — room to add fields
     /// without moving every existing one or resizing every account that
     /// holds a block.
-    pub _reserved: [u8; 40],
+    pub(crate) _reserved: [u8; 40],
 }
 
 pub const CONDITION_LEN: usize = core::mem::size_of::<ConditionV0>();
@@ -444,6 +444,95 @@ impl ConditionV0 {
         c
     }
 
+    /// Lamports the executor must pay the keeper.
+    pub fn min_payment(&self) -> u64 {
+        self.min_payment
+    }
+
+    /// Where this condition's resolver account list lives.
+    pub fn resolvers(&self) -> ResolverListV0 {
+        ResolverListV0::new(self.resolver_list_offset, self.num_resolver_accounts)
+    }
+
+    /// The programs and discriminators to simulate and then submit.
+    pub fn crank_spec(&self) -> CrankSpecV0 {
+        CrankSpecV0 {
+            resolver_program: self.resolver_program,
+            resolver_disc: self.resolver_disc,
+            executor_program: self.executor_program,
+            executor_disc: self.executor_disc,
+            min_payment: self.min_payment,
+        }
+    }
+
+    /// Point this condition at a different resolver account list.
+    pub fn set_resolvers(&mut self, resolvers: ResolverListV0) {
+        self.resolver_list_offset = resolvers.offset;
+        self.num_resolver_accounts = resolvers.count;
+    }
+
+    /// Re-price the keeper fee (hosts re-price in place on reconfigure).
+    pub fn set_min_payment(&mut self, lamports: u64) {
+        self.min_payment = lamports;
+    }
+
+    /// Go quiet. A level-triggered wake fires until this is called.
+    pub fn deactivate(&mut self) {
+        self.active = 0;
+    }
+
+    /// Rewrite the wake, by variant. The wire format overloads its fields
+    /// — `wake_ts` is a timestamp for one kind and a threshold for another
+    /// — so this is the only sanctioned way to change one: it always
+    /// writes the discriminant and the fields together, and clears what
+    /// the new variant does not use.
+    pub fn set_wake(&mut self, wake: WakeView) {
+        self.wake_ts = 0;
+        self.wake_slot = 0;
+        self.wake_account = [0; 32];
+        self.wake_offset = 0;
+        self.wake_len = 0;
+        self.wake_cmp = 0;
+        match wake {
+            WakeView::AtTimestamp { unix_ts } => {
+                self.wake_kind = WakeKind::AtTimestamp as u8;
+                self.wake_ts = unix_ts;
+            }
+            WakeView::OnAccountChange {
+                address,
+                offset,
+                len,
+            } => {
+                self.wake_kind = WakeKind::OnAccountChange as u8;
+                self.wake_account = address;
+                self.wake_offset = offset;
+                self.wake_len = len;
+            }
+            WakeView::EverySlots { slots } => {
+                self.wake_kind = WakeKind::EverySlots as u8;
+                self.wake_slot = slots;
+            }
+            WakeView::AtSlot { slot } => {
+                self.wake_kind = WakeKind::AtSlot as u8;
+                self.wake_slot = slot;
+            }
+            WakeView::OnValueCross {
+                address,
+                offset,
+                len,
+                threshold,
+                cmp,
+            } => {
+                self.wake_kind = WakeKind::OnValueCross as u8;
+                self.wake_account = address;
+                self.wake_offset = offset;
+                self.wake_len = len;
+                self.wake_ts = threshold;
+                self.wake_cmp = cmp;
+            }
+        }
+    }
+
     pub fn is_active(&self) -> bool {
         self.active != 0
     }
@@ -474,6 +563,53 @@ impl ConditionV0 {
             _ => Err(SpecError::BadWakeKind),
         }
     }
+}
+
+/// Implement [`ConditionBlock`] for an account that keeps its block in a
+/// byte field, and pin the invariants the reader depends on.
+///
+/// Hosts were writing this by hand: the impl, plus a set of offset
+/// constants derived by adding up the lengths of every preceding field.
+/// That arithmetic is the one part of hosting a block that is easy to get
+/// silently wrong — a stale summand puts a region's offset a few bytes off
+/// and the failure surfaces as a turner reading garbage, far away. Here it
+/// comes from `offset_of!` instead, so it cannot disagree with the struct.
+///
+/// ```ignore
+/// condition_block!(UserConditionsV0, block, USER_CONDITIONS);
+/// ```
+#[macro_export]
+macro_rules! condition_block {
+    ($ty:ty, $field:ident, $n:expr) => {
+        impl $crate::ConditionBlock for $ty {
+            const NUM_CONDITIONS: usize = $n;
+
+            fn block(&self) -> &[u8] {
+                &self.$field
+            }
+
+            fn block_mut(&mut self) -> &mut [u8] {
+                &mut self.$field
+            }
+        }
+
+        const _: () = {
+            // The block must be 8-aligned within the account for the
+            // zero-copy readers, and big enough for the conditions it
+            // claims to hold.
+            assert!($crate::block_offset!($ty, $field) % 8 == 0);
+        };
+    };
+}
+
+/// Account-data offset of a field: past anchor's 8-byte discriminator.
+/// Every region a condition points at — resolver lists, staging — must be
+/// described this way rather than by summing field lengths.
+#[macro_export]
+macro_rules! block_offset {
+    ($ty:ty, $field:ident) => {
+        8 + core::mem::offset_of!($ty, $field)
+    };
 }
 
 /// Write a resolved crank into a staging buffer and describe where it
@@ -583,6 +719,40 @@ pub trait ConditionBlock {
 
     fn block(&self) -> &[u8];
     fn block_mut(&mut self) -> &mut [u8];
+
+    /// Bring a block written by an older spec up to the current one, in
+    /// place, and report whether anything changed.
+    ///
+    /// Hosts should call this before reading a block they did not write in
+    /// the same instruction. Today every supported version is the current
+    /// one, so it only re-stamps a header — but the call site is the point:
+    /// when a v1 arrives, hosts that already call this get the conversion
+    /// without changing, and hosts that never called it were going to
+    /// misread the block anyway.
+    fn migrate(&mut self) -> Result<bool, SpecError> {
+        // Read the header bytewise rather than through `read_block`: a
+        // migration must work on a block whose alignment is whatever the
+        // old layout left, which is the case this exists to handle.
+        let bytes = self.block();
+        let head = bytes.get(..BLOCK_HEADER_LEN).ok_or(SpecError::Truncated)?;
+        if head[..8] != MAGIC {
+            return Err(SpecError::BadMagic);
+        }
+        let (version, num_conditions) = (head[8], head[9] as usize);
+        if version > SPEC_VERSION {
+            return Err(SpecError::UnsupportedVersion);
+        }
+        if version == SPEC_VERSION && num_conditions == Self::NUM_CONDITIONS {
+            return Ok(false);
+        }
+        // Only same-shape re-stamping is possible at v0; a real conversion
+        // lands here when the layout actually changes.
+        if num_conditions != Self::NUM_CONDITIONS {
+            return Err(SpecError::TooLarge);
+        }
+        self.init_header()?;
+        Ok(true)
+    }
 
     /// Stamp the spec header. Conditions are written separately, by index,
     /// so a freshly zeroed account is a valid (inactive) block from the
@@ -974,6 +1144,38 @@ mod tests {
         assert_eq!(bad.wake(), Err(SpecError::BadWakeKind));
     }
 
+    /// The wire fields are sealed; a wake is written by variant, and
+    /// writing one clears what the previous variant used. `wake_ts` is a
+    /// timestamp for one kind and a threshold for another — that overload
+    /// is exactly what a caller must not have to remember.
+    #[test]
+    fn set_wake_replaces_the_variant_wholesale() {
+        let mut c = ConditionV0::on_value_cross(
+            [7; 32],
+            8,
+            8,
+            1234,
+            1,
+            spec(0),
+            ResolverListV0::new(64, 1),
+        );
+        assert_eq!(
+            c.wake(),
+            Ok(WakeView::OnValueCross {
+                address: [7; 32],
+                offset: 8,
+                len: 8,
+                threshold: 1234,
+                cmp: 1,
+            })
+        );
+        c.set_wake(WakeView::EverySlots { slots: 300 });
+        assert_eq!(c.wake(), Ok(WakeView::EverySlots { slots: 300 }));
+        // The threshold did not survive as a stale timestamp.
+        c.set_wake(WakeView::AtTimestamp { unix_ts: 5 });
+        assert_eq!(c.wake(), Ok(WakeView::AtTimestamp { unix_ts: 5 }));
+    }
+
     #[test]
     fn resolver_list_is_always_indirect() {
         let c = ConditionV0::at_timestamp(0, spec(0), ResolverListV0::new(96, 7));
@@ -1176,6 +1378,14 @@ mod condition_block_tests {
             executor_disc: [3; 8],
             min_payment: 7,
         }
+    }
+
+    /// A block already at the current version reports no change.
+    #[test]
+    fn migrate_is_a_no_op_on_a_current_block() {
+        let mut host = host();
+        host.init_header().unwrap();
+        assert_eq!(host.migrate(), Ok(false));
     }
 
     #[test]

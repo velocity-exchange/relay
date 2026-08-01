@@ -565,7 +565,7 @@ impl<S: ChainSource> Turner<S> {
             .map_err(|_| crate::filter::RejectReason::Unparseable)?;
         conditions
             .iter()
-            .any(|c| c.is_active() && c.min_payment >= self.config.min_crank_payment)
+            .any(|c| c.is_active() && c.min_payment() >= self.config.min_crank_payment)
             .then_some(())
             .ok_or(crate::filter::RejectReason::PaysTooLittle)
     }
@@ -779,7 +779,7 @@ impl<S: ChainSource> Turner<S> {
         if !condition.is_active() {
             return Err(Outcome::Skipped(key, SkipReason::Inactive));
         }
-        if condition.min_payment < self.config.min_crank_payment {
+        if condition.min_payment() < self.config.min_crank_payment {
             return Err(Outcome::Skipped(key, SkipReason::BelowMinPayment));
         }
         let Ok(wake) = condition.wake() else {
@@ -962,11 +962,12 @@ impl<S: ChainSource> Turner<S> {
             .map(|a| Pubkey::from(a.address))
             .collect();
         let resolver_ix = Instruction {
-            program_id: Pubkey::from(condition.resolver_program),
+            program_id: Pubkey::from(condition.crank_spec().resolver_program),
             accounts: due.resolver_accounts.iter().map(account_ref_meta).collect(),
-            data: condition.resolver_disc.to_vec(),
+            data: condition.crank_spec().resolver_disc.to_vec(),
         };
-        let program_label = metrics::program_label(&Pubkey::from(condition.resolver_program));
+        let program_label =
+            metrics::program_label(&Pubkey::from(condition.crank_spec().resolver_program));
         let sim = {
             let started = Instant::now();
             let (tx, _) = self.signed_tx(&[resolver_ix]).await?;
@@ -1006,7 +1007,7 @@ impl<S: ChainSource> Turner<S> {
         let resolved = read_staged(&sim.accounts, &pointer).context("staged resolver payload")?;
 
         // Build the executor itself — no CPI wrapper.
-        let program = Pubkey::from(condition.executor_program);
+        let program = Pubkey::from(condition.crank_spec().executor_program);
         let Some(payout) = self.payout_for(&program) else {
             return Ok(CrankResult::Done(
                 Outcome::Skipped(key, SkipReason::NoSafePayout),
@@ -1033,6 +1034,7 @@ impl<S: ChainSource> Turner<S> {
                 })
                 .collect(),
             data: condition
+                .crank_spec()
                 .executor_disc
                 .iter()
                 .copied()
@@ -1053,7 +1055,7 @@ impl<S: ChainSource> Turner<S> {
                 StateUpdate::Failed,
             ));
         }
-        let ixs = self.guarded(executor_ix, payout, &program, condition.min_payment);
+        let ixs = self.guarded(executor_ix, payout, &program, condition.min_payment());
 
         // Simulate with a generous budget to learn the real cost, then let
         // the packing phase re-sign with a tight limit — the fee is charged
@@ -1083,7 +1085,7 @@ impl<S: ChainSource> Turner<S> {
         Ok(CrankResult::Ready(Box::new(Prepared {
             key,
             program: due.program,
-            min_payment: condition.min_payment,
+            min_payment: condition.min_payment(),
             units: sim.units_consumed,
             ixs,
         })))
@@ -1618,11 +1620,11 @@ fn materialize_resolver_accounts(
     condition: &spec::ConditionV0,
     block_account_data: &[u8],
 ) -> Option<Vec<spec::AccountRefV0>> {
-    let count = condition.num_resolver_accounts as usize;
+    let count = condition.resolvers().count as usize;
     if count > spec::MAX_INDIRECT_RESOLVER_ACCOUNTS {
         return None;
     }
-    let start = condition.resolver_list_offset as usize;
+    let start = condition.resolvers().offset as usize;
     let end = start.checked_add(count.checked_mul(spec::ACCOUNT_REF_LEN)?)?;
     let region = block_account_data.get(start..end)?;
     Some(

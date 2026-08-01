@@ -88,15 +88,15 @@ const_assert_eq!(core::mem::size_of::<BookV0>(), 2560);
 
 /// Account-data offset of the condition block (what to register the watch
 /// at). 8-aligned, as the zero-copy read path requires.
-pub const CONDITIONS_OFFSET: usize = 8 + core::mem::offset_of!(BookV0, block);
+pub const CONDITIONS_OFFSET: usize = relay_spec::block_offset!(BookV0, block);
 const_assert_eq!(CONDITIONS_OFFSET % 8, 0);
 // The block is one region now; the reader's only requirement is alignment.
 const_assert_eq!(CONDITIONS_OFFSET % 8, 0);
 
 /// Account-data offset of the staging region — the `offset` a resolver's
 /// [`ResponsePointerV0`] carries.
-pub const STAGING_OFFSET: usize = 8 + core::mem::offset_of!(BookV0, staging);
-pub const RESOLVERS_OFFSET: usize = 8 + core::mem::offset_of!(BookV0, resolvers);
+pub const STAGING_OFFSET: usize = relay_spec::block_offset!(BookV0, staging);
+pub const RESOLVERS_OFFSET: usize = relay_spec::block_offset!(BookV0, resolvers);
 
 /// Account-data offset of `entry_count` — the evict condition's
 /// change-watch range.
@@ -144,7 +144,9 @@ impl BookV0 {
         if expiry_ts < self.next_expiry_ts {
             self.next_expiry_ts = expiry_ts;
             // The single-store wake update the pod layout exists for.
-            let _ = self.update_condition(SWEEP_CONDITION as usize, |c| c.wake_ts = expiry_ts);
+            let _ = self.update_condition(SWEEP_CONDITION as usize, |c| {
+                c.set_wake(relay_spec::WakeView::AtTimestamp { unix_ts: expiry_ts })
+            });
         }
         Ok(id)
     }
@@ -173,7 +175,9 @@ impl BookV0 {
     pub fn repair_next_expiry(&mut self) {
         self.next_expiry_ts = self.true_next_expiry();
         let next = self.next_expiry_ts;
-        let _ = self.update_condition(SWEEP_CONDITION as usize, |c| c.wake_ts = next);
+        let _ = self.update_condition(SWEEP_CONDITION as usize, |c| {
+            c.set_wake(relay_spec::WakeView::AtTimestamp { unix_ts: next })
+        });
     }
 
     /// Live entry with the smallest id (the eviction victim).
@@ -298,17 +302,7 @@ impl BookV0 {
 /// The block region + staging contract, from the spec. Everything the
 /// program calls on it (`init_header`, `write_condition`,
 /// `update_condition`, `stage`) is a provided method.
-impl ConditionBlock for BookV0 {
-    const NUM_CONDITIONS: usize = NUM_CONDITIONS;
-
-    fn block(&self) -> &[u8] {
-        &self.block
-    }
-
-    fn block_mut(&mut self) -> &mut [u8] {
-        &mut self.block
-    }
-}
+relay_spec::condition_block!(BookV0, block, NUM_CONDITIONS);
 
 impl BookV0 {
     /// Executor account list shared by every resolver: keeper placeholder
