@@ -226,9 +226,11 @@ pub enum WakeKind {
     AtSlot = 3,
     /// Due while the watched value sits at-or-beyond a threshold: the
     /// bytes at `wake_account.data[wake_offset..wake_offset + wake_len]`
-    /// read as a little-endian signed integer (widths 1/2/4/8,
-    /// sign-extended), compared against `wake_ts` reinterpreted as the
-    /// threshold, in the direction `wake_cmp` selects (0 = due when
+    /// read as a little-endian integer (widths 1/2/4/8; signed and
+    /// sign-extended by default, unsigned and zero-extended when
+    /// `wake_value_unsigned` is set — declared by the [`WatchValue`] the
+    /// condition was built with), compared against `wake_ts` reinterpreted
+    /// as the threshold, in the direction `wake_cmp` selects (0 = due when
     /// value >= threshold, 1 = due when value <= threshold).
     ///
     /// This is the wake for price-like conditions — trigger orders,
@@ -263,30 +265,76 @@ pub enum WakeView {
         address: [u8; 32],
         offset: u32,
         len: u32,
-        threshold: i64,
+        threshold: WatchValue,
         /// 0 = due when value >= threshold, 1 = due when value <= threshold.
         cmp: u8,
     },
 }
 
-/// Read a watched region as the signed little-endian integer
-/// [`WakeKind::OnValueCross`] compares (widths 1/2/4/8, sign-extended).
-/// `None` for any other width — an unreadable value is never due.
-pub fn read_watched_value(bytes: &[u8]) -> Option<i64> {
-    match bytes.len() {
-        1 => Some(i8::from_le_bytes(bytes.try_into().ok()?) as i64),
-        2 => Some(i16::from_le_bytes(bytes.try_into().ok()?) as i64),
-        4 => Some(i32::from_le_bytes(bytes.try_into().ok()?) as i64),
-        8 => Some(i64::from_le_bytes(bytes.try_into().ok()?)),
-        _ => None,
+/// A watched integer with its signedness. On-chain fields are unsigned at
+/// least as often as they are signed (token amounts, counters, most u64
+/// prices), and sign-extending an unsigned field with its top bit set
+/// inverts every comparison — so the threshold carries which domain it
+/// lives in, and the watched bytes are always read in that same domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchValue {
+    Signed(i64),
+    Unsigned(u64),
+}
+
+impl WatchValue {
+    pub fn is_unsigned(&self) -> bool {
+        matches!(self, WatchValue::Unsigned(_))
+    }
+
+    /// Both domains fit in i128, so comparisons are uniform.
+    pub fn widened(self) -> i128 {
+        match self {
+            WatchValue::Signed(v) => v as i128,
+            WatchValue::Unsigned(v) => v as i128,
+        }
     }
 }
 
+impl core::fmt::Display for WatchValue {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            WatchValue::Signed(v) => write!(f, "{v}"),
+            WatchValue::Unsigned(v) => write!(f, "{v}u"),
+        }
+    }
+}
+
+/// Read a watched region as the little-endian integer
+/// [`WakeKind::OnValueCross`] compares (widths 1/2/4/8; sign-extended when
+/// signed, zero-extended when unsigned). `None` for any other width — an
+/// unreadable value is never due.
+pub fn read_watched_value(bytes: &[u8], unsigned: bool) -> Option<WatchValue> {
+    if unsigned {
+        let value = match bytes.len() {
+            1 => u8::from_le_bytes(bytes.try_into().ok()?) as u64,
+            2 => u16::from_le_bytes(bytes.try_into().ok()?) as u64,
+            4 => u32::from_le_bytes(bytes.try_into().ok()?) as u64,
+            8 => u64::from_le_bytes(bytes.try_into().ok()?),
+            _ => return None,
+        };
+        return Some(WatchValue::Unsigned(value));
+    }
+    let value = match bytes.len() {
+        1 => i8::from_le_bytes(bytes.try_into().ok()?) as i64,
+        2 => i16::from_le_bytes(bytes.try_into().ok()?) as i64,
+        4 => i32::from_le_bytes(bytes.try_into().ok()?) as i64,
+        8 => i64::from_le_bytes(bytes.try_into().ok()?),
+        _ => return None,
+    };
+    Some(WatchValue::Signed(value))
+}
+
 /// Whether an [`WakeKind::OnValueCross`] condition is due for `value`.
-pub fn value_crossed(value: i64, threshold: i64, cmp: u8) -> bool {
+pub fn value_crossed(value: WatchValue, threshold: WatchValue, cmp: u8) -> bool {
     match cmp {
-        0 => value >= threshold,
-        _ => value <= threshold,
+        0 => value.widened() >= threshold.widened(),
+        _ => value.widened() <= threshold.widened(),
     }
 }
 
@@ -353,10 +401,15 @@ pub struct ConditionV0 {
     /// condition that wants it, is both smaller and the only mechanism to
     /// reason about.
     pub(crate) resolver_list_offset: u32,
+    /// [`WakeKind::OnValueCross`]: nonzero = the watched bytes and the
+    /// threshold (`wake_ts`'s bits reinterpreted as `u64`) are unsigned.
+    /// Zero — the value every pre-existing block already holds — keeps the
+    /// original signed reading.
+    pub(crate) wake_value_unsigned: u8,
     /// Reserved. Zero on write, ignored on read — room to add fields
     /// without moving every existing one or resizing every account that
     /// holds a block.
-    pub(crate) _reserved: [u8; 40],
+    pub(crate) _reserved: [u8; 39],
 }
 
 pub const CONDITION_LEN: usize = core::mem::size_of::<ConditionV0>();
@@ -381,7 +434,8 @@ impl ConditionV0 {
             active: 1,
             wake_cmp: 0,
             resolver_list_offset: resolvers.offset,
-            _reserved: [0; 40],
+            wake_value_unsigned: 0,
+            _reserved: [0; 39],
         }
     }
 
@@ -409,13 +463,16 @@ impl ConditionV0 {
 
     /// Level-triggered value threshold (see [`WakeKind::OnValueCross`]):
     /// due while the watched value is at-or-beyond `threshold` in the
-    /// direction `cmp` selects (0 = >=, 1 = <=).
+    /// direction `cmp` selects (0 = >=, 1 = <=). The threshold's
+    /// [`WatchValue`] variant declares the watched field's signedness —
+    /// the caller knows the layout it is watching, and reading an unsigned
+    /// field sign-extended inverts the comparison once the top bit is set.
     #[allow(clippy::too_many_arguments)]
     pub fn on_value_cross(
         watched: [u8; 32],
         offset: u32,
         len: u32,
-        threshold: i64,
+        threshold: WatchValue,
         cmp: u8,
         spec: CrankSpecV0,
         resolvers: ResolverListV0,
@@ -425,8 +482,14 @@ impl ConditionV0 {
         c.wake_account = watched;
         c.wake_offset = offset;
         c.wake_len = len;
-        c.wake_ts = threshold;
         c.wake_cmp = cmp;
+        match threshold {
+            WatchValue::Signed(value) => c.wake_ts = value,
+            WatchValue::Unsigned(value) => {
+                c.wake_ts = value as i64;
+                c.wake_value_unsigned = 1;
+            }
+        }
         c
     }
 
@@ -493,6 +556,7 @@ impl ConditionV0 {
         self.wake_offset = 0;
         self.wake_len = 0;
         self.wake_cmp = 0;
+        self.wake_value_unsigned = 0;
         match wake {
             WakeView::AtTimestamp { unix_ts } => {
                 self.wake_kind = WakeKind::AtTimestamp as u8;
@@ -527,8 +591,14 @@ impl ConditionV0 {
                 self.wake_account = address;
                 self.wake_offset = offset;
                 self.wake_len = len;
-                self.wake_ts = threshold;
                 self.wake_cmp = cmp;
+                match threshold {
+                    WatchValue::Signed(value) => self.wake_ts = value,
+                    WatchValue::Unsigned(value) => {
+                        self.wake_ts = value as i64;
+                        self.wake_value_unsigned = 1;
+                    }
+                }
             }
         }
     }
@@ -557,7 +627,11 @@ impl ConditionV0 {
                 address: self.wake_account,
                 offset: self.wake_offset,
                 len: self.wake_len,
-                threshold: self.wake_ts,
+                threshold: if self.wake_value_unsigned != 0 {
+                    WatchValue::Unsigned(self.wake_ts as u64)
+                } else {
+                    WatchValue::Signed(self.wake_ts)
+                },
                 cmp: self.wake_cmp,
             }),
             _ => Err(SpecError::BadWakeKind),
@@ -1154,7 +1228,7 @@ mod tests {
             [7; 32],
             8,
             8,
-            1234,
+            WatchValue::Signed(1234),
             1,
             spec(0),
             ResolverListV0::new(64, 1),
@@ -1165,7 +1239,7 @@ mod tests {
                 address: [7; 32],
                 offset: 8,
                 len: 8,
-                threshold: 1234,
+                threshold: WatchValue::Signed(1234),
                 cmp: 1,
             })
         );
@@ -1176,13 +1250,93 @@ mod tests {
         assert_eq!(c.wake(), Ok(WakeView::AtTimestamp { unix_ts: 5 }));
     }
 
+    /// An unsigned watched field with its top bit set must not read as
+    /// negative. A u64 amount past `i64::MAX` sign-extended flips every
+    /// comparison: `value >= threshold` reports not-due exactly when the
+    /// value is at its largest.
+    #[test]
+    fn unsigned_watches_compare_in_the_unsigned_domain() {
+        let big: u64 = i64::MAX as u64 + 5; // top bit set
+        let bytes = big.to_le_bytes();
+
+        // Sign-extended (the old reading) this is negative and >= fails.
+        let signed = read_watched_value(&bytes, false).unwrap();
+        assert!(!value_crossed(signed, WatchValue::Signed(100), 0));
+
+        // Declared unsigned it compares correctly, in both directions.
+        let unsigned = read_watched_value(&bytes, true).unwrap();
+        assert_eq!(unsigned, WatchValue::Unsigned(big));
+        assert!(value_crossed(unsigned, WatchValue::Unsigned(100), 0));
+        assert!(!value_crossed(unsigned, WatchValue::Unsigned(u64::MAX), 0));
+        assert!(value_crossed(unsigned, WatchValue::Unsigned(u64::MAX), 1));
+
+        // And the condition round-trips the declaration through the wire.
+        let c = ConditionV0::on_value_cross(
+            [7; 32],
+            8,
+            8,
+            WatchValue::Unsigned(big),
+            0,
+            spec(0),
+            ResolverListV0::new(64, 1),
+        );
+        let Ok(WakeView::OnValueCross { threshold, .. }) = c.wake() else {
+            panic!("wrong wake kind");
+        };
+        assert_eq!(threshold, WatchValue::Unsigned(big));
+
+        // Narrow unsigned widths zero-extend.
+        assert_eq!(
+            read_watched_value(&0xFFu8.to_le_bytes(), true),
+            Some(WatchValue::Unsigned(255))
+        );
+        assert_eq!(
+            read_watched_value(&0xFFFFu16.to_le_bytes(), true),
+            Some(WatchValue::Unsigned(65_535))
+        );
+    }
+
+    /// Rewriting an unsigned value-cross wake to any other variant clears
+    /// the signedness flag with the rest of the wake fields.
+    #[test]
+    fn set_wake_clears_the_signedness_flag() {
+        let mut c = ConditionV0::on_value_cross(
+            [7; 32],
+            8,
+            8,
+            WatchValue::Unsigned(9),
+            0,
+            spec(0),
+            ResolverListV0::new(64, 1),
+        );
+        assert_eq!(c.wake_value_unsigned, 1);
+        c.set_wake(WakeView::OnValueCross {
+            address: [7; 32],
+            offset: 8,
+            len: 8,
+            threshold: WatchValue::Signed(-3),
+            cmp: 0,
+        });
+        assert_eq!(c.wake_value_unsigned, 0);
+        assert_eq!(
+            c.wake().unwrap(),
+            WakeView::OnValueCross {
+                address: [7; 32],
+                offset: 8,
+                len: 8,
+                threshold: WatchValue::Signed(-3),
+                cmp: 0,
+            }
+        );
+    }
+
     #[test]
     fn resolver_list_is_always_indirect() {
         let c = ConditionV0::at_timestamp(0, spec(0), ResolverListV0::new(96, 7));
         assert_eq!(c.resolver_list_offset, 96);
         assert_eq!(c.num_resolver_accounts, 7);
         // Reserved space stays zero so a future field can claim it.
-        assert_eq!(c._reserved, [0u8; 40]);
+        assert_eq!(c._reserved, [0u8; 39]);
     }
 
     #[test]
@@ -1412,7 +1566,15 @@ mod condition_block_tests {
         // Deactivation is what makes a level-triggered wake go quiet.
         host.write_condition(
             2,
-            &ConditionV0::on_value_cross([5; 32], 8, 8, 100, 0, spec(), ResolverListV0::new(0, 0)),
+            &ConditionV0::on_value_cross(
+                [5; 32],
+                8,
+                8,
+                WatchValue::Signed(100),
+                0,
+                spec(),
+                ResolverListV0::new(0, 0),
+            ),
         )
         .unwrap();
         assert_eq!(host.read_condition(2).unwrap().active, 1);

@@ -808,7 +808,7 @@ impl<S: ChainSource> Turner<S> {
             }
             spec::WakeView::OnValueCross { threshold, cmp, .. } => watched_now
                 .as_deref()
-                .and_then(spec::read_watched_value)
+                .and_then(|bytes| spec::read_watched_value(bytes, threshold.is_unsigned()))
                 .is_some_and(|value| spec::value_crossed(value, threshold, cmp)),
         };
         if !due {

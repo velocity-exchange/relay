@@ -2714,7 +2714,7 @@ async fn on_value_cross_fires_only_past_the_threshold() {
         address: oracle.to_bytes(),
         offset: 8,
         len: 8,
-        threshold: 100,
+        threshold: spec::WatchValue::Signed(100),
         cmp: 0, // due when value >= 100
     });
     h.write_conditions(&conditions);
@@ -2724,7 +2724,7 @@ async fn on_value_cross_fires_only_past_the_threshold() {
             address: oracle.to_bytes(),
             offset: 8,
             len: 8,
-            threshold: 100,
+            threshold: spec::WatchValue::Signed(100),
             cmp: 0,
         })
     );
@@ -2785,8 +2785,8 @@ async fn on_value_cross_below_comparator() {
         address: oracle.to_bytes(),
         offset: 8,
         len: 8,
-        threshold: -10, // negative threshold: signed compare
-        cmp: 1,         // due when value <= -10
+        threshold: spec::WatchValue::Signed(-10), // negative threshold: signed compare
+        cmp: 1,                                   // due when value <= -10
     });
     h.write_conditions(&conditions);
 

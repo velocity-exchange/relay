@@ -68,7 +68,8 @@ pub fn wake_detail(
             threshold,
             cmp,
         }) => {
-            let value = watched_now.and_then(relay_spec::read_watched_value);
+            let value = watched_now
+                .and_then(|bytes| relay_spec::read_watched_value(bytes, threshold.is_unsigned()));
             WakeDetail {
                 kind: "on-value-cross",
                 waiting_for: format!(
@@ -83,9 +84,9 @@ pub fn wake_detail(
                 ),
                 remaining: value.map(|value| {
                     if cmp == 0 {
-                        threshold as i128 - value as i128
+                        threshold.widened() - value.widened()
                     } else {
-                        value as i128 - threshold as i128
+                        value.widened() - threshold.widened()
                     }
                 }),
             }
