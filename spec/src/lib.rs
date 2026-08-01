@@ -570,23 +570,19 @@ pub fn write_block(region: &mut [u8], conditions: &[ConditionV0]) -> Result<usiz
 /// arithmetic — and an off-by-one in it is a silently unreadable block.
 ///
 /// The block must live at an 8-aligned account-data offset (see
-/// [`read_block`]); `STAGING_OFFSET` is the *account-data* offset of the
-/// staging region, because that is the frame a [`ResponsePointerV0`] is
-/// interpreted in.
+/// [`read_block`]).
+///
+/// Staging is deliberately not part of this. A host does not have to
+/// carry scratch of its own — see [`stage_into`] — so where a resolved
+/// crank lands is the resolver's decision, not a property of the account
+/// holding the conditions.
 pub trait ConditionBlock {
     /// Conditions the block holds. Slots are addressed by index, so this
     /// is fixed per account type.
     const NUM_CONDITIONS: usize;
-    /// Account-data offset of the staging region.
-    const STAGING_OFFSET: u32;
-    /// Index, within the resolver's own account list, of the account the
-    /// staged payload is written to. Almost always 0 — resolvers put their
-    /// conditions account first by convention.
-    const STAGING_ACCOUNT_INDEX: u8 = 0;
 
     fn block(&self) -> &[u8];
     fn block_mut(&mut self) -> &mut [u8];
-    fn staging_mut(&mut self) -> &mut [u8];
 
     /// Stamp the spec header. Conditions are written separately, by index,
     /// so a freshly zeroed account is a valid (inactive) block from the
@@ -655,13 +651,6 @@ pub trait ConditionBlock {
 
     /// Write a resolver's payload into the staging region and return the
     /// pointer bytes to set as return data.
-    fn stage(
-        &mut self,
-        resolved: &ResolvedCrankV0,
-    ) -> Result<[u8; RESPONSE_POINTER_LEN], SpecError> {
-        let (index, offset) = (Self::STAGING_ACCOUNT_INDEX, Self::STAGING_OFFSET);
-        stage_into(self.staging_mut(), index, offset, resolved)
-    }
 
     #[doc(hidden)]
     fn slot_start(index: usize) -> Result<usize, SpecError> {
@@ -1160,17 +1149,15 @@ mod condition_block_tests {
         staging: [u8; 512],
     }
 
+    const HOST_STAGING_OFFSET: u32 = (8 + BLOCK_HEADER_LEN + 3 * CONDITION_LEN) as u32;
+
     impl ConditionBlock for Host {
         const NUM_CONDITIONS: usize = 3;
-        const STAGING_OFFSET: u32 = (8 + BLOCK_HEADER_LEN + 3 * CONDITION_LEN) as u32;
         fn block(&self) -> &[u8] {
             &self.block
         }
         fn block_mut(&mut self) -> &mut [u8] {
             &mut self.block
-        }
-        fn staging_mut(&mut self) -> &mut [u8] {
-            &mut self.staging
         }
     }
 
@@ -1239,10 +1226,11 @@ mod condition_block_tests {
             accounts: vec![AccountRefV0::writable([9; 32])],
             data: vec![1, 2, 3],
         };
-        let pointer_bytes = host.stage(&resolved).unwrap();
+        let pointer_bytes =
+            stage_into(&mut host.staging, 0, HOST_STAGING_OFFSET, &resolved).unwrap();
         let pointer = ResponsePointerV0::read(&pointer_bytes).unwrap();
         assert!(pointer.has_work());
-        assert_eq!(pointer.offset(), Host::STAGING_OFFSET);
+        assert_eq!(pointer.offset(), HOST_STAGING_OFFSET);
         assert_eq!(
             ResolvedCrankV0::read(&host.staging[..pointer.len() as usize]).unwrap(),
             resolved

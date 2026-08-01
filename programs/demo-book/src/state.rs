@@ -216,7 +216,16 @@ impl BookV0 {
         &mut self,
         resolved: &ResolvedCrankV0,
     ) -> Result<[u8; RESPONSE_POINTER_LEN]> {
-        Ok(ConditionBlock::stage(self, resolved).map_err(|_| DemoError::StagingOverflow)?)
+        // The book keeps its own scratch, so it stages into itself; a host
+        // that shares a scratch account passes that account's bytes here
+        // instead.
+        Ok(relay_spec::stage_into(
+            &mut self.staging,
+            STAGING_ACCOUNT_INDEX,
+            STAGING_OFFSET as u32,
+            resolved,
+        )
+        .map_err(|_| DemoError::StagingOverflow)?)
     }
 
     /// One-time condition block initialization (wake inputs are updated in
@@ -291,8 +300,6 @@ impl BookV0 {
 /// `update_condition`, `stage`) is a provided method.
 impl ConditionBlock for BookV0 {
     const NUM_CONDITIONS: usize = NUM_CONDITIONS;
-    const STAGING_OFFSET: u32 = STAGING_OFFSET as u32;
-    const STAGING_ACCOUNT_INDEX: u8 = STAGING_ACCOUNT_INDEX;
 
     fn block(&self) -> &[u8] {
         &self.block
@@ -300,10 +307,6 @@ impl ConditionBlock for BookV0 {
 
     fn block_mut(&mut self) -> &mut [u8] {
         &mut self.block
-    }
-
-    fn staging_mut(&mut self) -> &mut [u8] {
-        &mut self.staging
     }
 }
 
