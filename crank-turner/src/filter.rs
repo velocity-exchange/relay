@@ -9,7 +9,7 @@
 //!
 //! Filters apply in cost order, cheapest first:
 //!
-//! 1. **Server-side** — `target_program` (and `registrar`) lead the
+//! 1. **Server-side** — `target_program` (and `creator`) lead the
 //!    `WatchV0` layout, so an allowlist becomes a `getProgramAccounts` /
 //!    geyser memcmp filter. Watches outside it are never even transmitted.
 //! 2. **Registry-only** — denylists and target pins are evaluated against
@@ -37,8 +37,8 @@ pub enum RejectReason {
     ProgramNotAllowed,
     /// Target program is on the denylist.
     ProgramBlocked,
-    /// Registrar is not on the allowlist.
-    RegistrarNotAllowed,
+    /// Watch creator is not on the allowlist.
+    CreatorNotAllowed,
     /// Target pubkey is not on the allowlist.
     TargetNotAllowed,
     /// Target account is larger than `max_target_bytes`.
@@ -67,7 +67,7 @@ pub struct WatchFilter {
     /// Never track these programs. Applied after the allowlist.
     pub blocked_target_programs: HashSet<Pubkey>,
     /// Only track watches registered by these keys.
-    pub allowed_registrars: HashSet<Pubkey>,
+    pub allowed_creators: HashSet<Pubkey>,
     /// Only track these exact target accounts.
     pub allowed_targets: HashSet<Pubkey>,
     /// Drop watches whose target account exceeds this size. Targets are
@@ -84,7 +84,7 @@ pub fn reject_label(reason: &RejectReason) -> &'static str {
     match reason {
         RejectReason::ProgramNotAllowed => "program_not_allowed",
         RejectReason::ProgramBlocked => "program_blocked",
-        RejectReason::RegistrarNotAllowed => "registrar_not_allowed",
+        RejectReason::CreatorNotAllowed => "creator_not_allowed",
         RejectReason::TargetNotAllowed => "target_not_allowed",
         RejectReason::TargetTooLarge => "target_too_large",
         RejectReason::TargetMissing => "target_missing",
@@ -129,10 +129,8 @@ impl WatchFilter {
         if self.blocked_target_programs.contains(&watch.target_program) {
             return Err(RejectReason::ProgramBlocked);
         }
-        if !self.allowed_registrars.is_empty()
-            && !self.allowed_registrars.contains(&watch.registrar)
-        {
-            return Err(RejectReason::RegistrarNotAllowed);
+        if !self.allowed_creators.is_empty() && !self.allowed_creators.contains(&watch.creator) {
+            return Err(RejectReason::CreatorNotAllowed);
         }
         if !self.allowed_targets.is_empty() && !self.allowed_targets.contains(&watch.target) {
             return Err(RejectReason::TargetNotAllowed);

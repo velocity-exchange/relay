@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["spec", "chain-source", "crank-turner", "cli"]
+# `relay-anchor/` is its own workspace: it is the only crate in the repo that
+# depends on anchor (the 1.0 line), and that tree belongs in neither this
+# workspace nor `programs/`.
+exclude = ["relay-anchor"]
 
 # The on-chain programs live in a SEPARATE workspace at `programs/` (anchor-v2
 # alpha + SBF toolchain, own lockfile + target dir) so its dependency tree

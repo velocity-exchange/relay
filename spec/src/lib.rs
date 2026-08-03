@@ -5,12 +5,16 @@
 //! offset in one of its accounts, and registers `(account, offset)` with the
 //! relay program as a `WatchV0`. A crank turner finds watches, reads the
 //! conditions, and for each due condition simulates the **resolver**
-//! instruction; the resolver stages a [`ResolvedCrankV0`] payload in one of
-//! its own writable accounts and returns a [`ResponsePointerV0`] locating
-//! it. The turner reads the staged bytes out of the simulation's
-//! post-execution account state, then submits the **executor** directly,
-//! bracketed by relay's payment guards (`begin_guard_v0` … executor …
-//! `assert_paid_v0`) so an underpaying crank reverts.
+//! instruction, telling it which condition fired ([`FiredConditionV0`],
+//! appended to the resolver's instruction data); the resolver stages a
+//! [`ResolvedCrankV0`] payload in one of its own writable accounts and
+//! returns a [`ResponsePointerV0`] locating it. The payload names the
+//! **executor** — program, discriminator, accounts, args — so the identity
+//! of the instruction to run is the resolver's answer rather than a literal
+//! in the condition. The turner reads the staged bytes out of the
+//! simulation's post-execution account state, then submits that executor
+//! directly, bracketed by relay's payment guards (`begin_guard_v0` …
+//! executor … `assert_paid_v0`) so an underpaying crank reverts.
 //!
 //! **Why staging instead of raw return data:** return data is capped at
 //! 1024 bytes, which bounds how many accounts/args a resolver could name —
@@ -22,9 +26,13 @@
 //! competing turners.
 //!
 //! Everything on the evaluation path is **zero-copy pod**: fixed-size
-//! `#[repr(C)]` structs with natural alignment and no interior padding, so
-//! programs read conditions in place (`bytemuck::from_bytes`) and update a
-//! wake with a single field store — no serialization pass, no heap.
+//! `#[repr(C)]` structs with **alignment 1** (every multi-byte scalar is
+//! stored as a little-endian byte array, read back through an accessor) and
+//! no interior padding. Alignment 1 is what makes the read path uniform:
+//! any reader — a program looking at its own account data, a turner looking
+//! at bytes off an RPC response — casts the region in place with
+//! [`read_block`], at any offset, with no copy and no separate unaligned
+//! path to keep in step.
 //!
 //! Design notes live in the repo's DESIGN.md. Two properties matter here:
 //!
@@ -58,15 +66,14 @@ pub const SPEC_VERSION: u8 = 0;
 /// replaces with its keeper (payment recipient) before submitting.
 pub const KEEPER_PLACEHOLDER: [u8; 32] = *b"relay/keeper/placeholder\0\0\0\0\0\0\0\0";
 
-/// Fixed inline slots for a resolver's account list — sized for the common
-/// resolver (the conditions account, a couple of state inputs). A resolver
-/// needing more (e.g. one that CPIs an external quoter's registered
-/// `quote_v0` surface under simulation) stores its list *next to the
-/// condition block* on the same account and points at it with
-/// `resolver_list_offset` — one copy per account instead of a fat inline
-/// array per condition, read fresh by the turner on every attempt.
 /// Where a condition's resolver account list lives: `count`
 /// [`AccountRefV0`]s at `offset` bytes into the account holding the block.
+///
+/// The list is always indirect — one copy per account, shared by every
+/// condition that points at it, read fresh by the turner on every attempt.
+/// A resolver needing many accounts (e.g. one that CPIs an external
+/// quoter's registered `quote_v0` surface under simulation) costs those
+/// bytes once instead of once per condition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResolverListV0 {
     pub offset: u32,
@@ -96,7 +103,7 @@ pub const GUARD_SEED: &[u8] = b"guard";
 pub const WATCH_V0_DISCRIMINATOR: [u8; 8] = [177, 10, 201, 159, 2, 232, 62, 244];
 
 /// Serialized length of a `WatchV0` account:
-/// `[disc: 8][target_program: 32][target: 32][registrar: 32][offset: u32][_pad: 4]`.
+/// `[disc: 8][target_program: 32][target: 32][creator: 32][offset: u32][_pad: 4]`.
 pub const WATCH_V0_LEN: usize = 112;
 
 /// Byte offset of `target_program` in a `WatchV0` account. `target_program`
@@ -109,10 +116,10 @@ pub const WATCH_TARGET_PROGRAM_OFFSET: usize = 8;
 /// Byte offset of `target` in a `WatchV0` account.
 pub const WATCH_TARGET_OFFSET: usize = 40;
 
-/// Byte offset of `registrar` in a `WatchV0` account — memcmp-filterable
+/// Byte offset of `creator` in a `WatchV0` account — memcmp-filterable
 /// too, for turners that key off who registered rather than what program
 /// owns the target.
-pub const WATCH_REGISTRAR_OFFSET: usize = 72;
+pub const WATCH_CREATOR_OFFSET: usize = 72;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpecError {
@@ -124,8 +131,10 @@ pub enum SpecError {
     UnsupportedVersion,
     /// Wake kind byte out of range.
     BadWakeKind,
-    /// Block offset (or buffer base) is not 8-aligned — zero-copy reads
-    /// require the block to start on an 8-byte boundary.
+    /// A zero-copy cast failed. Unreachable for a v0 block — every type in
+    /// one is alignment 1, so no offset can be wrong for it — and kept only
+    /// so the error surface does not shift under callers matching on it,
+    /// and so a future version with stricter types has somewhere to land.
     Misaligned,
     /// A count field exceeds its fixed capacity, or a payload exceeds the
     /// region it must fit in.
@@ -340,51 +349,59 @@ pub fn value_crossed(value: WatchValue, threshold: WatchValue, cmp: u8) -> bool 
 
 /// Everything about a condition except its wake — the arguments shared by
 /// all the constructors.
+///
+/// The executor is deliberately absent: a resolver names the instruction to
+/// run in its [`ResolvedCrankV0`], so a condition says *how to find out
+/// what to do* and never *what to do*. If you trust the resolver you
+/// already trust what it returns, and one resolver can then serve a family
+/// of like-instructions from one condition slot.
 #[derive(Debug, Clone, Copy)]
 pub struct CrankSpecV0 {
     pub resolver_program: [u8; 32],
     pub resolver_disc: [u8; 8],
-    pub executor_program: [u8; 32],
-    pub executor_disc: [u8; 8],
     pub min_payment: u64,
 }
 
-/// One crankable condition. Fixed 280 bytes, natural alignment 8, no
-/// interior padding: read it in place, update wake inputs with single field
-/// stores. Wake variants are flattened into dedicated fields (selected by
-/// `wake_kind`) rather than an enum, precisely so a program can do
-/// `conditions[i].wake_ts = new_min` and touch nothing else.
+/// One crankable condition. Fixed 192 bytes, **alignment 1**, no interior
+/// padding: read it in place from any offset, update wake inputs with
+/// single field stores. Wake variants are flattened into dedicated fields
+/// (selected by `wake_kind`) rather than an enum, precisely so a program
+/// can rewrite one wake input and touch nothing else.
+///
+/// Every multi-byte scalar is stored as a little-endian byte array with an
+/// accessor of the same name ([`Self::min_payment`], [`Self::wake_ts`], …).
+/// That is what buys alignment 1, and alignment 1 is what lets *every*
+/// reader — on-chain host, off-chain turner, a test looking at raw account
+/// bytes — cast a block in place instead of copying it condition by
+/// condition.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
 pub struct ConditionV0 {
-    /// Lamports the executor must pay the keeper. `crank_v0` asserts the
-    /// keeper's balance grew by at least this much; turners use it to
-    /// decide whether a crank is worth the fee.
-    pub(crate) min_payment: u64,
+    /// Lamports the executor must pay the keeper. Turners use it to decide
+    /// whether a crank is worth the fee, and pass it to `assert_paid_v0`.
+    pub(crate) min_payment: [u8; 8],
     /// [`WakeKind::AtTimestamp`] input.
-    pub(crate) wake_ts: i64,
+    pub(crate) wake_ts: [u8; 8],
     /// [`WakeKind::EverySlots`] input (interval) or [`WakeKind::AtSlot`]
     /// input (absolute slot) — selected by `wake_kind`.
-    pub(crate) wake_slot: u64,
+    pub(crate) wake_slot: [u8; 8],
     /// [`WakeKind::OnAccountChange`] inputs.
     pub(crate) wake_account: [u8; 32],
-    pub(crate) wake_offset: u32,
-    pub(crate) wake_len: u32,
-    /// Instruction the turner simulates to discover work. Stages its
-    /// payload in one of `resolver_accounts` and returns a
-    /// [`ResponsePointerV0`].
+    pub(crate) wake_offset: [u8; 4],
+    pub(crate) wake_len: [u8; 4],
+    /// Instruction the turner simulates to discover work. Stages a
+    /// [`ResolvedCrankV0`] in one of the resolver's accounts and returns a
+    /// [`ResponsePointerV0`]; the turner appends a [`FiredConditionV0`] to
+    /// its instruction data so it knows which condition it is answering
+    /// for.
     pub(crate) resolver_program: [u8; 32],
     pub(crate) resolver_disc: [u8; 8],
-    /// Instruction that does the work and pays the keeper. Its account list
-    /// and trailing args come from the resolver's staged payload.
-    pub(crate) executor_program: [u8; 32],
-    pub(crate) executor_disc: [u8; 8],
     /// How many [`AccountRefV0`]s make up the resolver's account list. The
     /// list itself lives at `resolver_list_offset`; see there.
     pub(crate) num_resolver_accounts: u8,
     /// A [`WakeKind`] value.
     pub(crate) wake_kind: u8,
-    /// 0 = inactive (skipped by turners, rejected by `crank_v0`).
+    /// 0 = inactive (skipped by turners).
     pub(crate) active: u8,
     /// [`WakeKind::OnValueCross`] comparator: 0 = due when value >=
     /// threshold (`wake_ts`), 1 = due when value <= threshold.
@@ -395,54 +412,51 @@ pub struct ConditionV0 {
     /// writable.
     ///
     /// The list is always indirect. Conditions used to carry four inline
-    /// refs, which cost 132 of every condition's 288 bytes whether or not
-    /// they were used — and any resolver needing more than four had to
-    /// point somewhere anyway. One list per account, shared by every
-    /// condition that wants it, is both smaller and the only mechanism to
-    /// reason about.
-    pub(crate) resolver_list_offset: u32,
+    /// refs, which cost 132 of every condition's bytes whether or not they
+    /// were used — and any resolver needing more than four had to point
+    /// somewhere anyway. One list per account, shared by every condition
+    /// that wants it, is both smaller and the only mechanism to reason
+    /// about.
+    pub(crate) resolver_list_offset: [u8; 4],
     /// [`WakeKind::OnValueCross`]: nonzero = the watched bytes and the
     /// threshold (`wake_ts`'s bits reinterpreted as `u64`) are unsigned.
-    /// Zero — the value every pre-existing block already holds — keeps the
-    /// original signed reading.
+    /// Zero keeps the signed reading.
     pub(crate) wake_value_unsigned: u8,
     /// Reserved. Zero on write, ignored on read — room to add fields
     /// without moving every existing one or resizing every account that
-    /// holds a block.
-    pub(crate) _reserved: [u8; 39],
+    /// holds a block. The executor program and discriminator used to live
+    /// in 40 of these bytes; the resolver returns them now.
+    pub(crate) _reserved: [u8; 79],
 }
 
 pub const CONDITION_LEN: usize = core::mem::size_of::<ConditionV0>();
 const _: () = assert!(CONDITION_LEN == 192);
-const _: () = assert!(core::mem::align_of::<ConditionV0>() == 8);
+const _: () = assert!(core::mem::align_of::<ConditionV0>() == 1);
 
 impl ConditionV0 {
     fn base(spec: CrankSpecV0, resolvers: ResolverListV0) -> Self {
         Self {
-            min_payment: spec.min_payment,
-            wake_ts: 0,
-            wake_slot: 0,
+            min_payment: spec.min_payment.to_le_bytes(),
+            wake_ts: [0; 8],
+            wake_slot: [0; 8],
             wake_account: [0; 32],
-            wake_offset: 0,
-            wake_len: 0,
+            wake_offset: [0; 4],
+            wake_len: [0; 4],
             resolver_program: spec.resolver_program,
             resolver_disc: spec.resolver_disc,
-            executor_program: spec.executor_program,
-            executor_disc: spec.executor_disc,
             num_resolver_accounts: resolvers.count,
             wake_kind: 0,
             active: 1,
             wake_cmp: 0,
-            resolver_list_offset: resolvers.offset,
+            resolver_list_offset: resolvers.offset.to_le_bytes(),
             wake_value_unsigned: 0,
-            _reserved: [0; 39],
+            _reserved: [0; 79],
         }
     }
 
     pub fn at_timestamp(unix_ts: i64, spec: CrankSpecV0, resolvers: ResolverListV0) -> Self {
         let mut c = Self::base(spec, resolvers);
-        c.wake_kind = WakeKind::AtTimestamp as u8;
-        c.wake_ts = unix_ts;
+        c.set_wake(WakeView::AtTimestamp { unix_ts });
         c
     }
 
@@ -454,10 +468,11 @@ impl ConditionV0 {
         resolvers: ResolverListV0,
     ) -> Self {
         let mut c = Self::base(spec, resolvers);
-        c.wake_kind = WakeKind::OnAccountChange as u8;
-        c.wake_account = watched;
-        c.wake_offset = offset;
-        c.wake_len = len;
+        c.set_wake(WakeView::OnAccountChange {
+            address: watched,
+            offset,
+            len,
+        });
         c
     }
 
@@ -478,65 +493,88 @@ impl ConditionV0 {
         resolvers: ResolverListV0,
     ) -> Self {
         let mut c = Self::base(spec, resolvers);
-        c.wake_kind = WakeKind::OnValueCross as u8;
-        c.wake_account = watched;
-        c.wake_offset = offset;
-        c.wake_len = len;
-        c.wake_cmp = cmp;
-        match threshold {
-            WatchValue::Signed(value) => c.wake_ts = value,
-            WatchValue::Unsigned(value) => {
-                c.wake_ts = value as i64;
-                c.wake_value_unsigned = 1;
-            }
-        }
+        c.set_wake(WakeView::OnValueCross {
+            address: watched,
+            offset,
+            len,
+            threshold,
+            cmp,
+        });
         c
     }
 
     pub fn every_slots(slots: u64, spec: CrankSpecV0, resolvers: ResolverListV0) -> Self {
         let mut c = Self::base(spec, resolvers);
-        c.wake_kind = WakeKind::EverySlots as u8;
-        c.wake_slot = slots;
+        c.set_wake(WakeView::EverySlots { slots });
         c
     }
 
     pub fn at_slot(slot: u64, spec: CrankSpecV0, resolvers: ResolverListV0) -> Self {
         let mut c = Self::base(spec, resolvers);
-        c.wake_kind = WakeKind::AtSlot as u8;
-        c.wake_slot = slot;
+        c.set_wake(WakeView::AtSlot { slot });
         c
     }
 
     /// Lamports the executor must pay the keeper.
     pub fn min_payment(&self) -> u64 {
-        self.min_payment
+        u64::from_le_bytes(self.min_payment)
+    }
+
+    /// [`WakeKind::AtTimestamp`] input (and [`WakeKind::OnValueCross`]'s
+    /// threshold bits — see [`Self::wake`] for the reading that applies).
+    pub fn wake_ts(&self) -> i64 {
+        i64::from_le_bytes(self.wake_ts)
+    }
+
+    /// [`WakeKind::AtSlot`] / [`WakeKind::EverySlots`] input.
+    pub fn wake_slot(&self) -> u64 {
+        u64::from_le_bytes(self.wake_slot)
+    }
+
+    /// Watched account of a change- or value-cross wake.
+    pub fn wake_account(&self) -> [u8; 32] {
+        self.wake_account
+    }
+
+    /// Watched byte range of a change- or value-cross wake.
+    pub fn wake_range(&self) -> (u32, u32) {
+        (
+            u32::from_le_bytes(self.wake_offset),
+            u32::from_le_bytes(self.wake_len),
+        )
+    }
+
+    /// The raw [`WakeKind`] byte. [`Self::wake`] is the checked reading.
+    pub fn wake_kind(&self) -> u8 {
+        self.wake_kind
     }
 
     /// Where this condition's resolver account list lives.
     pub fn resolvers(&self) -> ResolverListV0 {
-        ResolverListV0::new(self.resolver_list_offset, self.num_resolver_accounts)
+        ResolverListV0::new(
+            u32::from_le_bytes(self.resolver_list_offset),
+            self.num_resolver_accounts,
+        )
     }
 
-    /// The programs and discriminators to simulate and then submit.
+    /// The resolver to simulate, and what the crank must pay.
     pub fn crank_spec(&self) -> CrankSpecV0 {
         CrankSpecV0 {
             resolver_program: self.resolver_program,
             resolver_disc: self.resolver_disc,
-            executor_program: self.executor_program,
-            executor_disc: self.executor_disc,
-            min_payment: self.min_payment,
+            min_payment: self.min_payment(),
         }
     }
 
     /// Point this condition at a different resolver account list.
     pub fn set_resolvers(&mut self, resolvers: ResolverListV0) {
-        self.resolver_list_offset = resolvers.offset;
+        self.resolver_list_offset = resolvers.offset.to_le_bytes();
         self.num_resolver_accounts = resolvers.count;
     }
 
     /// Re-price the keeper fee (hosts re-price in place on reconfigure).
     pub fn set_min_payment(&mut self, lamports: u64) {
-        self.min_payment = lamports;
+        self.min_payment = lamports.to_le_bytes();
     }
 
     /// Go quiet. A level-triggered wake fires until this is called.
@@ -550,17 +588,17 @@ impl ConditionV0 {
     /// writes the discriminant and the fields together, and clears what
     /// the new variant does not use.
     pub fn set_wake(&mut self, wake: WakeView) {
-        self.wake_ts = 0;
-        self.wake_slot = 0;
+        self.wake_ts = [0; 8];
+        self.wake_slot = [0; 8];
         self.wake_account = [0; 32];
-        self.wake_offset = 0;
-        self.wake_len = 0;
+        self.wake_offset = [0; 4];
+        self.wake_len = [0; 4];
         self.wake_cmp = 0;
         self.wake_value_unsigned = 0;
         match wake {
             WakeView::AtTimestamp { unix_ts } => {
                 self.wake_kind = WakeKind::AtTimestamp as u8;
-                self.wake_ts = unix_ts;
+                self.wake_ts = unix_ts.to_le_bytes();
             }
             WakeView::OnAccountChange {
                 address,
@@ -568,17 +606,15 @@ impl ConditionV0 {
                 len,
             } => {
                 self.wake_kind = WakeKind::OnAccountChange as u8;
-                self.wake_account = address;
-                self.wake_offset = offset;
-                self.wake_len = len;
+                self.set_watched(address, offset, len);
             }
             WakeView::EverySlots { slots } => {
                 self.wake_kind = WakeKind::EverySlots as u8;
-                self.wake_slot = slots;
+                self.wake_slot = slots.to_le_bytes();
             }
             WakeView::AtSlot { slot } => {
                 self.wake_kind = WakeKind::AtSlot as u8;
-                self.wake_slot = slot;
+                self.wake_slot = slot.to_le_bytes();
             }
             WakeView::OnValueCross {
                 address,
@@ -588,14 +624,12 @@ impl ConditionV0 {
                 cmp,
             } => {
                 self.wake_kind = WakeKind::OnValueCross as u8;
-                self.wake_account = address;
-                self.wake_offset = offset;
-                self.wake_len = len;
+                self.set_watched(address, offset, len);
                 self.wake_cmp = cmp;
                 match threshold {
-                    WatchValue::Signed(value) => self.wake_ts = value,
+                    WatchValue::Signed(value) => self.wake_ts = value.to_le_bytes(),
                     WatchValue::Unsigned(value) => {
-                        self.wake_ts = value as i64;
+                        self.wake_ts = value.to_le_bytes();
                         self.wake_value_unsigned = 1;
                     }
                 }
@@ -603,34 +637,41 @@ impl ConditionV0 {
         }
     }
 
+    fn set_watched(&mut self, address: [u8; 32], offset: u32, len: u32) {
+        self.wake_account = address;
+        self.wake_offset = offset.to_le_bytes();
+        self.wake_len = len.to_le_bytes();
+    }
+
     pub fn is_active(&self) -> bool {
         self.active != 0
     }
 
     pub fn wake(&self) -> Result<WakeView, SpecError> {
+        let (offset, len) = self.wake_range();
         match self.wake_kind {
             0 => Ok(WakeView::AtTimestamp {
-                unix_ts: self.wake_ts,
+                unix_ts: self.wake_ts(),
             }),
             1 => Ok(WakeView::OnAccountChange {
                 address: self.wake_account,
-                offset: self.wake_offset,
-                len: self.wake_len,
+                offset,
+                len,
             }),
             2 => Ok(WakeView::EverySlots {
-                slots: self.wake_slot,
+                slots: self.wake_slot(),
             }),
             3 => Ok(WakeView::AtSlot {
-                slot: self.wake_slot,
+                slot: self.wake_slot(),
             }),
             4 => Ok(WakeView::OnValueCross {
                 address: self.wake_account,
-                offset: self.wake_offset,
-                len: self.wake_len,
+                offset,
+                len,
                 threshold: if self.wake_value_unsigned != 0 {
-                    WatchValue::Unsigned(self.wake_ts as u64)
+                    WatchValue::Unsigned(u64::from_le_bytes(self.wake_ts))
                 } else {
-                    WatchValue::Signed(self.wake_ts)
+                    WatchValue::Signed(self.wake_ts())
                 },
                 cmp: self.wake_cmp,
             }),
@@ -675,10 +716,13 @@ pub const fn block_space(n: usize) -> usize {
     BLOCK_HEADER_LEN + n * CONDITION_LEN
 }
 
-/// Zero-copy view of a block at `data[offset..]`. The block must sit on an
-/// 8-byte boundary — guaranteed on-chain for account data at an 8-aligned
-/// offset; off-chain callers with arbitrary buffers use
-/// [`read_conditions_unaligned`].
+/// Zero-copy view of a block at `data[offset..]`.
+///
+/// Every type in the block is alignment 1, so this works at **any** offset
+/// in any buffer — an account's data on chain, an RPC response off it — and
+/// costs a bounds check and a cast. There is deliberately no copying
+/// sibling: one reader means one behaviour to reason about, and a turner
+/// reading a large registry pays nothing per condition.
 pub fn read_block(
     data: &[u8],
     offset: usize,
@@ -815,18 +859,30 @@ pub trait ConditionBlock {
         Ok(())
     }
 
-    /// Read one condition slot back (copying — the region may be
-    /// unaligned in an account's data).
-    fn read_condition(&self, index: usize) -> Result<ConditionV0, SpecError> {
+    /// Borrow one condition slot in place. Alignment 1 means this is a cast
+    /// at any offset, so nothing is copied.
+    fn condition(&self, index: usize) -> Result<&ConditionV0, SpecError> {
         let start = Self::slot_start(index)?;
         let block = self.block();
-        if start + CONDITION_LEN > block.len() {
-            return Err(SpecError::Truncated);
-        }
-        let mut condition = ConditionV0::zeroed();
-        bytemuck::bytes_of_mut(&mut condition)
-            .copy_from_slice(&block[start..start + CONDITION_LEN]);
-        Ok(condition)
+        let slot = block
+            .get(start..start + CONDITION_LEN)
+            .ok_or(SpecError::Truncated)?;
+        bytemuck::try_from_bytes(slot).map_err(|_| SpecError::Misaligned)
+    }
+
+    /// Borrow one condition slot mutably, for wake updates in place.
+    fn condition_mut(&mut self, index: usize) -> Result<&mut ConditionV0, SpecError> {
+        let start = Self::slot_start(index)?;
+        let block = self.block_mut();
+        let slot = block
+            .get_mut(start..start + CONDITION_LEN)
+            .ok_or(SpecError::Truncated)?;
+        bytemuck::try_from_bytes_mut(slot).map_err(|_| SpecError::Misaligned)
+    }
+
+    /// Read one condition slot back by value.
+    fn read_condition(&self, index: usize) -> Result<ConditionV0, SpecError> {
+        self.condition(index).copied()
     }
 
     /// Zero a slot — the way work that is done goes quiet. A
@@ -845,15 +901,15 @@ pub trait ConditionBlock {
     }
 
     /// Mutate one slot's wake inputs in place (the min-fold/repair
-    /// pattern): read, apply, write back.
+    /// pattern). No read-modify-write pass: the closure is handed the slot
+    /// itself.
     fn update_condition(
         &mut self,
         index: usize,
         f: impl FnOnce(&mut ConditionV0),
     ) -> Result<(), SpecError> {
-        let mut condition = self.read_condition(index)?;
-        f(&mut condition);
-        self.write_condition(index, &condition)
+        f(self.condition_mut(index)?);
+        Ok(())
     }
 
     #[doc(hidden)]
@@ -871,6 +927,10 @@ pub trait ConditionBlock {
 /// creation with the field's own account offset, and the offset arithmetic
 /// hosts used to hand-roll (three regions, each with its own length
 /// constant and alignment note) disappears:
+///
+/// Anchor hosts wrap this in `relay_anchor::RelayBlock<C, R>`, which adds
+/// the framework coupling (an `IdlBuild` impl) that this crate deliberately
+/// cannot: the spec depends on bytemuck and nothing else.
 ///
 /// ```ignore
 /// #[account(zero_copy)]
@@ -1000,15 +1060,11 @@ impl<const C: usize, const R: usize> RelayBlockV0<C, R> {
         ))
     }
 
-    /// The stored resolver list, as last written.
-    pub fn resolver_refs(&self) -> Vec<AccountRefV0> {
-        self.resolvers[..(self.resolver_count as usize).min(R)]
-            .iter()
-            .map(|slot| AccountRefV0 {
-                address: slot[..32].try_into().expect("32-byte address"),
-                writable: slot[32],
-            })
-            .collect()
+    /// The stored resolver list, as last written — borrowed in place, not
+    /// rebuilt. [`AccountRefV0`] is alignment-1 pod and the region is a
+    /// packed array of them, so the list is already the wire format.
+    pub fn resolver_refs(&self) -> &[AccountRefV0] {
+        bytemuck::cast_slice(&self.resolvers[..(self.resolver_count as usize).min(R)])
     }
 
     /// Grow a smaller block into this instantiation, in place, inside an
@@ -1089,17 +1145,17 @@ impl<const C: usize, const R: usize> RelayBlockV0<C, R> {
         // (or the zero of an inactive slot) stands.
         for index in 0..old_conditions {
             let at = block_offset + BLOCK_HEADER_LEN + index * CONDITION_LEN;
-            let mut condition: ConditionV0 =
-                bytemuck::pod_read_unaligned(&data[at..at + CONDITION_LEN]);
-            let offset = condition.resolver_list_offset as usize;
-            if (old_region..old_trailer).contains(&offset) {
-                condition.resolver_list_offset = (new_region + (offset - old_region)) as u32;
+            let condition: &mut ConditionV0 =
+                bytemuck::from_bytes_mut(&mut data[at..at + CONDITION_LEN]);
+            let offset = condition.resolvers().offset as usize;
+            let rebased = if (old_region..old_trailer).contains(&offset) {
+                new_region + (offset - old_region)
             } else if offset >= old_end {
-                condition.resolver_list_offset = (offset + delta) as u32;
+                offset + delta
             } else {
                 continue;
-            }
-            data[at..at + CONDITION_LEN].copy_from_slice(bytemuck::bytes_of(&condition));
+            };
+            condition.resolver_list_offset = (rebased as u32).to_le_bytes();
         }
         Ok(())
     }
@@ -1115,35 +1171,6 @@ impl<const C: usize, const R: usize> ConditionBlock for RelayBlockV0<C, R> {
     fn block_mut(&mut self) -> &mut [u8] {
         &mut bytemuck::bytes_of_mut(self)[..BLOCK_HEADER_LEN + C * CONDITION_LEN]
     }
-}
-
-/// Copying reader for arbitrary (possibly unaligned) buffers — the
-/// off-chain path. 280 bytes copied per condition; negligible off-chain.
-pub fn read_conditions_unaligned(
-    data: &[u8],
-    offset: usize,
-) -> Result<Vec<ConditionV0>, SpecError> {
-    let header_end = offset
-        .checked_add(BLOCK_HEADER_LEN)
-        .ok_or(SpecError::Truncated)?;
-    if header_end > data.len() {
-        return Err(SpecError::Truncated);
-    }
-    let header: ConditionBlockHeaderV0 = bytemuck::pod_read_unaligned(&data[offset..header_end]);
-    header.validate()?;
-    let n = header.num_conditions as usize;
-    let end = header_end
-        .checked_add(n * CONDITION_LEN)
-        .ok_or(SpecError::Truncated)?;
-    if end > data.len() {
-        return Err(SpecError::Truncated);
-    }
-    Ok((0..n)
-        .map(|i| {
-            let start = header_end + i * CONDITION_LEN;
-            bytemuck::pod_read_unaligned(&data[start..start + CONDITION_LEN])
-        })
-        .collect())
 }
 
 // --- resolver output ---
@@ -1220,20 +1247,50 @@ impl ResponsePointerV0 {
     }
 }
 
-/// The staged payload a [`ResponsePointerV0`] points at. Align-1 wire:
-/// `[num_accounts: u8][data_len: u16 LE][AccountRefV0; num][data bytes]`
+/// The staged payload a [`ResponsePointerV0`] points at: the whole
+/// instruction to run. Align-1 wire:
+/// `[executor_program: 32][executor_disc: 8][num_accounts: u8][data_len: u16 LE][AccountRefV0; num][data bytes]`
+///
+/// **The resolver names the executor.** A condition used to carry the
+/// executor's program and discriminator as literals, which meant one
+/// condition slot could only ever run one instruction — a program with a
+/// family of like-instructions (settle *this* kind of position, sweep *that*
+/// kind of order) needed a slot, and a wake, for each. Returning the
+/// identity instead costs 40 staged bytes and adds no trust: the resolver
+/// already decides the accounts and args, so a turner willing to run what a
+/// resolver picked out is willing to run *which* instruction it picked. The
+/// guards are what bound the damage either way.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ResolvedCrankV0 {
+    /// Program owning the instruction to submit.
+    pub executor_program: [u8; 32],
+    /// Its 8-byte instruction discriminator; `data` follows it.
+    pub executor_disc: [u8; 8],
     /// Full executor account list, in order. [`KEEPER_PLACEHOLDER`] entries
     /// are replaced with the turner's keeper.
     pub accounts: Vec<AccountRefV0>,
-    /// Executor args after the 8-byte discriminator.
+    /// Executor args after the discriminator.
     pub data: Vec<u8>,
 }
 
-pub const RESOLVED_HEADER_LEN: usize = 3;
+pub const RESOLVED_HEADER_LEN: usize = 43;
 
 impl ResolvedCrankV0 {
+    /// The common shape: an executor in the resolver's own program.
+    pub fn new(
+        executor_program: [u8; 32],
+        executor_disc: [u8; 8],
+        accounts: Vec<AccountRefV0>,
+        data: Vec<u8>,
+    ) -> Self {
+        Self {
+            executor_program,
+            executor_disc,
+            accounts,
+            data,
+        }
+    }
+
     /// Bytes this payload needs when staged.
     pub fn encoded_len(&self) -> usize {
         RESOLVED_HEADER_LEN + self.accounts.len() * ACCOUNT_REF_LEN + self.data.len()
@@ -1243,20 +1300,22 @@ impl ResolvedCrankV0 {
         if bytes.len() < RESOLVED_HEADER_LEN {
             return Err(SpecError::Truncated);
         }
-        let n = bytes[0] as usize;
-        let data_len = u16::from_le_bytes([bytes[1], bytes[2]]) as usize;
+        let executor_program: [u8; 32] = bytes[..32].try_into().unwrap();
+        let executor_disc: [u8; 8] = bytes[32..40].try_into().unwrap();
+        let n = bytes[40] as usize;
+        let data_len = u16::from_le_bytes([bytes[41], bytes[42]]) as usize;
         let accounts_end = RESOLVED_HEADER_LEN + n * ACCOUNT_REF_LEN;
         let end = accounts_end + data_len;
         if end > bytes.len() {
             return Err(SpecError::Truncated);
         }
-        let accounts = (0..n)
-            .map(|i| {
-                let start = RESOLVED_HEADER_LEN + i * ACCOUNT_REF_LEN;
-                bytemuck::pod_read_unaligned(&bytes[start..start + ACCOUNT_REF_LEN])
-            })
+        let accounts = bytes[RESOLVED_HEADER_LEN..accounts_end]
+            .chunks_exact(ACCOUNT_REF_LEN)
+            .map(bytemuck::pod_read_unaligned)
             .collect();
         Ok(Self {
+            executor_program,
+            executor_disc,
             accounts,
             data: bytes[accounts_end..end].to_vec(),
         })
@@ -1273,8 +1332,10 @@ impl ResolvedCrankV0 {
         if end > region.len() {
             return Err(SpecError::TooLarge);
         }
-        region[0] = self.accounts.len() as u8;
-        region[1..3].copy_from_slice(&(self.data.len() as u16).to_le_bytes());
+        region[..32].copy_from_slice(&self.executor_program);
+        region[32..40].copy_from_slice(&self.executor_disc);
+        region[40] = self.accounts.len() as u8;
+        region[41..43].copy_from_slice(&(self.data.len() as u16).to_le_bytes());
         self.accounts.iter().enumerate().for_each(|(i, a)| {
             let start = RESOLVED_HEADER_LEN + i * ACCOUNT_REF_LEN;
             region[start..start + ACCOUNT_REF_LEN].copy_from_slice(bytemuck::bytes_of(a));
@@ -1290,16 +1351,104 @@ impl ResolvedCrankV0 {
     }
 }
 
+// --- resolver input ---
+
+/// Which condition fired, handed to the resolver.
+///
+/// A resolver that serves several conditions — the point of letting it name
+/// the executor — has to know which one it is answering for. The turner
+/// therefore appends this to the resolver's instruction data, after the
+/// 8-byte discriminator: `[resolver_disc: 8][target: 32][block_offset: u32
+/// LE][index: u8]`, 45 bytes total, built by
+/// [`encode_resolver_data`].
+///
+/// Instruction data is the cheapest faithful channel for it. It costs 37
+/// transaction bytes and no accounts, no compute, and no extra reads: the
+/// alternatives are an extra account (a whole 32-byte key plus a load, to
+/// carry 5 bytes of context the target account already holds), or a
+/// per-condition resolver discriminator (which is the very duplication this
+/// change removes). The identity is exactly a turner's [`WatchV0`]
+/// coordinates plus the slot index, so nothing new has to be tracked to
+/// produce it.
+///
+/// It is **not** authenticated, and does not need to be: it names the
+/// resolver's *own* program state, which the resolver re-reads from the
+/// accounts it was given. A resolver must therefore validate it the way it
+/// validates any argument — check the target is the account it holds and
+/// the index is one it serves — rather than trust it. A wrong identity can
+/// only make a resolver answer about a condition that is not due, which
+/// costs a simulation.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
+pub struct FiredConditionV0 {
+    /// Account holding the condition block.
+    pub target: [u8; 32],
+    /// Byte offset of the block in that account (the `WatchV0` offset).
+    pub block_offset: [u8; 4],
+    /// Slot index of the condition within the block.
+    pub index: u8,
+}
+
+pub const FIRED_CONDITION_LEN: usize = core::mem::size_of::<FiredConditionV0>();
+const _: () = assert!(FIRED_CONDITION_LEN == 37);
+const _: () = assert!(core::mem::align_of::<FiredConditionV0>() == 1);
+
+/// Bytes of a resolver's instruction data: discriminator, then the fired
+/// condition.
+pub const RESOLVER_DATA_LEN: usize = 8 + FIRED_CONDITION_LEN;
+
+impl FiredConditionV0 {
+    pub fn new(target: [u8; 32], block_offset: u32, index: u8) -> Self {
+        Self {
+            target,
+            block_offset: block_offset.to_le_bytes(),
+            index,
+        }
+    }
+
+    pub fn block_offset(&self) -> u32 {
+        u32::from_le_bytes(self.block_offset)
+    }
+
+    pub fn to_bytes(&self) -> [u8; FIRED_CONDITION_LEN] {
+        let mut out = [0u8; FIRED_CONDITION_LEN];
+        out.copy_from_slice(bytemuck::bytes_of(self));
+        out
+    }
+
+    /// Read from the tail of a resolver's instruction data — i.e. from the
+    /// bytes after the discriminator. Trailing bytes are ignored.
+    pub fn read(bytes: &[u8]) -> Result<Self, SpecError> {
+        if bytes.len() < FIRED_CONDITION_LEN {
+            return Err(SpecError::Truncated);
+        }
+        Ok(bytemuck::pod_read_unaligned(&bytes[..FIRED_CONDITION_LEN]))
+    }
+}
+
+/// Encode a resolver's whole instruction data: its discriminator followed
+/// by the condition that fired.
+pub fn encode_resolver_data(
+    resolver_disc: [u8; 8],
+    fired: FiredConditionV0,
+) -> [u8; RESOLVER_DATA_LEN] {
+    let mut out = [0u8; RESOLVER_DATA_LEN];
+    out[..8].copy_from_slice(&resolver_disc);
+    out[8..].copy_from_slice(&fired.to_bytes());
+    out
+}
+
 // --- registry ---
 
 /// A parsed relay `WatchV0` registry account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WatchV0 {
     /// Owner program of `target`, recorded by the relay program from the
-    /// account itself at registration — a registrar cannot forge it.
+    /// account itself at registration — a creator cannot forge it.
     pub target_program: [u8; 32],
     pub target: [u8; 32],
-    pub registrar: [u8; 32],
+    /// Who registered the watch, and the only key that may close it.
+    pub creator: [u8; 32],
     pub offset: u32,
 }
 
@@ -1316,7 +1465,7 @@ impl WatchV0 {
         Ok(Self {
             target_program: field(WATCH_TARGET_PROGRAM_OFFSET),
             target: field(WATCH_TARGET_OFFSET),
-            registrar: field(WATCH_REGISTRAR_OFFSET),
+            creator: field(WATCH_CREATOR_OFFSET),
             offset: u32::from_le_bytes(data[104..108].try_into().unwrap()),
         })
     }
@@ -1349,8 +1498,6 @@ mod tests {
         CrankSpecV0 {
             resolver_program: [1; 32],
             resolver_disc: [9; 8],
-            executor_program: [1; 32],
-            executor_disc: [7; 8],
             min_payment,
         }
     }
@@ -1369,37 +1516,53 @@ mod tests {
         assert_eq!(BLOCK_HEADER_LEN, 16);
         assert_eq!(ACCOUNT_REF_LEN, 33);
         assert_eq!(RESPONSE_POINTER_LEN, 10);
+        assert_eq!(RESOLVED_HEADER_LEN, 43);
+        assert_eq!(FIRED_CONDITION_LEN, 37);
         assert_eq!(block_space(2), 400);
     }
 
+    /// Alignment 1 everywhere on the evaluation path is what makes one
+    /// reader enough: [`read_block`] casts a block out of *any* buffer at
+    /// *any* offset, so nothing needs a copying sibling.
     #[test]
-    fn block_round_trip_aligned() {
+    fn the_wire_types_are_alignment_one() {
+        assert_eq!(core::mem::align_of::<ConditionBlockHeaderV0>(), 1);
+        assert_eq!(core::mem::align_of::<ConditionV0>(), 1);
+        assert_eq!(core::mem::align_of::<AccountRefV0>(), 1);
+        assert_eq!(core::mem::align_of::<ResponsePointerV0>(), 1);
+        assert_eq!(core::mem::align_of::<FiredConditionV0>(), 1);
+    }
+
+    /// The read path with no alignment left to get wrong: the same block
+    /// written at every offset in a byte buffer reads back identically.
+    #[test]
+    fn blocks_read_in_place_at_any_offset() {
         let conditions = sample_conditions();
-        // 8-aligned backing store.
-        let mut region = vec![0u64; block_space(conditions.len()).div_ceil(8)];
-        let bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut region);
-        let n = write_block(bytes, &conditions).unwrap();
+        (0..8).for_each(|offset| {
+            let mut region = vec![0u8; offset + block_space(conditions.len())];
+            write_block(&mut region[offset..], &conditions).unwrap();
+            let (header, parsed) = read_block(&region, offset).unwrap();
+            assert_eq!(header.num_conditions, 3);
+            assert_eq!(parsed, &conditions[..], "offset {offset}");
+        });
+    }
+
+    #[test]
+    fn block_round_trip() {
+        let conditions = sample_conditions();
+        let mut bytes = vec![0u8; block_space(conditions.len())];
+        let n = write_block(&mut bytes, &conditions).unwrap();
         assert_eq!(n, block_space(3));
 
-        let (header, parsed) = read_block(bytes, 0).unwrap();
+        let (header, parsed) = read_block(&bytes, 0).unwrap();
         assert_eq!(header.num_conditions, 3);
         assert_eq!(parsed, &conditions[..]);
 
         // In-place wake update through the mut view.
-        let parsed_mut = read_block_mut(bytes, 0).unwrap();
-        parsed_mut[0].wake_ts = 42;
-        let (_, parsed) = read_block(bytes, 0).unwrap();
+        let parsed_mut = read_block_mut(&mut bytes, 0).unwrap();
+        parsed_mut[0].set_wake(WakeView::AtTimestamp { unix_ts: 42 });
+        let (_, parsed) = read_block(&bytes, 0).unwrap();
         assert_eq!(parsed[0].wake(), Ok(WakeView::AtTimestamp { unix_ts: 42 }));
-    }
-
-    #[test]
-    fn unaligned_reader_matches() {
-        let conditions = sample_conditions();
-        let mut region = vec![0u8; block_space(conditions.len()) + 1];
-        write_block(&mut region[1..], &conditions).unwrap();
-        // Offset 1: hopelessly misaligned, still reads via the copying path.
-        let parsed = read_conditions_unaligned(&region, 1).unwrap();
-        assert_eq!(parsed, conditions);
     }
 
     #[test]
@@ -1482,8 +1645,6 @@ mod tests {
         let spec = CrankSpecV0 {
             resolver_program: [1; 32],
             resolver_disc: [2; 8],
-            executor_program: [3; 32],
-            executor_disc: [4; 8],
             min_payment: 5,
         };
         // Condition 0 points at the built-in region, condition 1 at a
@@ -1513,11 +1674,10 @@ mod tests {
             &account[BLOCK_OFFSET + New::SIZE..BLOCK_OFFSET + New::SIZE + 5],
             HOST_TAIL
         );
-        let grown: New =
-            bytemuck::pod_read_unaligned(&account[BLOCK_OFFSET..BLOCK_OFFSET + New::SIZE]);
+        let grown: &New = bytemuck::from_bytes(&account[BLOCK_OFFSET..BLOCK_OFFSET + New::SIZE]);
         assert_eq!(grown.account_offset(), BLOCK_OFFSET as u32);
-        assert_eq!(grown.resolver_refs(), refs.to_vec());
-        let conditions = read_conditions_unaligned(&account, BLOCK_OFFSET).unwrap();
+        assert_eq!(grown.resolver_refs(), &refs[..]);
+        let (_, conditions) = read_block(&account, BLOCK_OFFSET).unwrap();
         assert_eq!(conditions.len(), 4);
         assert_eq!(
             conditions[0].wake(),
@@ -1573,7 +1733,7 @@ mod tests {
             list.offset as usize,
             BLOCK_OFFSET + BLOCK_HEADER_LEN + 3 * CONDITION_LEN
         );
-        assert_eq!(block.resolver_refs(), refs.to_vec());
+        assert_eq!(block.resolver_refs(), &refs[..]);
 
         block
             .write_condition(
@@ -1583,8 +1743,6 @@ mod tests {
                     CrankSpecV0 {
                         resolver_program: [1; 32],
                         resolver_disc: [2; 8],
-                        executor_program: [3; 32],
-                        executor_disc: [4; 8],
                         min_payment: 5,
                     },
                     list,
@@ -1597,7 +1755,7 @@ mod tests {
         let mut account = alloc::vec![0u8; BLOCK_OFFSET + Block::SIZE];
         account[BLOCK_OFFSET..BLOCK_OFFSET + Block::SIZE]
             .copy_from_slice(bytemuck::bytes_of(&block));
-        let conditions = read_conditions_unaligned(&account, BLOCK_OFFSET).unwrap();
+        let (_, conditions) = read_block(&account, BLOCK_OFFSET).unwrap();
         assert_eq!(conditions.len(), 3);
         assert_eq!(
             conditions[0].wake(),
@@ -1693,10 +1851,10 @@ mod tests {
     #[test]
     fn resolver_list_is_always_indirect() {
         let c = ConditionV0::at_timestamp(0, spec(0), ResolverListV0::new(96, 7));
-        assert_eq!(c.resolver_list_offset, 96);
-        assert_eq!(c.num_resolver_accounts, 7);
-        // Reserved space stays zero so a future field can claim it.
-        assert_eq!(c._reserved, [0u8; 39]);
+        assert_eq!(c.resolvers(), ResolverListV0::new(96, 7));
+        // Reserved space stays zero so a future field can claim it — the
+        // executor identity used to occupy 40 of these bytes.
+        assert_eq!(c._reserved, [0u8; 79]);
     }
 
     #[test]
@@ -1707,16 +1865,13 @@ mod tests {
 
         let mut tampered = region.clone();
         tampered[0] ^= 0xFF;
-        assert_eq!(
-            read_conditions_unaligned(&tampered, 0),
-            Err(SpecError::BadMagic)
-        );
+        assert_eq!(read_block(&tampered, 0).err(), Some(SpecError::BadMagic));
 
         let mut tampered = region;
         tampered[8] = SPEC_VERSION + 1;
         assert_eq!(
-            read_conditions_unaligned(&tampered, 0),
-            Err(SpecError::UnsupportedVersion)
+            read_block(&tampered, 0).err(),
+            Some(SpecError::UnsupportedVersion)
         );
     }
 
@@ -1726,10 +1881,7 @@ mod tests {
         let mut region = vec![0u8; block_space(conditions.len())];
         write_block(&mut region, &conditions).unwrap();
         (0..region.len()).for_each(|n| {
-            assert!(
-                read_conditions_unaligned(&region[..n], 0).is_err(),
-                "cut {n} should fail"
-            );
+            assert!(read_block(&region[..n], 0).is_err(), "cut {n} should fail");
         });
     }
 
@@ -1764,24 +1916,86 @@ mod tests {
 
     #[test]
     fn staged_payload_round_trip() {
-        let resolved = ResolvedCrankV0 {
-            accounts: vec![
+        let resolved = ResolvedCrankV0::new(
+            [4; 32],
+            [8; 8],
+            vec![
                 AccountRefV0::writable(KEEPER_PLACEHOLDER),
                 AccountRefV0::writable([5; 32]),
             ],
-            data: vec![1, 2, 3, 4],
-        };
+            vec![1, 2, 3, 4],
+        );
         let bytes = resolved.to_bytes();
         assert_eq!(bytes.len(), resolved.encoded_len());
         assert_eq!(ResolvedCrankV0::read(&bytes).unwrap(), resolved);
     }
 
+    /// The executor's identity comes back from the resolver, in front of
+    /// the account list, so one condition slot can run whichever
+    /// instruction the resolver picked.
+    #[test]
+    fn staged_payload_names_the_executor() {
+        let resolved = ResolvedCrankV0::new(
+            [7; 32],
+            [1, 2, 3, 4, 5, 6, 7, 8],
+            vec![AccountRefV0::writable(KEEPER_PLACEHOLDER)],
+            vec![9, 9],
+        );
+        let bytes = resolved.to_bytes();
+        assert_eq!(&bytes[..32], &[7u8; 32]);
+        assert_eq!(&bytes[32..40], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(bytes[40], 1, "one account");
+        assert_eq!(&bytes[41..43], &2u16.to_le_bytes());
+
+        let parsed = ResolvedCrankV0::read(&bytes).unwrap();
+        assert_eq!(parsed.executor_program, [7; 32]);
+        assert_eq!(parsed.executor_disc, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(parsed, resolved);
+
+        // A payload cut short of the identity is a truncation, not a
+        // silently zeroed program id.
+        (0..RESOLVED_HEADER_LEN).for_each(|n| {
+            assert_eq!(
+                ResolvedCrankV0::read(&bytes[..n]),
+                Err(SpecError::Truncated),
+                "cut {n}"
+            );
+        });
+    }
+
+    /// The resolver's input: which condition fired, appended to its
+    /// instruction data after the discriminator.
+    #[test]
+    fn fired_condition_round_trips_through_instruction_data() {
+        let fired = FiredConditionV0::new([3; 32], 912, 2);
+        let data = encode_resolver_data([9; 8], fired);
+        assert_eq!(data.len(), RESOLVER_DATA_LEN);
+        assert_eq!(&data[..8], &[9u8; 8]);
+
+        let parsed = FiredConditionV0::read(&data[8..]).unwrap();
+        assert_eq!(parsed, fired);
+        assert_eq!(parsed.target, [3; 32]);
+        assert_eq!(parsed.block_offset(), 912);
+        assert_eq!(parsed.index, 2);
+
+        // Trailing bytes are ignored; a short tail is a truncation.
+        let mut padded = data.to_vec();
+        padded.push(0xAA);
+        assert_eq!(FiredConditionV0::read(&padded[8..]).unwrap(), fired);
+        assert_eq!(
+            FiredConditionV0::read(&data[9..]),
+            Err(SpecError::Truncated)
+        );
+    }
+
     #[test]
     fn staged_payload_write_into_region() {
-        let resolved = ResolvedCrankV0 {
-            accounts: vec![AccountRefV0::writable(KEEPER_PLACEHOLDER)],
-            data: vec![7; 10],
-        };
+        let resolved = ResolvedCrankV0::new(
+            [1; 32],
+            [2; 8],
+            vec![AccountRefV0::writable(KEEPER_PLACEHOLDER)],
+            vec![7; 10],
+        );
         // A region much larger than the payload: only the used prefix is
         // meaningful, and the pointer's `len` says how much.
         let mut region = [0xAAu8; 512];
@@ -1789,7 +2003,7 @@ mod tests {
         assert_eq!(ResolvedCrankV0::read(&region[..n]).unwrap(), resolved);
         assert_eq!(region[n], 0xAA, "write must not clobber past len");
 
-        let mut tiny = [0u8; 8];
+        let mut tiny = [0u8; RESOLVED_HEADER_LEN];
         assert_eq!(resolved.write_into(&mut tiny), Err(SpecError::TooLarge));
     }
 
@@ -1797,10 +2011,12 @@ mod tests {
     /// 1024-byte return-data cap stages fine.
     #[test]
     fn staged_payload_exceeds_return_data_cap() {
-        let resolved = ResolvedCrankV0 {
-            accounts: (0..40u8).map(|i| AccountRefV0::writable([i; 32])).collect(),
-            data: vec![9; 400],
-        };
+        let resolved = ResolvedCrankV0::new(
+            [1; 32],
+            [2; 8],
+            (0..40u8).map(|i| AccountRefV0::writable([i; 32])).collect(),
+            vec![9; 400],
+        );
         assert!(resolved.encoded_len() > 1024);
         let mut region = vec![0u8; 4096];
         let n = resolved.write_into(&mut region).unwrap();
@@ -1818,7 +2034,7 @@ mod tests {
             .into_iter()
             .chain([6; 32]) // target_program
             .chain([8; 32]) // target
-            .chain([7; 32]) // registrar
+            .chain([7; 32]) // creator
             .chain(123u32.to_le_bytes())
             .chain([0; 4])
             .collect();
@@ -1826,13 +2042,13 @@ mod tests {
         let w = WatchV0::read_from_account(&data).unwrap();
         assert_eq!(w.target_program, [6; 32]);
         assert_eq!(w.target, [8; 32]);
-        assert_eq!(w.registrar, [7; 32]);
+        assert_eq!(w.creator, [7; 32]);
         assert_eq!(w.offset, 123);
 
         // The memcmp offsets turners filter on must address those fields.
         assert_eq!(&data[WATCH_TARGET_PROGRAM_OFFSET..][..32], &[6; 32]);
         assert_eq!(&data[WATCH_TARGET_OFFSET..][..32], &[8; 32]);
-        assert_eq!(&data[WATCH_REGISTRAR_OFFSET..][..32], &[7; 32]);
+        assert_eq!(&data[WATCH_CREATOR_OFFSET..][..32], &[7; 32]);
 
         let mut bad = data;
         bad[0] ^= 1;
@@ -1888,8 +2104,6 @@ mod condition_block_tests {
         CrankSpecV0 {
             resolver_program: [1; 32],
             resolver_disc: [2; 8],
-            executor_program: [1; 32],
-            executor_disc: [3; 8],
             min_payment: 7,
         }
     }
@@ -1915,13 +2129,16 @@ mod condition_block_tests {
         // The canonical reader accepts what the trait wrote.
         let (header, conditions) = read_block(host.block(), 0).unwrap();
         assert_eq!(header.num_conditions, 3);
-        assert_eq!(conditions[1].wake_slot, 42);
+        assert_eq!(conditions[1].wake_slot(), 42);
         assert_eq!(conditions[0].active, 0);
-        assert_eq!(host.read_condition(1).unwrap().wake_slot, 42);
+        assert_eq!(host.read_condition(1).unwrap().wake_slot(), 42);
 
-        // In-place wake updates (the min-fold/repair pattern).
-        host.update_condition(1, |c| c.wake_slot = 9).unwrap();
-        assert_eq!(host.read_condition(1).unwrap().wake_slot, 9);
+        // In-place wake updates (the min-fold/repair pattern), written
+        // straight into the block's own bytes.
+        host.update_condition(1, |c| c.set_wake(WakeView::EverySlots { slots: 9 }))
+            .unwrap();
+        assert_eq!(host.read_condition(1).unwrap().wake_slot(), 9);
+        assert_eq!(host.condition(1).unwrap().wake_slot(), 9);
 
         // Deactivation is what makes a level-triggered wake go quiet.
         host.write_condition(
@@ -1954,10 +2171,12 @@ mod condition_block_tests {
     #[test]
     fn staging_returns_a_pointer_the_turner_can_follow() {
         let mut host = host();
-        let resolved = ResolvedCrankV0 {
-            accounts: vec![AccountRefV0::writable([9; 32])],
-            data: vec![1, 2, 3],
-        };
+        let resolved = ResolvedCrankV0::new(
+            [1; 32],
+            [2; 8],
+            vec![AccountRefV0::writable([9; 32])],
+            vec![1, 2, 3],
+        );
         let pointer_bytes =
             stage_into(&mut host.staging, 0, HOST_STAGING_OFFSET, &resolved).unwrap();
         let pointer = ResponsePointerV0::read(&pointer_bytes).unwrap();

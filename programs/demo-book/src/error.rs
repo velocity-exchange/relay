@@ -22,4 +22,6 @@ pub enum DemoError {
     WrongSide,
     #[msg("Best bid does not cross best ask")]
     NotCrossing,
+    #[msg("Resolver was told about a condition this book does not serve")]
+    UnknownCondition,
 }

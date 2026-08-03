@@ -7,16 +7,21 @@
 //!   book keeps a `next_expiry_ts` hint maintained min-over-inserts — cheap,
 //!   conservative (only ever early, never late), and deliberately NOT
 //!   repaired on cancel. The sweep executor recomputes the true minimum as
-//!   it walks, repairing the hint. `resolve_sweep_v0` enumerates expired
-//!   entries and returns the executor's account list + args;
-//!   `sweep_v0` frees them and pays the keeper from the book's own
-//!   lamports.
+//!   it walks, repairing the hint. `resolve_v0` enumerates expired entries
+//!   and returns `sweep_v0` with its account list + args; `sweep_v0` frees
+//!   them and pays the keeper from the book's own lamports.
 //! - **Evict** ([`WakeV0::OnAccountChange`] on `entry_count`): once the book
 //!   holds at least `evict_threshold` entries, the oldest entry can be
 //!   evicted for a reward — the CLOB soft-cap pattern.
 //! - **Cross** ([`WakeV0::OnAccountChange`] on `version`, which every
 //!   mutation bumps): whenever the book changes at all, check whether the
 //!   best bid crosses the best ask and match them if so.
+//!
+//! All three share **one** resolver instruction, `resolve_v0`: the turner
+//! tells it which condition fired and it returns the executor to run —
+//! program, discriminator, accounts, args. That is the whole reason a
+//! condition does not name an executor itself; a family of like-instructions
+//! costs one resolver rather than one per instruction.
 //!
 //! Executors require no signer: cranks are permissionless, priced by
 //! `payment_per_crank`, and the instruction itself is the authoritative
@@ -63,30 +68,22 @@ pub mod demo_book {
         instructions::set_payment_v0::handle_set_payment_v0(ctx, args)
     }
 
-    pub fn resolve_sweep_v0(
-        ctx: &mut Context<ResolveSweepV0>,
+    /// One resolver for every condition on the book — it is told which one
+    /// fired and returns the executor to run. See
+    /// [`instructions::resolve_v0`].
+    pub fn resolve_v0(
+        ctx: &mut Context<ResolveV0>,
+        args: FiredConditionArgsV0,
     ) -> Result<[u8; relay_spec::RESPONSE_POINTER_LEN]> {
-        instructions::resolve_sweep_v0::handle_resolve_sweep_v0(ctx)
+        instructions::resolve_v0::handle_resolve_v0(ctx, args)
     }
 
     pub fn sweep_v0(ctx: &mut Context<SweepV0>, args: SweepArgsV0) -> Result<()> {
         instructions::sweep_v0::handle_sweep_v0(ctx, args)
     }
 
-    pub fn resolve_evict_v0(
-        ctx: &mut Context<ResolveEvictV0>,
-    ) -> Result<[u8; relay_spec::RESPONSE_POINTER_LEN]> {
-        instructions::resolve_evict_v0::handle_resolve_evict_v0(ctx)
-    }
-
     pub fn evict_v0(ctx: &mut Context<EvictV0>, args: EvictArgsV0) -> Result<()> {
         instructions::evict_v0::handle_evict_v0(ctx, args)
-    }
-
-    pub fn resolve_cross_v0(
-        ctx: &mut Context<ResolveCrossV0>,
-    ) -> Result<[u8; relay_spec::RESPONSE_POINTER_LEN]> {
-        instructions::resolve_cross_v0::handle_resolve_cross_v0(ctx)
     }
 
     pub fn cross_v0(ctx: &mut Context<CrossV0>, args: CrossArgsV0) -> Result<()> {

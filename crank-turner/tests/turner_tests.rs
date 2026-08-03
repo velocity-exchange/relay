@@ -46,6 +46,10 @@ const BOOK_ACCOUNT_LEN: usize = 2816;
 const CONDITIONS_OFFSET: u32 = 912;
 /// demo-book's sweep condition — the timestamp-waked one.
 const SWEEP: u8 = 0;
+/// demo-book's cross condition — waked by any change to the book.
+const CROSS: u8 = 2;
+const SIDE_BID: u8 = 0;
+const SIDE_ASK: u8 = 1;
 const ENTRY_COUNT_OFFSET: usize = 72;
 const NEXT_EXPIRY_OFFSET: usize = 64;
 const STAGING_OFFSET: usize = 1792;
@@ -445,6 +449,18 @@ impl Harness {
         self.add_entry_to(book, expiry_ts);
     }
 
+    fn add_quote(&mut self, expiry_ts: i64, price: u64, side: u8) {
+        let ix = demo_ix(
+            "add_entry_v0",
+            vec![
+                AccountMeta::new(self.book, false),
+                AccountMeta::new_readonly(self.authority.pubkey(), true),
+            ],
+            &quote_args(expiry_ts, price, side),
+        );
+        self.send_admin(ix);
+    }
+
     fn cancel_entry(&mut self, id: u64) {
         let ix = demo_ix(
             "cancel_entry_v0",
@@ -533,8 +549,12 @@ impl Harness {
         self.send_admin(ix);
     }
 
+    /// The block as the turner reads it: cast in place out of the raw
+    /// account bytes, then copied because the caller owns the buffer.
     fn conditions(&self) -> Vec<spec::ConditionV0> {
-        spec::read_conditions_unaligned(&self.book_data(), CONDITIONS_OFFSET as usize).unwrap()
+        let data = self.book_data();
+        let (_, conditions) = spec::read_block(&data, CONDITIONS_OFFSET as usize).unwrap();
+        conditions.to_vec()
     }
 
     fn write_conditions(&mut self, conditions: &[spec::ConditionV0]) {
@@ -1005,7 +1025,7 @@ async fn filter_scopes_turner_to_its_own_programs() {
     let foreign_watch = relay_crank_turner::Watch {
         target_program: foreign_program,
         target: foreign_target,
-        registrar: Pubkey::new_unique(),
+        creator: Pubkey::new_unique(),
         offset: 0,
     };
     assert_eq!(
@@ -2419,6 +2439,72 @@ async fn clearing_the_delay_releases_held_work() {
         sent(&outcomes).len(),
         1,
         "work stayed held after the delay cleared: {outcomes:?}"
+    );
+}
+
+/// The executor is the **resolver's** answer, not a literal in the
+/// condition: demo-book's three conditions all name one `resolve_v0`, and
+/// which instruction the turner ends up submitting depends only on which
+/// condition it told that resolver had fired.
+///
+/// This is also the test that the fired-condition coordinates actually
+/// reach the resolver — a turner that dropped them could not produce two
+/// different executors from one resolver discriminator.
+#[tokio::test]
+async fn one_resolver_returns_a_different_executor_per_condition() {
+    let mut h = setup(PAYMENT, 100, TurnerConfig::default());
+    h.refresh().await;
+    let t0 = h.t0;
+    // An expired bid (sweepable) that also crosses a live ask.
+    h.add_quote(t0 + 100, 100, SIDE_BID);
+    h.add_quote(t0 + 10_000, 90, SIDE_ASK);
+    h.warp(t0 + 200, 2);
+
+    let conditions = h.conditions();
+    let resolver = disc("resolve_v0");
+    assert_eq!(
+        conditions[SWEEP as usize].crank_spec().resolver_disc[..],
+        resolver[..],
+        "sweep must name the shared resolver"
+    );
+    assert_eq!(
+        conditions[CROSS as usize].crank_spec().resolver_disc[..],
+        resolver[..],
+        "cross must name the same one"
+    );
+
+    let executor_data = |verdict: &Verdict| -> Vec<u8> {
+        let Verdict::WouldSend { instructions, .. } = verdict else {
+            panic!("expected a ready crank, got {verdict:?}");
+        };
+        instructions
+            .iter()
+            .find(|ix| ix.program_id == demo_id())
+            .expect("the executor is demo-book's")
+            .data
+            .clone()
+    };
+
+    let sweep = h
+        .turner
+        .explain((h.book, CONDITIONS_OFFSET, SWEEP))
+        .await
+        .unwrap();
+    assert_eq!(
+        &executor_data(&sweep.verdict)[..8],
+        &disc("sweep_v0")[..],
+        "the sweep condition resolved to sweep_v0"
+    );
+
+    let cross = h
+        .turner
+        .explain((h.book, CONDITIONS_OFFSET, CROSS))
+        .await
+        .unwrap();
+    assert_eq!(
+        &executor_data(&cross.verdict)[..8],
+        &disc("cross_v0")[..],
+        "the same resolver, told a different condition fired, resolved to cross_v0"
     );
 }
 

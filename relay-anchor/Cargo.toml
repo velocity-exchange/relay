@@ -1,0 +1,27 @@
+[package]
+name = "relay-anchor"
+description = "Host a relay condition block as one typed field in an Anchor 1.0 account"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/velocity-exchange/relay"
+
+# A THIRD workspace, deliberately: this crate is the only thing in the repo
+# that depends on anchor (the 1.0 line, from crates.io), and neither existing
+# workspace should carry that tree. The client workspace at the repo root is
+# solana 3.x, `programs/` is the anchor-v2 alpha, and `relay-spec` can be a
+# member of both only because it is zero-dep. Own Cargo.lock, own target dir.
+# Build/test with `cargo test --manifest-path relay-anchor/Cargo.toml`.
+[workspace]
+
+[dependencies]
+relay-spec = { path = "../spec" }
+
+# Optional, and only for the IdlBuild impl: a host that does not run
+# `anchor idl build` needs no anchor code from this crate at all. Hosts
+# forward their own `idl-build` feature to ours (see the module docs).
+anchor-lang = { version = "1.0.2", optional = true }
+
+[features]
+default = []
+idl-build = ["dep:anchor-lang", "anchor-lang/idl-build"]

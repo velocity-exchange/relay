@@ -4,7 +4,9 @@
 //! pass), and a scratch region resolvers stage their payloads in.
 //!
 //! Entries are two-sided quotes, so the book can cross. Three conditions
-//! ride on it, one per wake kind that matters in practice:
+//! ride on it, one per wake kind that matters in practice — all three
+//! resolved by the single `resolve_v0` instruction, which is told which one
+//! fired and names the executor to run:
 //!
 //! - **sweep** (`AtTimestamp`) — reclaim expired entries.
 //! - **evict** (`OnAccountChange` on `entry_count`) — trim at a soft cap.
@@ -17,7 +19,7 @@
 use anchor_lang_v2::prelude::*;
 use relay_spec::{
     AccountRefV0, ConditionBlock, ConditionV0, CrankSpecV0, RelayBlockV0, ResolvedCrankV0,
-    ResponsePointerV0, KEEPER_PLACEHOLDER, RESPONSE_POINTER_LEN,
+    KEEPER_PLACEHOLDER, RESPONSE_POINTER_LEN,
 };
 use static_assertions::const_assert_eq;
 
@@ -235,15 +237,16 @@ impl BookV0 {
             .relay
             .write_resolvers(&[AccountRefV0::writable(book)])
             .expect("one ref fits the region");
-        // Copied out: the closure below is used while `self` is borrowed
-        // mutably by the condition writes.
+        // Copied out: used while `self` is borrowed mutably by the
+        // condition writes.
         let min_payment = self.payment_per_crank;
         let next_expiry_ts = self.next_expiry_ts;
-        let spec = move |resolver: &'static [u8], executor: &'static [u8]| CrankSpecV0 {
+        // Every condition names the same resolver: it is told which one
+        // fired and answers with the executor to run, so the block carries
+        // no executor identity at all.
+        let spec = CrankSpecV0 {
             resolver_program: program,
-            resolver_disc: disc(resolver),
-            executor_program: program,
-            executor_disc: disc(executor),
+            resolver_disc: disc(crate::instruction::ResolveV0::DISCRIMINATOR),
             min_payment,
         };
         // One condition at a time: an array literal would materialize
@@ -251,47 +254,37 @@ impl BookV0 {
         // a few slots blows the 4KB limit.
         let _ = self.relay.write_condition(
             SWEEP_CONDITION as usize,
-            &ConditionV0::at_timestamp(
-                next_expiry_ts,
-                spec(
-                    crate::instruction::ResolveSweepV0::DISCRIMINATOR,
-                    crate::instruction::SweepV0::DISCRIMINATOR,
-                ),
-                resolvers,
-            ),
+            &ConditionV0::at_timestamp(next_expiry_ts, spec, resolvers),
         );
         let _ = self.relay.write_condition(
             EVICT_CONDITION as usize,
-            &ConditionV0::on_account_change(
-                book,
-                ENTRY_COUNT_OFFSET as u32,
-                4,
-                spec(
-                    crate::instruction::ResolveEvictV0::DISCRIMINATOR,
-                    crate::instruction::EvictV0::DISCRIMINATOR,
-                ),
-                resolvers,
-            ),
+            &ConditionV0::on_account_change(book, ENTRY_COUNT_OFFSET as u32, 4, spec, resolvers),
         );
         // Cross: any change to the book at all.
         let _ = self.relay.write_condition(
             CROSS_CONDITION as usize,
-            &ConditionV0::on_account_change(
-                book,
-                VERSION_OFFSET as u32,
-                8,
-                spec(
-                    crate::instruction::ResolveCrossV0::DISCRIMINATOR,
-                    crate::instruction::CrossV0::DISCRIMINATOR,
-                ),
-                resolvers,
-            ),
+            &ConditionV0::on_account_change(book, VERSION_OFFSET as u32, 8, spec, resolvers),
         );
     }
 }
 
 impl BookV0 {
-    /// Executor account list shared by every resolver: keeper placeholder
+    /// A resolved crank on this program: the executor named by
+    /// `executor_disc`, the shared account list, and its args.
+    pub fn resolved(
+        own_address: &Address,
+        executor_disc: &'static [u8],
+        data: Vec<u8>,
+    ) -> ResolvedCrankV0 {
+        ResolvedCrankV0::new(
+            *crate::ID.as_array(),
+            disc(executor_disc),
+            Self::executor_accounts(own_address),
+            data,
+        )
+    }
+
+    /// Executor account list shared by every crank: keeper placeholder
     /// (writable, receives payment) then the book (writable).
     pub fn executor_accounts(own_address: &Address) -> Vec<AccountRefV0> {
         vec![

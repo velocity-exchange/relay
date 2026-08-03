@@ -8,6 +8,6 @@ pub enum RelayError {
     GuardNotArmed,
     #[msg("Guard does not belong to the given payout account")]
     GuardPayoutMismatch,
-    #[msg("Signer does not match the watch registrar")]
-    InvalidRegistrar,
+    #[msg("Signer does not match the watch creator")]
+    InvalidCreator,
 }

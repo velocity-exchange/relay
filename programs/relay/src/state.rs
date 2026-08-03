@@ -14,7 +14,7 @@ pub struct WatchV0 {
     /// Account carrying a condition block in its data.
     pub target: Address,
     /// Who registered (and may close) this watch.
-    pub registrar: Address,
+    pub creator: Address,
     /// Byte offset of the block within the target's account data.
     pub offset: u32,
     pub _pad: [u8; 4],
@@ -31,6 +31,14 @@ const_assert_eq!(WATCH_ACCOUNT_LEN, relay_spec::WATCH_V0_LEN);
 const_assert_eq!(
     8 + core::mem::offset_of!(WatchV0, target_program),
     relay_spec::WATCH_TARGET_PROGRAM_OFFSET
+);
+const_assert_eq!(
+    8 + core::mem::offset_of!(WatchV0, target),
+    relay_spec::WATCH_TARGET_OFFSET
+);
+const_assert_eq!(
+    8 + core::mem::offset_of!(WatchV0, creator),
+    relay_spec::WATCH_CREATOR_OFFSET
 );
 
 /// PDA seed prefix for [`GuardV0`].

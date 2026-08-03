@@ -70,8 +70,8 @@ struct Args {
     #[arg(long, env = "RELAY_BLOCKED_PROGRAMS", value_delimiter = ',')]
     blocked_program: Vec<Pubkey>,
     /// Only crank watches registered by these keys. Repeatable.
-    #[arg(long, env = "RELAY_ALLOWED_REGISTRARS", value_delimiter = ',')]
-    allowed_registrar: Vec<Pubkey>,
+    #[arg(long, env = "RELAY_ALLOWED_CREATORS", value_delimiter = ',')]
+    allowed_creator: Vec<Pubkey>,
     /// Drop watches whose target account exceeds this many bytes.
     #[arg(long, env = "RELAY_MAX_TARGET_BYTES")]
     max_target_bytes: Option<usize>,
@@ -178,7 +178,7 @@ async fn main() -> Result<()> {
     let filter = WatchFilter {
         allowed_target_programs: args.target_program.iter().copied().collect(),
         blocked_target_programs: args.blocked_program.iter().copied().collect(),
-        allowed_registrars: args.allowed_registrar.iter().copied().collect(),
+        allowed_creators: args.allowed_creator.iter().copied().collect(),
         allowed_targets: Default::default(),
         max_target_bytes: args.max_target_bytes,
         max_watches: args.max_watches,

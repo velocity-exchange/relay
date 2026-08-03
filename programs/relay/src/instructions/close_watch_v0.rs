@@ -8,12 +8,12 @@ pub struct CloseWatchV0 {
     #[account(mut)]
     pub watch: Account<WatchV0>,
     /// Receives the watch account's rent.
-    #[account(mut, address = watch.registrar @ RelayError::InvalidRegistrar)]
-    pub registrar: Signer,
+    #[account(mut, address = watch.creator @ RelayError::InvalidCreator)]
+    pub creator: Signer,
 }
 
 pub fn handle_close_watch_v0(ctx: &mut Context<CloseWatchV0>) -> Result<()> {
-    let destination = *ctx.accounts.registrar.as_ref();
+    let destination = *ctx.accounts.creator.as_ref();
     ctx.accounts.watch.close(destination)?;
     Ok(())
 }

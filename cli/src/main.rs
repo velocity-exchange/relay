@@ -81,14 +81,14 @@ struct Common {
         global = true
     )]
     blocked_program: Vec<Pubkey>,
-    /// Mirror the daemon's `--allowed-registrar`.
+    /// Mirror the daemon's `--allowed-creator`.
     #[arg(
         long,
-        env = "RELAY_ALLOWED_REGISTRARS",
+        env = "RELAY_ALLOWED_CREATORS",
         value_delimiter = ',',
         global = true
     )]
-    allowed_registrar: Vec<Pubkey>,
+    allowed_creator: Vec<Pubkey>,
     /// Mirror the daemon's `--trusted-program`.
     #[arg(
         long,
@@ -232,7 +232,7 @@ async fn turner(common: &Common) -> Result<Loaded> {
         filter: WatchFilter {
             allowed_target_programs: common.target_program.iter().copied().collect(),
             blocked_target_programs: common.blocked_program.iter().copied().collect(),
-            allowed_registrars: common.allowed_registrar.iter().copied().collect(),
+            allowed_creators: common.allowed_creator.iter().copied().collect(),
             ..WatchFilter::default()
         },
         ..TurnerConfig::default()
@@ -270,9 +270,7 @@ fn reject_advice(reason: &RejectReason) -> &'static str {
             "its target program is not in --target-program (this turner's allowlist)"
         }
         RejectReason::ProgramBlocked => "its target program is in --blocked-program",
-        RejectReason::RegistrarNotAllowed => {
-            "whoever registered it is not in --allowed-registrar"
-        }
+        RejectReason::CreatorNotAllowed => "whoever registered it is not in --allowed-creator",
         RejectReason::TargetNotAllowed => "its target is not in this turner's target allowlist",
         RejectReason::TargetTooLarge => "the target account is bigger than --max-target-bytes",
         RejectReason::TargetMissing => {
@@ -295,7 +293,7 @@ fn reject_name(reason: &RejectReason) -> &'static str {
     match reason {
         RejectReason::ProgramNotAllowed => "program not allowed",
         RejectReason::ProgramBlocked => "program blocked",
-        RejectReason::RegistrarNotAllowed => "registrar not allowed",
+        RejectReason::CreatorNotAllowed => "creator not allowed",
         RejectReason::TargetNotAllowed => "target not allowed",
         RejectReason::TargetTooLarge => "target too large",
         RejectReason::TargetMissing => "target missing",
@@ -379,12 +377,12 @@ async fn watch_list(common: &Common, rejected: bool) -> Result<()> {
             vec![
                 w.target.to_string(),
                 w.target_program.to_string(),
-                w.registrar.to_string(),
+                w.creator.to_string(),
                 w.offset.to_string(),
             ]
         })
         .collect();
-    render::table(&["TARGET", "PROGRAM", "REGISTRAR", "OFFSET"], &rows);
+    render::table(&["TARGET", "PROGRAM", "CREATOR", "OFFSET"], &rows);
     if rejected && !print_rejected(&summary) {
         println!(
             "\nNo watch was rejected: every one registered against {} is tracked.",
@@ -405,7 +403,7 @@ fn watch_json(w: &Watch) -> serde_json::Value {
     json!({
         "target": w.target.to_string(),
         "target_program": w.target_program.to_string(),
-        "registrar": w.registrar.to_string(),
+        "creator": w.creator.to_string(),
         "offset": w.offset,
     })
 }
@@ -422,7 +420,7 @@ async fn watch_get(common: &Common, target: Pubkey) -> Result<()> {
         .ok_or_else(|| {
             anyhow!(
                 "no watch for {target} at all — nothing is registered against it. \
-                 Check --program-id, and that the registrar's transaction landed."
+                 Check --program-id, and that the creator's transaction landed."
             )
         })?;
     let explanations = explain_all(&turner, &[watch]).await;
@@ -438,7 +436,7 @@ async fn watch_get(common: &Common, target: Pubkey) -> Result<()> {
     }
     println!("target     {}", watch.target);
     println!("program    {}", watch.target_program);
-    println!("registrar  {}", watch.registrar);
+    println!("creator    {}", watch.creator);
     println!("offset     {}\n", watch.offset);
     print_condition_table(&explanations);
     Ok(())
@@ -536,7 +534,7 @@ fn explanation_json(e: &Explanation) -> serde_json::Value {
         "offset": e.key.1,
         "index": e.key.2,
         "program": e.program.to_string(),
-        "registrar": e.registrar.to_string(),
+        "creator": e.creator.to_string(),
         "active": e.condition.is_active(),
         "min_payment": e.condition.min_payment(),
         "wake": {
@@ -573,7 +571,7 @@ async fn explain(common: &Common, target: Pubkey, index: u8, offset: Option<u32>
         e.key.0, e.key.1, e.key.2
     );
     println!("program    {}", e.program);
-    println!("registrar  {}", e.registrar);
+    println!("creator    {}", e.creator);
     println!(
         "chain      slot {}, unix_timestamp {}\n",
         e.clock.slot, e.clock.unix_timestamp

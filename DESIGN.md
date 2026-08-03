@@ -10,20 +10,22 @@ Generic condition-cranking for Solana programs. Successor to [tuktuk](https://gi
 
 ## Condition contract (spec crate)
 
-A condition block lives at a fixed **8-aligned** offset in a target-program account, registered with the relay program as a `WatchV0`. The block is **zero-copy pod** (`#[repr(C)]`, bytemuck, no interior padding): `ConditionBlockHeaderV0` (16 bytes: `"RELAY-V0"` magic, version, count) followed by a fixed array of `ConditionV0` (280 bytes each):
+A condition block lives at a fixed offset in a target-program account, registered with the relay program as a `WatchV0`. The block is **zero-copy pod** (`#[repr(C)]`, bytemuck, no interior padding): `ConditionBlockHeaderV0` (16 bytes: `"RELAY-V0"` magic, version, count) followed by a fixed array of `ConditionV0` (192 bytes each):
 
 ```
 ConditionV0 {
   min_payment: u64,          // lamports the executor must pay the keeper
   // wake inputs, flattened so updates are single field stores:
-  wake_ts: i64,              // WakeKind::AtTimestamp
+  wake_ts: i64,              // WakeKind::AtTimestamp | OnValueCross threshold
   wake_slot: u64,            // WakeKind::EverySlots (interval) | AtSlot (absolute)
-  wake_account/offset/len,   // WakeKind::OnAccountChange (watched byte range)
-  resolver_program + resolver_disc + resolver_accounts[4],
-  executor_program + executor_disc,   // accounts/args come from the resolver
-  num_resolver_accounts, wake_kind, active, _pad
+  wake_account/offset/len,   // watched byte range (OnAccountChange, OnValueCross)
+  resolver_program + resolver_disc,   // the executor is the resolver's answer
+  resolver_list_offset + num_resolver_accounts,
+  wake_kind, active, wake_cmp, wake_value_unsigned, _reserved
 }
 ```
+
+Every field is stored as a little-endian byte array behind an accessor, so the whole evaluation path is **alignment 1**. That is what makes one reader enough: `read_block` casts a block in place out of any buffer at any offset — a program's own account data, a turner's RPC response — with no copy and no second, copying code path to keep in step. (Hosts still put blocks at 8-aligned offsets by convention, because it keeps their own structs tidy; nothing in the read path needs it.)
 
 Wake kinds:
 
@@ -43,13 +45,21 @@ Payment therefore lands as raw lamports, which is exactly what the guard measure
 
 **The payout must never sign.** Signer status on Solana is transaction-global: an account that signs the message is a signer inside *every* instruction of it, whatever the per-instruction `AccountMeta` says. A malicious executor handed the fee payer would therefore see `is_signer: true` and could CPI a System transfer to drain it — marking the meta `is_signer: false` is necessary but nowhere near sufficient. So `--payout-address` names a separate account that receives payment and never signs; the fee payer signs and is never handed to an executor. On top of that the turner **searches the finished instruction list** and refuses to sign a transaction where any instruction that is not relay's own, and not trusted, either **asks for a signature** (any `is_signer: true` meta — nothing legitimate needs one, since executors are permissionless) or **names one of the transaction's signers** (`Turner::signer_leak`, reading the signer set off the compiled message rather than assuming it). The second is the one that actually bites, since the meta flag is not honoured per instruction. Note what this does *not* forbid: an executor must name the account it pays, and that is fine — a non-signing account can only be credited. The rule is "don't name a signer", not "don't name the payee", and the separate payout is what makes those two different accounts. That is the binding rule, and it deliberately lives at signing time rather than at build time: instructions get rebuilt, re-priced, and concatenated into packs afterwards, so checking the list about to be signed is the only version no later transformation can bypass. A resolver that slips the fee payer in directly instead of through `KEEPER_PLACEHOLDER` is caught the same way. Without a payout configured, untrusted programs are skipped entirely rather than risked.
 
-**Trusted programs opt out of all of it.** `--trusted-program <ID>` says "I wrote this, I don't need a condom": its executors run with no guard instructions (two fewer instructions, their compute, ~100 bytes) and may be paid straight to the fee payer. Only list programs you control — the guards and the payout separation are the only things standing between a turner and a malicious executor.
+**Trusted programs opt out of all of it.** `--trusted-program <ID>` says "I wrote this, I don't need a condom": its executors run with no guard instructions (two fewer instructions, their compute, ~100 bytes) and may be paid straight to the fee payer. Only list programs you control — the guards and the payout separation are the only things standing between a turner and a malicious executor. And note that the program deciding this is the one the *resolver* named, which is not authenticated (the literal a condition used to carry never was either): any target program can have its cranks run against a listed program by naming it, so the bar is "I am happy for anyone to invoke its permissionless surface with my fee payer in the account list", not merely "I wrote it".
 
 ### Resolver output: staging, not return data
 
 Return data is capped at 1024 bytes, which would bound how many accounts and args a resolver can name — exactly the wrong thing to bound, since batch cranks grow with the work (sweep every expired order, each with its own owner). So the resolver **stages** `[num_accounts: u8][data_len: u16][AccountRefV0; n][data]` in one of its own writable accounts and returns a 10-byte `ResponsePointerV0 { work, account_index, offset, len }`; `account_index` indexes the condition's `resolver_accounts`. The turner reads the byte range out of the simulation's **post-execution account state** (`simulateTransaction`'s `accounts` config; litesvm's `post_accounts`).
 
 Because resolvers are only ever simulated, the staging write never lands on chain: no state bloat, no rent churn, and no write contention between competing turners. A no-work result stages nothing at all. `KEEPER_PLACEHOLDER` entries in the staged account list are replaced with the turner's keeper; `data` becomes the executor's args after the discriminator.
+
+### The resolver names the executor
+
+The staged payload leads with the executor's **program and discriminator**, and a condition carries neither. A condition used to name the instruction to run as a literal, which meant one slot could only ever run one instruction: a program with a family of like-instructions — settle this kind of position, sweep that kind of order — needed a condition, and a wake, for each. Returning the identity costs 40 staged bytes and adds no trust, because the resolver already decides the accounts and the args: a turner willing to run what a resolver picked out is willing to run *which* instruction it picked, and the guards bound the damage identically either way. demo-book is the reference — its three conditions share one `resolve_v0`.
+
+That only works if the resolver knows which condition it is answering for, so the turner appends a `FiredConditionV0` — target account, block offset, condition index — to the resolver's instruction data after the discriminator (45 bytes total). Instruction data is the cheapest faithful channel: 37 bytes, no extra account, no extra read, and nothing new for the turner to track, since the identity is exactly the `WatchV0` coordinates plus the slot index. The alternatives are worse in kind, not degree — an extra account is a 32-byte key plus a load to carry 5 bytes of context, and a discriminator per condition is the duplication this removes.
+
+The identity is not authenticated and does not need to be: it names the resolver's *own* state, which the resolver re-reads from the accounts it was handed. So a resolver validates it like any argument — is this the account I hold, is this an index I serve — rather than trusting it. A wrong identity can only produce an answer about a condition that is not due, which costs a simulation.
 
 Programs embed the block as typed fields (`cond_header: ConditionBlockHeaderV0, conditions: [ConditionV0; N]`) — see demo-book — or via `relay_spec::read_block / read_block_mut / write_block` over a byte region.
 
@@ -60,12 +70,12 @@ The registry is permissionless, so a turner that tracked everything could be mad
 | Stage | Rule | Cost |
 |---|---|---|
 | Server-side | `allowed_target_programs` → `getProgramAccounts` / geyser memcmp on `WatchV0.target_program` | non-matching watches are never transmitted |
-| Registry-only | `blocked_target_programs`, `allowed_registrars`, `allowed_targets` | decided from the 112-byte watch account |
+| Registry-only | `blocked_target_programs`, `allowed_creators`, `allowed_targets` | decided from the 112-byte watch account |
 | Post-fetch | `max_target_bytes`, owner-drift check | one fetch per refresh |
 | Post-parse | `min_crank_payment` | one parse per refresh |
 | Last | `max_watches` | — |
 
-`target_program` is recorded **by the relay program from the target account's owner** at registration, so a registrar can't claim someone else's program to slip past an allowlist. It leads the `WatchV0` layout precisely so it is memcmp-able.
+`target_program` is recorded **by the relay program from the target account's owner** at registration, so a watch's creator can't claim someone else's program to slip past an allowlist. It leads the `WatchV0` layout precisely so it is memcmp-able.
 
 The fee bar drops the *whole watch*, not just the underachieving condition: a book with nothing worth cranking stops being fetched and subscribed until the next refresh, rather than costing a fetch every tick forever. Everything here is resource policy, never correctness — `crank_v0`'s payment assert is what guarantees a turner actually gets paid.
 
@@ -73,7 +83,7 @@ The fee bar drops the *whole watch*, not just the underachieving condition: a bo
 
 Anchor v2 (anchor-next, same pinned rev as velocity's anchor-v2 workspace). Two jobs:
 
-1. **Registry**: `register_watch_v0(target, offset)` / `close_watch_v0`. A `WatchV0` is `[disc][target_program][target][registrar][offset]` — discovery metadata only. `target_program` is read from the target account, not from args. Registration is permissionless (garbage watches parse-fail and get dropped at refresh); the registrar can close and reclaim rent.
+1. **Registry**: `register_watch_v0(target, offset)` / `close_watch_v0`. A `WatchV0` is `[disc][target_program][target][creator][offset]` — discovery metadata only. `target_program` is read from the target account, not from args. Registration is permissionless (garbage watches parse-fail and get dropped at refresh); the creator can close and reclaim rent.
 2. **Payment guards**: `begin_guard_v0` / `assert_paid_v0`, bracketing the executor. `begin_guard_v0` takes a signing `payer` (which funds the guard account) and a non-signing `payout` (whose balance is measured) — deliberately different accounts, see the trust model above:
 
 ```
@@ -127,7 +137,8 @@ The turner is three cooperating pieces, following tuktuk's crank turner where it
 `ws` and `grpc` are `CachedSource<RpcSource>`: the subscription feeds an account cache, and misses (plus a periodic `repoll_every` refetch, the tuktuk dual ws+poll insurance) fall through to RPC. Subscriptions only replace *reads* — simulation and submission always go to RPC. Loop per condition:
 
 ```
-wake hint due? → sim resolver → work? → read staged payload from post-sim account state
+wake hint due? → sim resolver (told which condition fired) → work?
+  → read staged payload from post-sim account state (executor id, accounts, args)
   → build [begin_guard, executor, assert_paid] with the keeper injected
   → sim (success ⇒ pays ≥ min_payment) → send → backoff/dedup bookkeeping
 ```
@@ -154,8 +165,9 @@ Discovery over unbounded account sets (finding liquidatable users) is not expres
 
 ## Repo layout
 
-- `spec/` — `relay-spec`: the wire types. Zero-copy pod; depends only on bytemuck.
-- `programs/` — separate cargo workspace (anchor-v2 pinned rev, own lockfile + target): `relay` program, `demo-book` (reference target: a two-sided book carrying one condition per wake kind — `AtTimestamp` expiry sweep with a self-repairing hint, `OnAccountChange` soft-cap eviction on `entry_count`, and `OnAccountChange` crossing on a `version` counter every mutation bumps, i.e. "whenever the book changes at all, look for a cross"). Hosts the cross-program tests.
+- `spec/` — `relay-spec`: the wire types. Zero-copy pod, alignment 1; depends only on bytemuck.
+- `relay-anchor/` — `relay-anchor`: the block as one typed field in an Anchor 1.0 account (`Deref` to the spec type, `Pod`, the condition surface by delegation, and an `IdlBuild` impl describing the region as opaque bytes). Its own workspace, because it is the one crate here that depends on anchor at all; generic over the spec version, so a `RelayBlockV1` is a new alias rather than a break for hosts.
+- `programs/` — separate cargo workspace (anchor-v2 pinned rev, own lockfile + target): `relay` program, `demo-book` (reference target: a two-sided book carrying one condition per wake kind — `AtTimestamp` expiry sweep with a self-repairing hint, `OnAccountChange` soft-cap eviction on `entry_count`, and `OnAccountChange` crossing on a `version` counter every mutation bumps, i.e. "whenever the book changes at all, look for a cross" — all three served by one `resolve_v0`). Hosts the cross-program tests.
 - `crank-turner/` — root-workspace client crate (solana 3.x), litesvm tests drive the full loop against built `.so` fixtures.
 
 `crank-turner/tests/validator_e2e.rs` runs three scenarios against a real `solana-test-validator` (`./scripts/e2e.sh`). Two drive `tick()` directly — good for precise assertions, but they bypass everything the binary adds. The third, `shipped_daemon_cranks_over_websocket`, **spawns the actual `relay-crank-turner` process** with `--transport ws` against the validator's pubsub port and never touches it again: the test only creates a book and posts orders, and asserts the cranks happened, that the log shows the websocket path was taken rather than a silent fallback, and that the daemon's own `/metrics` shows reads served from subscription coverage. That is the one that answers "does the thing we ship work".

@@ -34,6 +34,7 @@ jobs:
           workspaces: |
             .
             programs
+            relay-anchor
       - name: Cache Solana platform tools
         uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
         with:
@@ -47,6 +48,7 @@ jobs:
         run: |
           cargo fmt --all --check
           cargo fmt --all --check --manifest-path programs/Cargo.toml
+          cargo fmt --all --check --manifest-path relay-anchor/Cargo.toml
       - name: Build program fixtures (platform-tools v1.54)
         # v1.52 miscompiles both programs into runtime access violations —
         # see CLAUDE.md; the pin lives in the script.
@@ -55,5 +57,13 @@ jobs:
         run: cargo test --workspace
       - name: Test programs workspace
         run: cargo test --manifest-path programs/Cargo.toml
+      # The anchor 1.0 host wrapper: both feature flavors, since the IdlBuild
+      # impl only exists under `idl-build` and is what velocity needs.
+      - name: Test relay-anchor
+        run: |
+          cargo test --manifest-path relay-anchor/Cargo.toml
+          cargo test --manifest-path relay-anchor/Cargo.toml --features idl-build
       - name: Clippy
-        run: cargo clippy --workspace
+        run: |
+          cargo clippy --workspace
+          cargo clippy --manifest-path relay-anchor/Cargo.toml --all-features

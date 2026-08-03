@@ -31,7 +31,7 @@ fn addr(pk: Pubkey) -> Address {
 struct Ctx {
     svm: LiteSVM,
     payer: Keypair,
-    registrar: Keypair,
+    creator: Keypair,
     target: Pubkey,
     watch: Pubkey,
 }
@@ -42,9 +42,9 @@ fn setup() -> Ctx {
         .expect("relay.so missing — run scripts/build-programs.sh first");
 
     let payer = Keypair::new();
-    let registrar = Keypair::new();
+    let creator = Keypair::new();
     svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
-    svm.airdrop(&registrar.pubkey(), 1_000_000_000).unwrap();
+    svm.airdrop(&creator.pubkey(), 1_000_000_000).unwrap();
 
     let target = Pubkey::new_unique();
     svm.airdrop(&target, 1_000_000).unwrap();
@@ -67,7 +67,7 @@ fn setup() -> Ctx {
     Ctx {
         svm,
         payer,
-        registrar,
+        creator,
         target,
         watch,
     }
@@ -83,12 +83,12 @@ fn send(ctx: &mut Ctx, ix: Instruction) -> Result<TransactionMetadata, FailedTra
         &blockhash,
     );
     let mut signers: Vec<&dyn anchor_v2_testing::Signer> = vec![&ctx.payer];
-    let needs_registrar = ix
+    let needs_creator = ix
         .accounts
         .iter()
-        .any(|m| m.is_signer && m.pubkey.to_bytes() == ctx.registrar.pubkey().to_bytes());
-    if needs_registrar {
-        signers.push(&ctx.registrar);
+        .any(|m| m.is_signer && m.pubkey.to_bytes() == ctx.creator.pubkey().to_bytes());
+    if needs_creator {
+        signers.push(&ctx.creator);
     }
     let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(msg), &signers).unwrap();
     ctx.svm.send_transaction(tx)
@@ -99,7 +99,7 @@ fn register_ix(ctx: &Ctx, offset: u32) -> Instruction {
         args: RegisterWatchArgsV0 { offset },
     }
     .to_instruction(accounts::RegisterWatchV0 {
-        registrar: addr(ctx.registrar.pubkey()),
+        creator: addr(ctx.creator.pubkey()),
         target: addr(ctx.target),
         watch: addr(ctx.watch),
     })
@@ -175,7 +175,7 @@ fn register_and_parse_watch() {
     let account = ctx.svm.get_account(&ctx.watch).unwrap();
     assert_eq!(account.data.len(), relay_spec::WATCH_V0_LEN);
     let parsed = relay_spec::WatchV0::read_from_account(&account.data).unwrap();
-    assert_eq!(parsed.registrar, ctx.registrar.pubkey().to_bytes());
+    assert_eq!(parsed.creator, ctx.creator.pubkey().to_bytes());
     assert_eq!(parsed.target, ctx.target.to_bytes());
     assert_eq!(parsed.offset, 616);
 }
@@ -191,43 +191,43 @@ fn register_requires_zeroed_account() {
 }
 
 #[test]
-fn close_watch_returns_rent_to_registrar() {
+fn close_watch_returns_rent_to_creator() {
     let mut ctx = setup();
     let ix = register_ix(&ctx, 616);
     send(&mut ctx, ix).unwrap();
 
     let rent = ctx.svm.get_account(&ctx.watch).unwrap().lamports;
-    let registrar_before = ctx.svm.get_balance(&ctx.registrar.pubkey()).unwrap();
+    let creator_before = ctx.svm.get_balance(&ctx.creator.pubkey()).unwrap();
 
     let ix = instruction::CloseWatchV0 {}.to_instruction(accounts::CloseWatchV0 {
         watch: addr(ctx.watch),
-        registrar: addr(ctx.registrar.pubkey()),
+        creator: addr(ctx.creator.pubkey()),
     });
     send(&mut ctx, ix).unwrap();
 
-    let registrar_after = ctx.svm.get_balance(&ctx.registrar.pubkey()).unwrap();
-    assert_eq!(registrar_after, registrar_before + rent);
+    let creator_after = ctx.svm.get_balance(&ctx.creator.pubkey()).unwrap();
+    assert_eq!(creator_after, creator_before + rent);
     // Closed: gone or drained.
     let closed = ctx.svm.get_account(&ctx.watch);
     assert!(closed.is_none() || closed.unwrap().lamports == 0);
 }
 
 #[test]
-fn close_watch_rejects_non_registrar() {
+fn close_watch_rejects_non_creator() {
     let mut ctx = setup();
     let ix = register_ix(&ctx, 616);
     send(&mut ctx, ix).unwrap();
 
-    // Payer signs, but is not the registrar recorded on the watch.
+    // Payer signs, but is not the creator recorded on the watch.
     let ix = instruction::CloseWatchV0 {}.to_instruction(accounts::CloseWatchV0 {
         watch: addr(ctx.watch),
-        registrar: addr(ctx.payer.pubkey()),
+        creator: addr(ctx.payer.pubkey()),
     });
     let failed = send(&mut ctx, ix).unwrap_err();
     assert_eq!(
         custom_error_code(&failed),
         Some(6003),
-        "expected InvalidRegistrar, got {:?}",
+        "expected InvalidCreator, got {:?}",
         failed.err
     );
 }

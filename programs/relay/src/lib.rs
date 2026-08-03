@@ -3,22 +3,21 @@
 //! Two jobs, both small on purpose:
 //!
 //! 1. **Watch registry** — `WatchV0` accounts pointing crank turners at a
-//!    `(target account, offset)` where a target program embeds a
-//!    [`relay_spec::ConditionBlockV0`]. Registration is permissionless:
-//!    a watch pointing at garbage parses as garbage and turners skip it, so
-//!    there is nothing to gate. The registrar can close its watch and
-//!    reclaim rent.
-//! 2. **`crank_v0`** — a payment-asserting wrapper around a condition's
-//!    executor instruction. It reads the condition from the target account,
-//!    CPIs the executor with every account `is_signer: false`, and asserts
-//!    the keeper account's lamports grew by at least `min_payment`. Turners
-//!    that wrap their cranks get sim-time payment verification for free
-//!    (sim success ⇒ paid) and armor against the sim-to-land race.
+//!    `(target account, offset)` where a target program embeds a condition
+//!    block. Registration is permissionless: a watch pointing at garbage
+//!    parses as garbage and turners skip it, so there is nothing to gate.
+//!    The creator can close its watch and reclaim rent.
+//! 2. **Payment guards** — `begin_guard_v0` / `assert_paid_v0`, bracketing
+//!    the executor instruction rather than wrapping it. The first snapshots
+//!    the payout account's lamports, the second reverts the whole
+//!    transaction unless they grew by at least the turner's asserted
+//!    `min_payment`.
 //!
-//! `crank_v0` grants nothing: no signer privilege is forwarded, so anything
-//! it can make an executor do, anyone could already do with a direct
-//! transaction. Turners MAY submit executors unwrapped — the wrapper is
-//! optional armor, not a toll booth.
+//! Guards assert around the call, they do not mediate it: relay is never in
+//! the executor's CPI stack, so all four levels stay available to the
+//! executor's own calls. Guards are optional (`--no-guard`) — a turner that
+//! trusts its simulation can submit the bare executor, and relay is then
+//! not involved in execution at all.
 
 use anchor_lang_v2::prelude::*;
 

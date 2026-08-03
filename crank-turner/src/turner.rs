@@ -1,6 +1,6 @@
-//! The condition loop: wake evaluation → resolver simulation → read the
-//! staged payload out of post-simulation account state → executor build →
-//! simulation → send. Deliberately a pull-style `tick()` state machine so
+//! The condition loop: wake evaluation → resolver simulation (told which
+//! condition fired) → read the staged payload out of post-simulation account
+//! state → build the executor **it names** → simulation → send. Deliberately a pull-style `tick()` state machine so
 //! tests (and alternative runtimes) drive it deterministically; `main.rs`
 //! wraps it in a timer.
 //!
@@ -40,7 +40,8 @@ pub struct Watch {
     /// Owner program of `target`, recorded on chain at registration.
     pub target_program: Pubkey,
     pub target: Pubkey,
-    pub registrar: Pubkey,
+    /// Who registered the watch, and the only key that may close it.
+    pub creator: Pubkey,
     pub offset: u32,
 }
 
@@ -149,6 +150,13 @@ pub struct TurnerConfig {
     /// I do not need a condom" setting: it saves two instructions, their
     /// compute, and ~100 bytes of transaction, at the cost of every
     /// protection below. Only ever list programs you control.
+    ///
+    /// Note what decides it: the program the **resolver named**, which is not
+    /// authenticated — nor was the literal a condition used to carry, so this
+    /// is not new. Any target program can therefore have its cranks run
+    /// against a listed program by naming it. The bar for listing one is
+    /// consequently not "I wrote it" but "I am happy for anyone to invoke its
+    /// permissionless surface with my fee payer in the account list".
     pub trusted_programs: HashSet<Pubkey>,
     /// Bracket untrusted executors with relay's payment guards. Off means
     /// trusting simulation alone: cheaper, but nothing catches a payment
@@ -345,10 +353,9 @@ impl<S: ChainSource> Turner<S> {
             .await?
             .remove(&target)
             .ok_or_else(|| anyhow::anyhow!("target account {target} does not exist"))?;
-        let conditions =
-            spec::read_conditions_unaligned(&account.data, offset as usize).map_err(|err| {
-                anyhow::anyhow!("condition block at offset {offset} is unreadable: {err:?}")
-            })?;
+        let (_, conditions) = spec::read_block(&account.data, offset as usize).map_err(|err| {
+            anyhow::anyhow!("condition block at offset {offset} is unreadable: {err:?}")
+        })?;
         let condition = *conditions.get(index as usize).ok_or_else(|| {
             anyhow::anyhow!(
                 "condition {index} is past the end of the block ({} present)",
@@ -423,7 +430,7 @@ impl<S: ChainSource> Turner<S> {
         Ok(Explanation {
             key,
             program: watch.target_program,
-            registrar: watch.registrar,
+            creator: watch.creator,
             condition,
             clock,
             watched_now,
@@ -475,7 +482,7 @@ impl<S: ChainSource> Turner<S> {
             .map(|w| Watch {
                 target_program: Pubkey::from(w.target_program),
                 target: Pubkey::from(w.target),
-                registrar: Pubkey::from(w.registrar),
+                creator: Pubkey::from(w.creator),
                 offset: w.offset,
             })
             .collect();
@@ -561,7 +568,7 @@ impl<S: ChainSource> Turner<S> {
         account: Option<&Account>,
     ) -> Result<(), crate::filter::RejectReason> {
         let account = account.ok_or(crate::filter::RejectReason::TargetMissing)?;
-        let conditions = spec::read_conditions_unaligned(&account.data, watch.offset as usize)
+        let (_, conditions) = spec::read_block(&account.data, watch.offset as usize)
             .map_err(|_| crate::filter::RejectReason::Unparseable)?;
         conditions
             .iter()
@@ -584,13 +591,18 @@ impl<S: ChainSource> Turner<S> {
         // Load all targets, parse their condition blocks.
         let targets: Vec<Pubkey> = self.watches.iter().map(|w| w.target).collect();
         let target_accounts = self.load_map(&targets).await?;
-        let parsed: Vec<(Watch, Option<Vec<spec::ConditionV0>>)> = self
+        // Conditions are borrowed straight out of the fetched account data:
+        // every wire type is alignment 1, so a block is a cast rather than a
+        // copy per condition — which matters on a registry of thousands
+        // read every tick.
+        let parsed: Vec<(Watch, Option<&[spec::ConditionV0]>)> = self
             .watches
             .iter()
             .map(|w| {
-                let conditions = target_accounts.get(&w.target).and_then(|acc| {
-                    spec::read_conditions_unaligned(&acc.data, w.offset as usize).ok()
-                });
+                let conditions = target_accounts
+                    .get(&w.target)
+                    .and_then(|acc| spec::read_block(&acc.data, w.offset as usize).ok())
+                    .map(|(_, conditions)| conditions);
                 (*w, conditions)
             })
             .collect();
@@ -599,7 +611,7 @@ impl<S: ChainSource> Turner<S> {
         // those too (deduped, skipping ones already loaded).
         let watched_extras: Vec<Pubkey> = parsed
             .iter()
-            .filter_map(|(_, conditions)| conditions.as_ref())
+            .filter_map(|(_, conditions)| *conditions)
             .flat_map(|conditions| conditions.iter())
             .filter_map(|c| match c.wake() {
                 Ok(spec::WakeView::OnAccountChange { address, .. })
@@ -961,10 +973,18 @@ impl<S: ChainSource> Turner<S> {
             .iter()
             .map(|a| Pubkey::from(a.address))
             .collect();
+        // Tell the resolver which condition it is answering for: its
+        // discriminator followed by the fired condition's coordinates. A
+        // resolver serving several conditions cannot work without this, and
+        // it costs 37 transaction bytes and no accounts.
         let resolver_ix = Instruction {
             program_id: Pubkey::from(condition.crank_spec().resolver_program),
             accounts: due.resolver_accounts.iter().map(account_ref_meta).collect(),
-            data: condition.crank_spec().resolver_disc.to_vec(),
+            data: spec::encode_resolver_data(
+                condition.crank_spec().resolver_disc,
+                spec::FiredConditionV0::new(key.0.to_bytes(), key.1, key.2),
+            )
+            .to_vec(),
         };
         let program_label =
             metrics::program_label(&Pubkey::from(condition.crank_spec().resolver_program));
@@ -1006,8 +1026,12 @@ impl<S: ChainSource> Turner<S> {
         }
         let resolved = read_staged(&sim.accounts, &pointer).context("staged resolver payload")?;
 
-        // Build the executor itself — no CPI wrapper.
-        let program = Pubkey::from(condition.crank_spec().executor_program);
+        // Build the executor itself — no CPI wrapper. Which instruction it
+        // is comes from the resolver, not from the condition: if the turner
+        // is willing to run the accounts and args a resolver chose, it is
+        // willing to run the instruction it chose, and the guards bound the
+        // damage either way.
+        let program = Pubkey::from(resolved.executor_program);
         let Some(payout) = self.payout_for(&program) else {
             return Ok(CrankResult::Done(
                 Outcome::Skipped(key, SkipReason::NoSafePayout),
@@ -1033,8 +1057,7 @@ impl<S: ChainSource> Turner<S> {
                     is_writable: a.is_writable(),
                 })
                 .collect(),
-            data: condition
-                .crank_spec()
+            data: resolved
                 .executor_disc
                 .iter()
                 .copied()
@@ -1570,7 +1593,8 @@ enum CrankResult {
 pub struct Explanation {
     pub key: CondKey,
     pub program: Pubkey,
-    pub registrar: Pubkey,
+    /// Who registered the watch this condition rides on.
+    pub creator: Pubkey,
     pub condition: spec::ConditionV0,
     pub clock: ClockSnapshot,
     /// The change-wake's watched bytes as they read now. `None` for wakes
@@ -1627,15 +1651,8 @@ fn materialize_resolver_accounts(
     let start = condition.resolvers().offset as usize;
     let end = start.checked_add(count.checked_mul(spec::ACCOUNT_REF_LEN)?)?;
     let region = block_account_data.get(start..end)?;
-    Some(
-        region
-            .chunks_exact(spec::ACCOUNT_REF_LEN)
-            .map(|chunk| spec::AccountRefV0 {
-                address: chunk[..32].try_into().unwrap(),
-                writable: chunk[32],
-            })
-            .collect(),
-    )
+    // Align-1 pod, packed: the region already *is* a `[AccountRefV0]`.
+    Some(spec::bytemuck::cast_slice::<u8, spec::AccountRefV0>(region).to_vec())
 }
 
 /// Stable metric label for a skip reason. Spelled out rather than derived

@@ -7,8 +7,8 @@ See [DESIGN.md](./DESIGN.md) for the full design and rationale.
 ## How it works
 
 1. A target program lays out a zero-copy condition block (`relay-spec`) in one of its accounts and registers `(account, offset)` with the relay program as a `WatchV0`.
-2. Each `ConditionV0` names a **wake hint** (timestamp / slot / watched-bytes-changed / every-N-slots), a **resolver** instruction, an **executor** instruction, and a `min_payment`.
-3. The turner evaluates wake hints against its account feed. When one is due it *simulates* the resolver, which stages the executor's account list + args in one of its own accounts and returns a 10-byte pointer; the turner reads the payload out of post-simulation account state. Account resolution is program code, so it can't drift — and since the resolver is only simulated, the staging write never touches chain state.
+2. Each `ConditionV0` names a **wake hint** (timestamp / slot / watched-bytes-changed / value-crossed / every-N-slots), a **resolver** instruction, and a `min_payment`. It does *not* name an executor: which instruction to run is the resolver's answer, so one resolver can serve a whole family of like-instructions from one condition.
+3. The turner evaluates wake hints against its account feed. When one is due it *simulates* the resolver — telling it which condition fired, appended to the instruction data — and the resolver stages the executor (program, discriminator, accounts, args) in one of its own accounts and returns a 10-byte pointer; the turner reads the payload out of post-simulation account state. Account resolution is program code, so it can't drift — and since the resolver is only simulated, the staging write never touches chain state.
 4. The turner submits the executor **directly**, bracketed by relay's payment guards (`begin_guard_v0` … executor … `assert_paid_v0`), simulates (success ⇒ payment verified), and sends. Guards are assertions, not a CPI wrapper, so they cost no CPI depth — the executor keeps all four levels for its own call stack. `--no-guard` drops them entirely.
 
 The on-chain instruction is always the authoritative predicate — a stale turner costs itself a simulation or a failed-tx fee, never a wrong crank.
@@ -18,6 +18,7 @@ The on-chain instruction is always the authoritative predicate — a stale turne
 | Path | What |
 |---|---|
 | `spec/` | `relay-spec` — pod wire types (bytemuck only); embed this in your program |
+| `relay-anchor/` | `relay-anchor` — the block as one typed field in an Anchor 1.0 account (`Deref`, `Pod`, IDL type). Own workspace; the only crate here that depends on anchor |
 | `programs/relay/` | watch registry + payment guard instructions (Anchor v2) |
 | `programs/demo-book/` | reference target: a two-sided book with three conditions — expiry sweep, soft-cap eviction, and crossing |
 | `chain-source/` | `relay-chain-source` — pluggable chain access: subscription-fed account cache + in-process lazy-fork simulation behind one trait. Protocol-agnostic; consumable on its own |
@@ -29,6 +30,7 @@ The on-chain instruction is always the authoritative predicate — a stale turne
 ./scripts/build-programs.sh    # SBF-build both programs (needs cargo-build-sbf, tools v1.52)
 cargo test                     # spec + turner tests (root workspace)
 cd programs && cargo test      # program tests (litesvm, cross-program)
+cargo test --manifest-path relay-anchor/Cargo.toml   # the anchor 1.0 host wrapper
 ./scripts/e2e.sh               # end-to-end against a real solana-test-validator
 ```
 

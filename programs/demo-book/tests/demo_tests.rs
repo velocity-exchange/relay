@@ -171,7 +171,8 @@ fn add_quote(ctx: &mut Ctx, expiry_ts: i64, price: u64, side: u8) {
 
 fn read_conditions(ctx: &Ctx) -> Vec<spec::ConditionV0> {
     let data = ctx.svm.get_account(&ctx.book).unwrap().data;
-    spec::read_conditions_unaligned(&data, CONDITIONS_OFFSET).unwrap()
+    let (_, conditions) = spec::read_block(&data, CONDITIONS_OFFSET).unwrap();
+    conditions.to_vec()
 }
 
 fn sweep_wake_ts(conditions: &[spec::ConditionV0]) -> i64 {
@@ -213,10 +214,20 @@ fn resolve(ctx: &mut Ctx, condition_index: u8) -> Option<spec::ResolvedCrankV0> 
             is_writable: a.is_writable(),
         })
         .collect();
+    // The resolver is told which condition fired — one resolver serves all
+    // three, so without this it cannot answer at all.
     let ix = Instruction {
         program_id: demo_id(),
         accounts: metas,
-        data: condition.crank_spec().resolver_disc.to_vec(),
+        data: spec::encode_resolver_data(
+            condition.crank_spec().resolver_disc,
+            spec::FiredConditionV0::new(
+                ctx.book.to_bytes(),
+                CONDITIONS_OFFSET as u32,
+                condition_index,
+            ),
+        )
+        .to_vec(),
     };
     ctx.svm.expire_blockhash();
     let blockhash = ctx.svm.latest_blockhash();
@@ -278,17 +289,8 @@ fn executor_metas(resolved: &spec::ResolvedCrankV0, keeper: Pubkey) -> (Vec<Acco
 }
 
 /// Unwrapped executor submission.
-fn executor_ix(ctx: &Ctx, condition_index: u8, resolved: &spec::ResolvedCrankV0) -> Instruction {
-    let conditions = read_conditions(ctx);
-    let condition = &conditions[condition_index as usize];
-    let (metas, _) = executor_metas(resolved, ctx.keeper);
-    let mut data = condition.crank_spec().executor_disc.to_vec();
-    data.extend_from_slice(&resolved.data);
-    Instruction {
-        program_id: Pubkey::new_from_array(condition.crank_spec().executor_program),
-        accounts: metas,
-        data,
-    }
+fn executor_ix(ctx: &Ctx, resolved: &spec::ResolvedCrankV0) -> Instruction {
+    executor_ix_for(ctx, resolved, ctx.keeper)
 }
 
 /// The keeper's guard PDA, derived exactly as the turner derives it.
@@ -306,7 +308,6 @@ fn guarded_crank(
     ctx: &Ctx,
     payer: Pubkey,
     payout: Pubkey,
-    condition_index: u8,
     resolved: &spec::ResolvedCrankV0,
     min_payment: u64,
 ) -> Vec<Instruction> {
@@ -323,7 +324,7 @@ fn guarded_crank(
             ],
             data: spec::encode_begin_guard_v0_data(nonce).to_vec(),
         },
-        executor_ix_for(ctx, condition_index, resolved, payout),
+        executor_ix_for(ctx, resolved, payout),
         Instruction {
             program_id: relay_id(),
             accounts: vec![
@@ -336,19 +337,16 @@ fn guarded_crank(
 }
 
 /// Executor instruction with an explicit keeper substituted in.
-fn executor_ix_for(
-    ctx: &Ctx,
-    condition_index: u8,
-    resolved: &spec::ResolvedCrankV0,
-    keeper: Pubkey,
-) -> Instruction {
-    let conditions = read_conditions(ctx);
-    let condition = &conditions[condition_index as usize];
+///
+/// Which instruction to run comes entirely from the resolver's staged
+/// payload — program, discriminator, accounts, args — so nothing here reads
+/// the condition.
+fn executor_ix_for(_ctx: &Ctx, resolved: &spec::ResolvedCrankV0, keeper: Pubkey) -> Instruction {
     let (metas, _) = executor_metas(resolved, keeper);
-    let mut data = condition.crank_spec().executor_disc.to_vec();
+    let mut data = resolved.executor_disc.to_vec();
     data.extend_from_slice(&resolved.data);
     Instruction {
-        program_id: Pubkey::new_from_array(condition.crank_spec().executor_program),
+        program_id: Pubkey::new_from_array(resolved.executor_program),
         accounts: metas,
         data,
     }
@@ -371,13 +369,11 @@ fn init_writes_valid_condition_block() {
     assert_eq!(sweep_wake_ts(&conditions), i64::MAX);
     assert_eq!(sweep.min_payment(), PAYMENT);
     assert_eq!(sweep.crank_spec().resolver_program, demo_id().to_bytes());
+    // Every condition names the same resolver; the executor is the
+    // resolver's answer, not part of the block.
     assert_eq!(
         &sweep.crank_spec().resolver_disc[..],
-        instruction::ResolveSweepV0::DISCRIMINATOR
-    );
-    assert_eq!(
-        &sweep.crank_spec().executor_disc[..],
-        instruction::SweepV0::DISCRIMINATOR
+        instruction::ResolveV0::DISCRIMINATOR
     );
     assert_eq!(resolver_refs(&ctx, sweep).len(), 1);
     assert_eq!(resolver_refs(&ctx, sweep)[0].address, ctx.book.to_bytes());
@@ -397,8 +393,8 @@ fn init_writes_valid_condition_block() {
         other => panic!("evict wake should be OnAccountChange, got {other:?}"),
     }
     assert_eq!(
-        &evict.crank_spec().executor_disc[..],
-        instruction::EvictV0::DISCRIMINATOR
+        &evict.crank_spec().resolver_disc[..],
+        instruction::ResolveV0::DISCRIMINATOR
     );
 }
 
@@ -439,9 +435,15 @@ fn sweep_via_resolver_roundtrip() {
 
     warp_to(&mut ctx, t + 300);
     let resolved = resolve(&mut ctx, SWEEP_CONDITION).expect("work");
+    // The payload, not the condition, is what names the instruction to run.
+    assert_eq!(resolved.executor_program, demo_id().to_bytes());
+    assert_eq!(
+        &resolved.executor_disc[..],
+        instruction::SweepV0::DISCRIMINATOR
+    );
 
     let before = keeper_balance(&ctx);
-    let ix = executor_ix(&ctx, SWEEP_CONDITION, &resolved);
+    let ix = executor_ix(&ctx, &resolved);
     send(&mut ctx, ix).unwrap();
     assert_eq!(keeper_balance(&ctx), before + PAYMENT);
 
@@ -461,41 +463,111 @@ fn sweep_rejects_bad_ids() {
     add_entry(&mut ctx, t + 100);
 
     // Unexpired.
-    let ix = executor_ix(
-        &ctx,
-        SWEEP_CONDITION,
-        &spec::ResolvedCrankV0 {
-            accounts: demo_book::state::BookV0::executor_accounts(&addr(ctx.book)),
-            data: sweep_args_wire(&[1]),
-        },
-    );
+    let ix = executor_ix(&ctx, &sweep_payload(&ctx, &[1]));
     let failed = send(&mut ctx, ix).unwrap_err();
     assert_eq!(custom_error_code(&failed), Some(6002)); // EntryNotExpired
 
     // Unknown id.
     warp_to(&mut ctx, t + 200);
-    let ix = executor_ix(
-        &ctx,
-        SWEEP_CONDITION,
-        &spec::ResolvedCrankV0 {
-            accounts: BookV0::executor_accounts(&addr(ctx.book)),
-            data: sweep_args_wire(&[42]),
-        },
-    );
+    let ix = executor_ix(&ctx, &sweep_payload(&ctx, &[42]));
     let failed = send(&mut ctx, ix).unwrap_err();
     assert_eq!(custom_error_code(&failed), Some(6001)); // EntryNotFound
 
     // Empty ids.
-    let ix = executor_ix(
-        &ctx,
-        SWEEP_CONDITION,
-        &spec::ResolvedCrankV0 {
-            accounts: BookV0::executor_accounts(&addr(ctx.book)),
-            data: sweep_args_wire(&[]),
-        },
-    );
+    let ix = executor_ix(&ctx, &sweep_payload(&ctx, &[]));
     let failed = send(&mut ctx, ix).unwrap_err();
     assert_eq!(custom_error_code(&failed), Some(6003)); // NothingToSweep
+}
+
+/// One resolver, three conditions: which executor comes back depends only
+/// on which condition the turner says fired.
+#[test]
+fn one_resolver_answers_for_each_condition() {
+    let mut ctx = setup();
+    let t = now(&ctx);
+    // An expired bid that also crosses a live ask, so sweep and cross both
+    // have work at the same time.
+    add_quote(&mut ctx, t + 100, 100, SIDE_BID);
+    add_quote(&mut ctx, t + 9000, 90, SIDE_ASK);
+    add_quote(&mut ctx, t + 9000, 80, SIDE_ASK); // third entry hits the evict threshold
+    warp_to(&mut ctx, t + 300);
+
+    let expected = [
+        (SWEEP_CONDITION, instruction::SweepV0::DISCRIMINATOR),
+        (EVICT_CONDITION, instruction::EvictV0::DISCRIMINATOR),
+        (CROSS_CONDITION, instruction::CrossV0::DISCRIMINATOR),
+    ];
+    expected.iter().for_each(|(index, disc)| {
+        let resolved = resolve(&mut ctx, *index).expect("work for condition {index}");
+        assert_eq!(
+            &resolved.executor_disc[..],
+            *disc,
+            "condition {index} resolved to the wrong executor"
+        );
+        assert_eq!(resolved.executor_program, demo_id().to_bytes());
+    });
+}
+
+/// The fired identity is an argument, so the resolver checks it rather than
+/// trusting it: a condition this book does not serve is refused outright
+/// instead of staging an answer about something else.
+#[test]
+fn resolver_refuses_a_condition_it_does_not_serve() {
+    let mut ctx = setup();
+    let t = now(&ctx);
+    add_entry(&mut ctx, t + 100);
+    warp_to(&mut ctx, t + 300);
+
+    let book = ctx.book;
+    // A slot index past the block.
+    let ix = resolve_ix(book, book, CONDITIONS_OFFSET as u32, 7);
+    let failed = send(&mut ctx, ix).expect_err("index 7 is not a condition this book has");
+    assert_eq!(custom_error_code(&failed), Some(6010)); // UnknownCondition
+
+    // The right index, but pointed at another account's block.
+    let ix = resolve_ix(
+        book,
+        Pubkey::new_unique(),
+        CONDITIONS_OFFSET as u32,
+        SWEEP_CONDITION,
+    );
+    let failed = send(&mut ctx, ix).expect_err("the target must be the book actually held");
+    assert_eq!(custom_error_code(&failed), Some(6010));
+
+    // And the right index at the wrong offset.
+    let ix = resolve_ix(book, book, 0, SWEEP_CONDITION);
+    let failed = send(&mut ctx, ix).expect_err("offset 0 is not where this book's block lives");
+    assert_eq!(custom_error_code(&failed), Some(6010));
+
+    // The honest coordinates still resolve.
+    let ix = resolve_ix(book, book, CONDITIONS_OFFSET as u32, SWEEP_CONDITION);
+    send(&mut ctx, ix).expect("the real condition resolves");
+}
+
+/// A `resolve_v0` instruction with arbitrary fired-condition coordinates.
+fn resolve_ix(book: Pubkey, target: Pubkey, block_offset: u32, index: u8) -> Instruction {
+    Instruction {
+        program_id: demo_id(),
+        accounts: vec![AccountMeta::new(book, false)],
+        data: spec::encode_resolver_data(
+            instruction::ResolveV0::DISCRIMINATOR
+                .try_into()
+                .expect("8-byte discriminator"),
+            spec::FiredConditionV0::new(target.to_bytes(), block_offset, index),
+        )
+        .to_vec(),
+    }
+}
+
+/// A resolver payload built by hand, for the cases a resolver would never
+/// produce: the executor identity is part of the payload now, so a test
+/// naming bad args names the instruction too.
+fn sweep_payload(ctx: &Ctx, ids: &[u64]) -> spec::ResolvedCrankV0 {
+    BookV0::resolved(
+        &addr(ctx.book),
+        instruction::SweepV0::DISCRIMINATOR,
+        sweep_args_wire(ids),
+    )
 }
 
 fn sweep_args_wire(ids: &[u64]) -> Vec<u8> {
@@ -547,7 +619,7 @@ fn guarded_crank_happy_path() {
     // First guarded crank also creates the guard account, so the keeper
     // pays its (one-time) rent on top of the fee.
     let resolved = resolve(&mut ctx, SWEEP_CONDITION).expect("work");
-    let ixs = guarded_crank(&ctx, payer, keeper, SWEEP_CONDITION, &resolved, PAYMENT);
+    let ixs = guarded_crank(&ctx, payer, keeper, &resolved, PAYMENT);
     send_all(&mut ctx, &ixs).unwrap();
     assert_eq!(entry_count(&ctx), 0);
 
@@ -557,7 +629,7 @@ fn guarded_crank_happy_path() {
     warp_to(&mut ctx, t + 400);
     let resolved = resolve(&mut ctx, SWEEP_CONDITION).expect("work");
     let before = ctx.svm.get_balance(&keeper).unwrap();
-    let ixs = guarded_crank(&ctx, payer, keeper, SWEEP_CONDITION, &resolved, PAYMENT);
+    let ixs = guarded_crank(&ctx, payer, keeper, &resolved, PAYMENT);
     send_all(&mut ctx, &ixs).unwrap();
     let after = ctx.svm.get_balance(&keeper).unwrap();
     assert!(
@@ -579,7 +651,7 @@ fn guard_reverts_underpayment() {
 
     // Arm the guard account once so its rent is not part of this test.
     let resolved = resolve(&mut ctx, SWEEP_CONDITION).expect("work");
-    let ixs = guarded_crank(&ctx, payer, keeper, SWEEP_CONDITION, &resolved, PAYMENT);
+    let ixs = guarded_crank(&ctx, payer, keeper, &resolved, PAYMENT);
     send_all(&mut ctx, &ixs).unwrap();
 
     // Now the book pays less than the turner asserts.
@@ -598,7 +670,7 @@ fn guard_reverts_underpayment() {
 
     let resolved = resolve(&mut ctx, SWEEP_CONDITION).expect("work");
     let entries_before = entry_count(&ctx);
-    let ixs = guarded_crank(&ctx, payer, keeper, SWEEP_CONDITION, &resolved, PAYMENT);
+    let ixs = guarded_crank(&ctx, payer, keeper, &resolved, PAYMENT);
     let failed = send_all(&mut ctx, &ixs).unwrap_err();
     assert_eq!(
         custom_error_code(&failed),
@@ -610,7 +682,7 @@ fn guard_reverts_underpayment() {
     assert_eq!(entry_count(&ctx), entries_before);
 
     // Unguarded, the same executor succeeds — the guard is what refuses.
-    let ix = executor_ix_for(&ctx, SWEEP_CONDITION, &resolved, keeper);
+    let ix = executor_ix_for(&ctx, &resolved, keeper);
     send(&mut ctx, ix).unwrap();
     assert!(entry_count(&ctx) < entries_before);
 }
@@ -626,12 +698,12 @@ fn assert_paid_requires_an_armed_guard() {
 
     // Arm and consume a guard so the account exists but is disarmed.
     let resolved = resolve(&mut ctx, SWEEP_CONDITION).expect("work");
-    let ixs = guarded_crank(&ctx, payer, keeper, SWEEP_CONDITION, &resolved, PAYMENT);
+    let ixs = guarded_crank(&ctx, payer, keeper, &resolved, PAYMENT);
     send_all(&mut ctx, &ixs).unwrap();
 
     // A trailing guard with no matching arm must fail rather than measure
     // against stale state.
-    let ixs = guarded_crank(&ctx, payer, keeper, SWEEP_CONDITION, &resolved, PAYMENT);
+    let ixs = guarded_crank(&ctx, payer, keeper, &resolved, PAYMENT);
     let trailing_only = vec![ixs[2].clone()];
     let failed = send_all(&mut ctx, &trailing_only).unwrap_err();
     assert_eq!(custom_error_code(&failed), Some(6001)); // GuardNotArmed
@@ -653,7 +725,7 @@ fn guard_measures_only_this_transaction() {
     // Make the payout rich, so only a delta measurement can fail.
     ctx.svm.airdrop(&keeper, 100_000_000_000).unwrap();
     assert!(ctx.svm.get_balance(&keeper).unwrap() > PAYMENT * 1000);
-    let ixs = guarded_crank(&ctx, payer, keeper, SWEEP_CONDITION, &resolved, PAYMENT + 1);
+    let ixs = guarded_crank(&ctx, payer, keeper, &resolved, PAYMENT + 1);
     let failed = send_all(&mut ctx, &ixs).unwrap_err();
     assert_eq!(custom_error_code(&failed), Some(6000));
 }
@@ -672,11 +744,11 @@ fn evict_flow() {
 
     let ix = executor_ix(
         &ctx,
-        EVICT_CONDITION,
-        &spec::ResolvedCrankV0 {
-            accounts: BookV0::executor_accounts(&addr(ctx.book)),
-            data: 1u64.to_le_bytes().to_vec(),
-        },
+        &BookV0::resolved(
+            &addr(ctx.book),
+            instruction::EvictV0::DISCRIMINATOR,
+            1u64.to_le_bytes().to_vec(),
+        ),
     );
     let failed = send(&mut ctx, ix).unwrap_err();
     assert_eq!(custom_error_code(&failed), Some(6004)); // BelowEvictThreshold
@@ -687,7 +759,7 @@ fn evict_flow() {
     assert_eq!(&resolved.data, &1u64.to_le_bytes()); // victim = oldest id
 
     let before = keeper_balance(&ctx);
-    let ix = executor_ix(&ctx, EVICT_CONDITION, &resolved);
+    let ix = executor_ix(&ctx, &resolved);
     send(&mut ctx, ix).unwrap();
     assert_eq!(keeper_balance(&ctx), before + PAYMENT);
 
@@ -705,7 +777,7 @@ fn sweep_fails_when_book_cannot_pay() {
     warp_to(&mut ctx, t + 200);
 
     let resolved = resolve(&mut ctx, SWEEP_CONDITION).expect("work");
-    let ix = executor_ix(&ctx, SWEEP_CONDITION, &resolved);
+    let ix = executor_ix(&ctx, &resolved);
     let failed = send(&mut ctx, ix).unwrap_err();
     assert_eq!(custom_error_code(&failed), Some(6005)); // InsufficientTreasury
 }
@@ -733,7 +805,7 @@ fn staged_payload_can_exceed_return_data_cap() {
 
     // And the batch actually cranks.
     let before = keeper_balance(&ctx);
-    let ix = executor_ix(&ctx, SWEEP_CONDITION, &resolved);
+    let ix = executor_ix(&ctx, &resolved);
     send(&mut ctx, ix).unwrap();
     assert_eq!(keeper_balance(&ctx), before + PAYMENT);
     assert_eq!(entry_count(&ctx), 0);
@@ -841,7 +913,7 @@ fn crossed_book_is_matched() {
     assert_eq!(&resolved.data[8..], &3u64.to_le_bytes());
 
     let before = keeper_balance(&ctx);
-    let ix = executor_ix(&ctx, CROSS_CONDITION, &resolved);
+    let ix = executor_ix(&ctx, &resolved);
     send(&mut ctx, ix).unwrap();
     assert_eq!(keeper_balance(&ctx), before + PAYMENT);
     assert_eq!(entry_count(&ctx), 2, "the matched pair is gone");
@@ -860,15 +932,14 @@ fn cross_rejects_a_pair_that_does_not_cross() {
     // A stale turner naming an uncrossed pair must be refused on chain.
     let ix = executor_ix(
         &ctx,
-        CROSS_CONDITION,
-        &spec::ResolvedCrankV0 {
-            accounts: BookV0::executor_accounts(&addr(ctx.book)),
-            data: 1u64
-                .to_le_bytes()
+        &BookV0::resolved(
+            &addr(ctx.book),
+            instruction::CrossV0::DISCRIMINATOR,
+            1u64.to_le_bytes()
                 .into_iter()
                 .chain(2u64.to_le_bytes())
                 .collect(),
-        },
+        ),
     );
     let failed = send(&mut ctx, ix).unwrap_err();
     assert_eq!(custom_error_code(&failed), Some(6009)); // NotCrossing
