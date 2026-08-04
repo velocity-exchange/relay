@@ -2899,7 +2899,7 @@ async fn indirect_resolver_list_is_read_from_the_block_account() {
     // the staging region (scratch space on the same account) and point the
     // condition at it.
     let mut conditions = h.conditions();
-    let inline = vec![spec::AccountRefV0::writable(h.book.to_bytes())];
+    let inline = [spec::AccountRefV0::writable(h.book.to_bytes())];
     assert_eq!(conditions[0].resolvers().count, 1);
     {
         let mut svm = h.svm.lock().unwrap();
