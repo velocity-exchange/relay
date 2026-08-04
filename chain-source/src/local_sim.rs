@@ -238,6 +238,11 @@ impl<Inner: ChainSource> LocalSimSource<Inner> {
     /// account. The slot sits at offset 4 of the programdata account data
     /// (`enum tag (4) + slot (8) + ...`) and advances every time the program
     /// is redeployed on chain.
+    ///
+    /// Must be called **before** the ELF is loaded. `add_program_with_loader`
+    /// installs its own programdata account at the same derived address with
+    /// slot 0, so a read taken afterwards reports 0 rather than the deploy
+    /// slot — see `load_program`.
     fn read_program_slot(&self, instance: &Instance, account: &Account) -> Option<u64> {
         let address = account
             .data
@@ -256,11 +261,30 @@ impl<Inner: ChainSource> LocalSimSource<Inner> {
     /// programdata account is compared against a cached value to detect
     /// redeploys and trigger a re-load.
     fn load_program(&self, instance: &mut Instance, program_id: &Pubkey, account: &Account) {
+        // Read the deploy slot once, up front, and use that one value for
+        // both the comparison and the record below.
+        //
+        // It has to happen before the load. `add_program_with_loader`
+        // installs its own programdata account at the *same* derived
+        // address that `seed_programdata` seeded — on a real chain a
+        // program's programdata is the PDA `[program_id]` under the
+        // upgradeable loader — and litesvm's version carries slot 0. So a
+        // slot recorded after loading is 0, every later tick compares the
+        // real deploy slot against it, and the program is re-verified on
+        // every single simulation. That is silent: it looks like working
+        // upgrade detection while defeating the instance pool, whose whole
+        // purpose is to avoid re-verifying multi-megabyte ELFs.
+        let deploy_slot = self.read_program_slot(instance, account);
+
         // ── cache check ─────────────────────────────────────────────
+        // Tracked explicitly: the branch below evicts the program before
+        // re-loading it, so the later `insert` always reports a fresh entry
+        // and cannot distinguish a re-load from a first load.
+        let mut reloading = false;
         if instance.programs.contains(program_id) {
             match account.owner {
                 id if id == *BPF_LOADER_UPGRADEABLE => {
-                    let current_slot = self.read_program_slot(instance, account);
+                    let current_slot = deploy_slot;
                     let cached_slot = instance.program_slots.get(program_id).copied();
                     if cached_slot == current_slot {
                         return; // still the same version
@@ -270,13 +294,13 @@ impl<Inner: ChainSource> LocalSimSource<Inner> {
                     // re-loads with the fresh ELF.
                     instance.programs.remove(program_id);
                     instance.program_slots.remove(program_id);
+                    reloading = true;
                     info!(
                         program = %program_id,
                         old_slot = cached_slot,
                         new_slot = current_slot,
                         "program upgrade detected, re-loading ELF"
                     );
-                    metrics::PROGRAM_RELOADS.inc();
                 }
                 // Non-upgradeable programs (BPFLoader) and builtins can
                 // never be redeployed — their cache entry is permanent.
@@ -316,8 +340,15 @@ impl<Inner: ChainSource> LocalSimSource<Inner> {
                 instance.programs.insert(*program_id);
                 // Record the slot so future lookups can detect upgrades.
                 if account.owner == *BPF_LOADER_UPGRADEABLE {
-                    if let Some(slot) = self.read_program_slot(instance, account) {
+                    if let Some(slot) = deploy_slot {
                         instance.program_slots.insert(*program_id, slot);
+                    }
+                    // Counted here rather than at detection so it only ever
+                    // reports loads that actually completed.
+                    if reloading {
+                        metrics::PROGRAM_RELOADS
+                            .with_label_values(&[&metrics::program_label(program_id)])
+                            .inc();
                     }
                 }
                 debug!(program = %program_id, bytes = elf.len(), "loaded program into local sim");

@@ -12,8 +12,7 @@ use std::sync::LazyLock;
 
 use prometheus::{
     register_histogram_vec_with_registry, register_int_counter_vec_with_registry,
-    register_int_counter_with_registry, register_int_gauge_vec_with_registry, HistogramVec,
-    IntCounter, IntCounterVec, IntGaugeVec, Registry,
+    register_int_gauge_vec_with_registry, HistogramVec, IntCounterVec, IntGaugeVec, Registry,
 };
 
 /// This crate's registry. Consumers gather it next to their own.
@@ -132,13 +131,26 @@ pub static FEED_HEALTHY: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .expect("metric registers")
 });
 
-/// How many times a program was re-loaded after detecting an on-chain
-/// upgrade. Spikes point to a program being redeployed or, if sustained
-/// and per-tick, to an always-mismatching cache (wrong slot comparison).
-pub static PROGRAM_RELOADS: LazyLock<IntCounter> = LazyLock::new(|| {
-    register_int_counter_with_registry!(
+/// Bounded label for a program: the same 8-character prefix the turner's
+/// metrics use, so the two registries agree on how a program is named.
+/// Never label by a full pubkey — a large registry would blow up
+/// cardinality, and per-account drilldown belongs in the CLI.
+pub fn program_label(program: &solana_sdk::pubkey::Pubkey) -> String {
+    program.to_string()[..8].to_string()
+}
+
+/// Program ELFs re-loaded after detecting an on-chain upgrade, by program.
+///
+/// A step per redeploy is the expected shape. Anything sustained — and in
+/// particular anything tracking `chain_simulations_total` — means the slot
+/// comparison never matches and every simulation is re-verifying the ELF,
+/// which silently defeats the instance pool. Labelled so that a program
+/// thrashing this way can be named.
+pub static PROGRAM_RELOADS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec_with_registry!(
         "chain_program_reloads_total",
         "Program ELF re-loads triggered by on-chain upgrade detection",
+        &["program"],
         REGISTRY
     )
     .expect("metric registers")

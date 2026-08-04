@@ -30,3 +30,7 @@ tracing = "0.1"
 # coexist in one deployment.
 yellowstone-grpc-client = { git = "https://github.com/rpcpool/yellowstone-grpc", rev = "b39a415a219e842143f97440a0d0ef04207152c2" }
 yellowstone-grpc-proto = { git = "https://github.com/rpcpool/yellowstone-grpc", rev = "b39a415a219e842143f97440a0d0ef04207152c2" }
+
+[dev-dependencies]
+solana-sdk = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
