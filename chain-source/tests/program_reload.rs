@@ -56,6 +56,9 @@ fn upgradeable_loader() -> Pubkey {
 struct FakeChain {
     accounts: Mutex<HashMap<Pubkey, Account>>,
     programdata: Pubkey,
+    /// Stop serving the programdata account, standing in for a fetch that
+    /// failed or a provider that returned nothing for it.
+    hide_programdata: Mutex<bool>,
 }
 
 impl FakeChain {
@@ -93,7 +96,12 @@ impl FakeChain {
         Self {
             accounts: Mutex::new(accounts),
             programdata,
+            hide_programdata: Mutex::new(false),
         }
+    }
+
+    fn hide_programdata(&self, hide: bool) {
+        *self.hide_programdata.lock().unwrap() = hide;
     }
 
     /// Stand in for `solana program deploy` on an existing program: same
@@ -119,9 +127,13 @@ fn programdata_bytes(slot: u64, elf: &[u8]) -> Vec<u8> {
 impl ChainSource for FakeChain {
     async fn get_multiple_accounts(&self, pubkeys: &[Pubkey]) -> Result<Vec<Option<Account>>> {
         let accounts = self.accounts.lock().unwrap();
+        let hidden = *self.hide_programdata.lock().unwrap();
         Ok(pubkeys
             .iter()
             .map(|pubkey| {
+                if hidden && *pubkey == self.programdata {
+                    return None;
+                }
                 accounts.get(pubkey).cloned().or_else(|| {
                     // Anything else — the fee payer — is a plain funded
                     // account, so the transaction can be paid for.
@@ -282,4 +294,91 @@ async fn a_redeploy_is_detected_exactly_once() {
         1,
         "detection did not settle after the upgrade was picked up"
     );
+}
+
+/// Losing sight of the deploy slot must not churn the cache.
+///
+/// The bank holds its own programdata copy at the same derived address,
+/// stamped with the simulator's clock rather than the chain's deploy slot, so
+/// a version check that fell back to it would report an upgrade on every tick
+/// the clock advanced — turning a failed fetch into a permanent full
+/// program load per simulation. Unknown has to mean "change nothing".
+#[tokio::test]
+async fn losing_the_programdata_read_does_not_churn_the_cache() {
+    let program: Pubkey = DEMO_ID.parse().unwrap();
+    let elf = std::fs::read(DEMO_SO).expect("demo_book.so; run scripts/build-programs.sh");
+    let source = LocalSimSource::new(
+        FakeChain::new(program, elf),
+        LocalSimConfig {
+            pool_size: 1,
+            ..LocalSimConfig::default()
+        },
+    );
+
+    let before = reloads();
+    simulate(&source, program).await;
+
+    // The provider stops serving programdata. The ELF is already in the bank,
+    // so simulation carries on — but the version is now unknown.
+    source.inner().hide_programdata(true);
+    for _ in 0..5 {
+        simulate(&source, program).await;
+    }
+    assert_eq!(
+        reloads() - before,
+        0,
+        "an unreadable deploy slot was treated as a version change"
+    );
+
+    // And once it comes back, an unchanged slot is still no reload.
+    source.inner().hide_programdata(false);
+    simulate(&source, program).await;
+    assert_eq!(reloads() - before, 0);
+}
+
+/// A loader this simulator cannot host must not be filed as a builtin.
+///
+/// litesvm rejects every loader but the two BPF ones, so a loader-v4 program
+/// cannot be loaded at all. Treating it as "already present" made that
+/// silent: nothing loaded, and the failure surfaced later as an unrelated
+/// simulation error with no hint about the cause.
+#[tokio::test]
+async fn an_unhostable_loader_fails_the_simulation_rather_than_pretending() {
+    let program: Pubkey = DEMO_ID.parse().unwrap();
+    let elf = std::fs::read(DEMO_SO).expect("demo_book.so; run scripts/build-programs.sh");
+    let chain = FakeChain::new(program, elf);
+    // Re-own the program account by loader v4, which litesvm has no support
+    // for. The ELF layout differs too (header, then bytes, inside the program
+    // account), so there is nothing to salvage here — only to report.
+    {
+        let mut accounts = chain.accounts.lock().unwrap();
+        let account = accounts.get_mut(&program).expect("program");
+        account.owner = "LoaderV411111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+    }
+    let source = LocalSimSource::new(
+        chain,
+        LocalSimConfig {
+            pool_size: 1,
+            ..LocalSimConfig::default()
+        },
+    );
+
+    let outcome = simulate(&source, program).await;
+    assert!(
+        outcome.err.is_some(),
+        "an unhostable program must fail the simulation, not appear to work: {outcome:?}"
+    );
+    // Nothing ran, so nothing was metered.
+    assert_eq!(
+        outcome.units_consumed, 0,
+        "the program should never have executed: {outcome:?}"
+    );
+    // And it is never counted as a re-load, however many times it is seen.
+    let before = reloads();
+    for _ in 0..3 {
+        simulate(&source, program).await;
+    }
+    assert_eq!(reloads() - before, 0);
 }

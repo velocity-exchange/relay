@@ -54,6 +54,25 @@ static BPF_LOADER_UPGRADEABLE: LazyLock<Pubkey> = LazyLock::new(|| {
         .parse()
         .unwrap()
 });
+
+/// Builtins (system, compute budget, ...) are already in every bank.
+static NATIVE_LOADER: LazyLock<Pubkey> = LazyLock::new(|| {
+    "NativeLoader1111111111111111111111111111111"
+        .parse()
+        .unwrap()
+});
+
+/// Loader v4. Recognised only so it can be reported as unhostable: litesvm
+/// rejects every loader but the two BPF ones with `InvalidLoader`, and a v4
+/// program keeps its ELF (and its deploy slot) inside the program account
+/// behind a 48-byte header rather than in a separate programdata account.
+/// Both the load and the upgrade detection would need new code, and neither
+/// can be exercised until the simulator can host one.
+static LOADER_V4: LazyLock<Pubkey> = LazyLock::new(|| {
+    "LoaderV411111111111111111111111111111111111"
+        .parse()
+        .unwrap()
+});
 /// Offset of the ELF inside an upgradeable programdata account:
 /// `enum tag (4) + slot (8) + Option<Pubkey> authority (1 + 32)`.
 const PROGRAMDATA_ELF_OFFSET: usize = 45;
@@ -90,6 +109,18 @@ impl Default for LocalSimConfig {
 }
 
 /// One pooled bank plus the set of programs already loaded into it.
+/// Everything one simulation needs from the chain, gathered before the bank
+/// is touched. Bundled so the seeding map travels with the accounts it was
+/// fetched alongside, rather than as another positional argument.
+struct Snapshot<'a> {
+    keys: &'a [Pubkey],
+    accounts: &'a [Option<Account>],
+    clock: &'a ClockSnapshot,
+    /// Programdata fetched this tick, by address. The authority on which
+    /// version of a program is deployed — see `deploy_slot`.
+    programdata: &'a HashMap<Pubkey, Account>,
+}
+
 struct Instance {
     svm: LiteSVM,
     programs: HashSet<Pubkey>,
@@ -98,6 +129,9 @@ struct Instance {
     /// upgrades — if the slot in the programdata account has advanced, the
     /// program was redeployed and must be re-loaded.
     program_slots: HashMap<Pubkey, u64>,
+    /// Programs whose loader this simulator cannot host, so the warning is
+    /// emitted once rather than on every tick.
+    unhostable: HashSet<Pubkey>,
 }
 
 impl Instance {
@@ -111,6 +145,7 @@ impl Instance {
                 .with_blockhash_check(false),
             programs: HashSet::new(),
             program_slots: HashMap::new(),
+            unhostable: HashSet::new(),
         }
     }
 }
@@ -152,6 +187,7 @@ impl<Inner: ChainSource> LocalSimSource<Inner> {
         &self,
         tx: &Transaction,
         return_accounts: &[Pubkey],
+        programdata: &HashMap<Pubkey, Account>,
     ) -> Result<SimOutcome> {
         let keys: Vec<Pubkey> = tx.message.account_keys.clone();
         // Cache-first; only genuinely cold accounts reach the network.
@@ -159,8 +195,13 @@ impl<Inner: ChainSource> LocalSimSource<Inner> {
         let clock = self.inner.clock().await?;
 
         let mut instance = self.take().await;
-        let outcome =
-            self.load_and_run(&mut instance, tx, &keys, &accounts, &clock, return_accounts);
+        let chain = Snapshot {
+            keys: &keys,
+            accounts: &accounts,
+            clock: &clock,
+            programdata,
+        };
+        let outcome = self.load_and_run(&mut instance, tx, &chain, return_accounts);
         self.put(instance).await;
         outcome
     }
@@ -169,11 +210,15 @@ impl<Inner: ChainSource> LocalSimSource<Inner> {
         &self,
         instance: &mut Instance,
         tx: &Transaction,
-        keys: &[Pubkey],
-        accounts: &[Option<Account>],
-        clock: &ClockSnapshot,
+        chain: &Snapshot<'_>,
         return_accounts: &[Pubkey],
     ) -> Result<SimOutcome> {
+        let Snapshot {
+            keys,
+            accounts,
+            clock,
+            programdata,
+        } = chain;
         // Chain time drives every wake and most executor logic.
         instance.svm.set_sysvar(&Clock {
             slot: clock.slot,
@@ -196,10 +241,10 @@ impl<Inner: ChainSource> LocalSimSource<Inner> {
             }
         }
 
-        for (key, account) in keys.iter().zip(accounts) {
+        for (key, account) in keys.iter().zip(accounts.iter()) {
             let Some(account) = account else { continue };
             if account.executable {
-                self.load_program(instance, key, account);
+                self.load_program(instance, key, account, programdata);
                 continue;
             }
             if let Err(err) = instance.svm.set_account(*key, account.clone()) {
@@ -234,86 +279,132 @@ impl<Inner: ChainSource> LocalSimSource<Inner> {
         })
     }
 
-    /// Read the upgrade slot from an upgradeable program's programdata
-    /// account. The slot sits at offset 4 of the programdata account data
-    /// (`enum tag (4) + slot (8) + ...`) and advances every time the program
-    /// is redeployed on chain.
-    ///
-    /// Must be called **before** the ELF is loaded. `add_program_with_loader`
-    /// installs its own programdata account at the same derived address with
-    /// slot 0, so a read taken afterwards reports 0 rather than the deploy
-    /// slot — see `load_program`.
-    fn read_program_slot(&self, instance: &Instance, account: &Account) -> Option<u64> {
-        let address = account
+    /// The address of an upgradeable program's programdata account, named by
+    /// the program account itself.
+    fn programdata_address(program: &Account) -> Option<Pubkey> {
+        let bytes = program
             .data
             .get(PROGRAM_PROGRAMDATA_OFFSET..PROGRAM_PROGRAMDATA_OFFSET + 32)?;
-        let address = Pubkey::try_from(address).ok()?;
-        let programdata = instance.svm.get_account(&address)?;
+        Pubkey::try_from(bytes).ok()
+    }
+
+    /// The slot an upgradeable program was last deployed at, read **only**
+    /// from the copy fetched from chain this tick.
+    ///
+    /// Deliberately no fallback to the bank. `add_program_with_loader`
+    /// installs its own programdata at the same derived address, stamped with
+    /// the bank's clock slot, so the bank's copy is the simulator's
+    /// bookkeeping rather than the chain's — comparing against it would
+    /// report an upgrade on every tick the clock advanced. Absent means
+    /// "unknown", which the caller treats as "change nothing".
+    fn deploy_slot(program: &Account, fresh: &HashMap<Pubkey, Account>) -> Option<u64> {
+        let programdata = fresh.get(&Self::programdata_address(program)?)?;
         let bytes = programdata
             .data
             .get(PROGRAMDATA_SLOT_OFFSET..PROGRAMDATA_SLOT_OFFSET + 8)?;
         Some(u64::from_le_bytes(bytes.try_into().ok()?))
     }
 
-    /// Load a program's ELF into the bank. Programs are the expensive
-    /// thing to install (verification), so pooled instances keep them
-    /// across ticks. For upgradeable programs, the on-chain slot in the
-    /// programdata account is compared against a cached value to detect
-    /// redeploys and trigger a re-load.
-    fn load_program(&self, instance: &mut Instance, program_id: &Pubkey, account: &Account) {
-        // Read the deploy slot once, up front, and use that one value for
-        // both the comparison and the record below.
-        //
-        // It has to happen before the load. `add_program_with_loader`
-        // installs its own programdata account at the *same* derived
-        // address that `seed_programdata` seeded — on a real chain a
-        // program's programdata is the PDA `[program_id]` under the
-        // upgradeable loader — and litesvm's version carries slot 0. So a
-        // slot recorded after loading is 0, every later tick compares the
-        // real deploy slot against it, and the program is re-verified on
-        // every single simulation. That is silent: it looks like working
-        // upgrade detection while defeating the instance pool, whose whole
-        // purpose is to avoid re-verifying multi-megabyte ELFs.
-        let deploy_slot = self.read_program_slot(instance, account);
+    /// The ELF behind an upgradeable program. Unlike the deploy slot this
+    /// does fall back to the bank, because a programdata account named
+    /// directly in the transaction arrives through the normal account loop
+    /// and never passes through the seeding map — and for the bytes
+    /// themselves the bank's copy is the same ELF either way.
+    fn programdata_elf(
+        &self,
+        instance: &Instance,
+        program: &Account,
+        fresh: &HashMap<Pubkey, Account>,
+    ) -> Option<Vec<u8>> {
+        let address = Self::programdata_address(program)?;
+        let programdata = fresh
+            .get(&address)
+            .cloned()
+            .or_else(|| instance.svm.get_account(&address))?;
+        programdata
+            .data
+            .get(PROGRAMDATA_ELF_OFFSET..)
+            .map(Vec::from)
+    }
 
-        // ── cache check ─────────────────────────────────────────────
-        // Tracked explicitly: the branch below evicts the program before
-        // re-loading it, so the later `insert` always reports a fresh entry
-        // and cannot distinguish a re-load from a first load.
+    /// Load a program's ELF into the bank, re-loading it if the program has
+    /// been redeployed since.
+    ///
+    /// Programs are the expensive thing to install — verification dominates,
+    /// and velocity's ELF is megabytes — so pooled instances keep them across
+    /// ticks. That cache has to be invalidated when the chain moves, and it
+    /// has to be invalidated *only* then: re-loading without cause silently
+    /// converts the pool into a per-simulation full program load, which looks
+    /// exactly like working upgrade detection from the outside.
+    ///
+    /// Upgradeable programs are versioned by the deploy slot in their
+    /// programdata account. A change is acted on; anything else — an
+    /// unchanged slot, or a slot that could not be read at all — leaves the
+    /// cache alone, so a failed programdata fetch degrades to "keep
+    /// simulating against what we have" rather than to churn.
+    fn load_program(
+        &self,
+        instance: &mut Instance,
+        program_id: &Pubkey,
+        account: &Account,
+        fresh: &HashMap<Pubkey, Account>,
+    ) {
+        // Builtins are in every bank already; nothing to load or track.
+        if account.owner == *NATIVE_LOADER {
+            instance.programs.insert(*program_id);
+            return;
+        }
+        let upgradeable = account.owner == *BPF_LOADER_UPGRADEABLE;
+        if !upgradeable && account.owner != *BPF_LOADER {
+            // Loader v4, or something newer still. Previously these were
+            // filed as builtins and assumed present, which is silent and
+            // wrong: the program never loads and the failure surfaces later
+            // as an unrelated simulation error.
+            if instance.unhostable.insert(*program_id) {
+                warn!(
+                    program = %program_id,
+                    loader = %account.owner,
+                    loader_v4 = (account.owner == *LOADER_V4),
+                    "local sim cannot host this loader; simulations naming this \
+                     program will fail. Use --remote-sim for it."
+                );
+            }
+            return;
+        }
+
+        // The chain's version of this program, from this tick's fetch.
+        let deploy_slot = upgradeable
+            .then(|| Self::deploy_slot(account, fresh))
+            .flatten();
+
         let mut reloading = false;
         if instance.programs.contains(program_id) {
-            match account.owner {
-                id if id == *BPF_LOADER_UPGRADEABLE => {
-                    let current_slot = deploy_slot;
-                    let cached_slot = instance.program_slots.get(program_id).copied();
-                    if cached_slot == current_slot {
-                        return; // still the same version
-                    }
-                    // Slot advanced → program was redeployed on chain.
-                    // Evict the stale cache entry so the code below
-                    // re-loads with the fresh ELF.
+            // A non-upgradeable program cannot be redeployed, so its entry
+            // is permanent.
+            if !upgradeable {
+                return;
+            }
+            let cached = instance.program_slots.get(program_id).copied();
+            match (cached, deploy_slot) {
+                (Some(cached), Some(current)) if cached != current => {
+                    // Evict so the load below installs the fresh ELF.
                     instance.programs.remove(program_id);
                     instance.program_slots.remove(program_id);
                     reloading = true;
                     info!(
                         program = %program_id,
-                        old_slot = cached_slot,
-                        new_slot = current_slot,
+                        old_slot = cached,
+                        new_slot = current,
                         "program upgrade detected, re-loading ELF"
                     );
                 }
-                // Non-upgradeable programs (BPFLoader) and builtins can
-                // never be redeployed — their cache entry is permanent.
+                // Unchanged, or nothing observed to change our mind.
                 _ => return,
             }
         }
 
-        // ── load (or re-load) ───────────────────────────────────────
-        let elf = if account.owner == *BPF_LOADER_UPGRADEABLE {
-            // The program account only names its programdata; fetching that
-            // is the caller's job (it is in the transaction's account keys
-            // only for upgrades, so we look it up lazily below).
-            match self.programdata_elf(instance, account) {
+        let elf = if upgradeable {
+            match self.programdata_elf(instance, account, fresh) {
                 Some(elf) => elf,
                 None => {
                     warn!(
@@ -323,12 +414,8 @@ impl<Inner: ChainSource> LocalSimSource<Inner> {
                     return;
                 }
             }
-        } else if account.owner == *BPF_LOADER {
-            account.data.clone()
         } else {
-            // Builtins (system, compute budget, ...) are already present.
-            instance.programs.insert(*program_id);
-            return;
+            account.data.clone()
         };
 
         let loader = account.owner;
@@ -338,18 +425,17 @@ impl<Inner: ChainSource> LocalSimSource<Inner> {
         {
             Ok(()) => {
                 instance.programs.insert(*program_id);
-                // Record the slot so future lookups can detect upgrades.
-                if account.owner == *BPF_LOADER_UPGRADEABLE {
-                    if let Some(slot) = deploy_slot {
-                        instance.program_slots.insert(*program_id, slot);
-                    }
-                    // Counted here rather than at detection so it only ever
-                    // reports loads that actually completed.
-                    if reloading {
-                        metrics::PROGRAM_RELOADS
-                            .with_label_values(&[&metrics::program_label(program_id)])
-                            .inc();
-                    }
+                if let Some(slot) = deploy_slot {
+                    instance.program_slots.insert(*program_id, slot);
+                }
+                // Counted after the fact, so it only ever reports a re-load
+                // that actually completed. It needs its own flag: the branch
+                // above evicts the program first, so the insert here always
+                // reports a fresh entry.
+                if reloading {
+                    metrics::PROGRAM_RELOADS
+                        .with_label_values(&[&metrics::program_label(program_id)])
+                        .inc();
                 }
                 debug!(program = %program_id, bytes = elf.len(), "loaded program into local sim");
             }
@@ -357,25 +443,11 @@ impl<Inner: ChainSource> LocalSimSource<Inner> {
         }
     }
 
-    /// Pull the ELF out of an upgradeable program's programdata account,
-    /// which the bank may already hold from a previous simulation.
-    fn programdata_elf(&self, instance: &Instance, account: &Account) -> Option<Vec<u8>> {
-        let address = account
-            .data
-            .get(PROGRAM_PROGRAMDATA_OFFSET..PROGRAM_PROGRAMDATA_OFFSET + 32)?;
-        let address = Pubkey::try_from(address).ok()?;
-        let programdata = instance.svm.get_account(&address)?;
-        programdata
-            .data
-            .get(PROGRAMDATA_ELF_OFFSET..)
-            .map(Vec::from)
-    }
-
     /// Seed programdata accounts for the programs a transaction invokes, so
     /// [`Self::load_program`] can find their ELFs. Upgradeable programs
     /// name their programdata in account data, and that account is not part
     /// of the transaction, so it has to be fetched separately.
-    async fn seed_programdata(&self, keys: &[Pubkey]) -> Result<()> {
+    async fn seed_programdata(&self, keys: &[Pubkey]) -> Result<HashMap<Pubkey, Account>> {
         let accounts = self.inner.get_multiple_accounts(keys).await?;
         let programdata: Vec<Pubkey> = accounts
             .iter()
@@ -389,23 +461,26 @@ impl<Inner: ChainSource> LocalSimSource<Inner> {
             })
             .collect();
         if programdata.is_empty() {
-            return Ok(());
+            return Ok(HashMap::new());
         }
         let fetched = self.inner.get_multiple_accounts(&programdata).await?;
+        let found: HashMap<Pubkey, Account> = programdata
+            .iter()
+            .zip(&fetched)
+            .filter_map(|(key, account)| account.as_ref().map(|a| (*key, a.clone())))
+            .collect();
         let mut pool = self.pool.lock().await;
         if pool.is_empty() {
             pool.push(Instance::new());
         }
         pool.iter_mut().for_each(|instance| {
-            programdata
-                .iter()
-                .zip(&fetched)
-                .filter_map(|(key, account)| account.as_ref().map(|a| (key, a)))
-                .for_each(|(key, account)| {
-                    let _ = instance.svm.set_account(*key, account.clone());
-                });
+            found.iter().for_each(|(key, account)| {
+                let _ = instance.svm.set_account(*key, account.clone());
+            });
         });
-        Ok(())
+        // Handed back as well as seeded: the bank's copy gets overwritten by
+        // program loading, so version comparisons read this one instead.
+        Ok(found)
     }
 }
 
@@ -467,10 +542,16 @@ impl<Inner: ChainSource> ChainSource for LocalSimSource<Inner> {
         // seeded before their ELF can be recovered. That is every
         // executable account in the key list, not just top-level program
         // ids — a CPI target rides along as a plain account meta.
-        if let Err(err) = self.seed_programdata(&tx.message.account_keys).await {
-            warn!(error = %format!("{err:#}"), "programdata seed failed; simulating anyway");
-        }
-        let outcome = self.simulate_locally(tx, return_accounts).await;
+        let programdata = match self.seed_programdata(&tx.message.account_keys).await {
+            Ok(found) => found,
+            Err(err) => {
+                warn!(error = %format!("{err:#}"), "programdata seed failed; simulating anyway");
+                HashMap::new()
+            }
+        };
+        let outcome = self
+            .simulate_locally(tx, return_accounts, &programdata)
+            .await;
         metrics::SIMULATIONS
             .with_label_values(&[if outcome.is_ok() { "local" } else { "error" }])
             .inc();
