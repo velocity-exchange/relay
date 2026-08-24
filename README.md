@@ -27,12 +27,21 @@ The on-chain instruction is always the authoritative predicate — a stale turne
 ## Build & test
 
 ```bash
-./scripts/build-programs.sh    # SBF-build both programs (needs cargo-build-sbf, tools v1.52)
 cargo test                     # spec + turner tests (root workspace)
 cd programs && cargo test      # program tests (litesvm, cross-program)
 cargo test --manifest-path relay-anchor/Cargo.toml   # the anchor 1.0 host wrapper
 ./scripts/e2e.sh               # end-to-end against a real solana-test-validator
+./scripts/build-programs.sh    # SBF-build both programs on demand
 ```
+
+The suites run the real programs, so they need real SBF binaries. `cargo test`
+in the root workspace builds them itself — `test-fixtures/` is a dev-dependency
+whose build script runs `build-programs.sh`, so the binaries are there by the
+time a test looks for them, and nothing rebuilds until a program's source
+changes. That needs `cargo-build-sbf` with platform-tools **v1.54**; v1.52
+miscompiles both programs into runtime access violations. The other three lines
+load the same binaries, so run the script yourself before them on a fresh
+checkout.
 
 `e2e.sh` deploys both programs to a throwaway validator, runs a turner, posts orders from a bot, and checks that expiry, eviction, and crossing all get cranked on a chain that is genuinely moving.
 

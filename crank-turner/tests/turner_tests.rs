@@ -32,14 +32,7 @@ use solana_sdk::signature::{Keypair, Signature};
 use solana_sdk::signer::Signer;
 use solana_sdk::transaction::Transaction;
 
-const RELAY_SO: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../programs/target/deploy/relay.so"
-);
-const DEMO_SO: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../programs/target/deploy/demo_book.so"
-);
+use relay_test_fixtures::{DEMO_BOOK_SO as DEMO_SO, RELAY_SO};
 
 // Mirrors of demo-book layout constants, hand-pinned (see module docs).
 const BOOK_ACCOUNT_LEN: usize = 2816;

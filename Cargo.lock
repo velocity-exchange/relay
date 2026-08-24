@@ -3526,6 +3526,7 @@ dependencies = [
  "futures-util",
  "litesvm",
  "prometheus",
+ "relay-test-fixtures",
  "solana-account",
  "solana-account-decoder",
  "solana-client",
@@ -3549,6 +3550,7 @@ dependencies = [
  "relay-chain-source",
  "relay-crank-turner",
  "relay-spec",
+ "relay-test-fixtures",
  "serde_json",
  "sha2 0.10.9",
  "solana-client",
@@ -3572,6 +3574,7 @@ dependencies = [
  "prometheus",
  "relay-chain-source",
  "relay-spec",
+ "relay-test-fixtures",
  "sha2 0.10.9",
  "solana-account",
  "solana-account-decoder",
@@ -3595,6 +3598,10 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
 ]
+
+[[package]]
+name = "relay-test-fixtures"
+version = "0.1.0"
 
 [[package]]
 name = "reqwest"

@@ -36,5 +36,7 @@ yellowstone-grpc-client = { git = "https://github.com/rpcpool/yellowstone-grpc",
 yellowstone-grpc-proto = { git = "https://github.com/rpcpool/yellowstone-grpc", rev = "b39a415a219e842143f97440a0d0ef04207152c2" }
 
 [dev-dependencies]
+# Depending on it is what builds the SBF binaries these tests load.
+relay-test-fixtures = { path = "../test-fixtures" }
 sha2 = "0.10"
 solana-system-interface = { version = "3", features = ["bincode"] }

@@ -656,11 +656,7 @@ mod tests {
     /// executor simulation failing `UnsupportedProgramId`.
     #[tokio::test]
     async fn cpi_target_programs_get_their_programdata_seeded() {
-        let elf = std::fs::read(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../programs/target/deploy/demo_book.so"
-        ))
-        .expect("demo_book.so missing — run scripts/build-programs.sh first");
+        let elf = relay_test_fixtures::elf(relay_test_fixtures::DEMO_BOOK_SO);
 
         let payer = Keypair::new();
         let cpi_target = Pubkey::new_unique();

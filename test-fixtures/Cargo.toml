@@ -1,0 +1,10 @@
+[package]
+name = "relay-test-fixtures"
+description = "The SBF program binaries the litesvm test suites load, built on demand"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]

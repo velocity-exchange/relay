@@ -74,10 +74,7 @@ impl Validator {
             .join(format!("relay-cli-e2e-{stamp}"))
             .to_string_lossy()
             .into_owned();
-        let so = format!(
-            "{}/../programs/target/deploy/relay.so",
-            env!("CARGO_MANIFEST_DIR")
-        );
+        let so = relay_test_fixtures::RELAY_SO;
         let child = Command::new("solana-test-validator")
             .args([
                 "--reset",

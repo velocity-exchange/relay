@@ -33,10 +33,7 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature, Signer};
 use solana_sdk::transaction::Transaction;
 
-const DEMO_SO: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../programs/target/deploy/demo_book.so"
-);
+use relay_test_fixtures::DEMO_BOOK_SO;
 /// demo-book's declared id. Using the real one matters: an anchor program
 /// checks it, so a program loaded at some other address never dispatches.
 const DEMO_ID: &str = "6PqZZeykcFwncPxs5LjjxzQshdRV29mpsFtmT3QS9jRZ";
@@ -223,7 +220,7 @@ async fn simulate(source: &LocalSimSource<FakeChain>, program: Pubkey) -> SimOut
 #[tokio::test]
 async fn a_steady_program_is_loaded_once_and_then_left_alone() {
     let program: Pubkey = DEMO_ID.parse().unwrap();
-    let elf = std::fs::read(DEMO_SO).expect("demo_book.so; run scripts/build-programs.sh");
+    let elf = relay_test_fixtures::elf(DEMO_BOOK_SO);
     let source = LocalSimSource::new(
         FakeChain::new(program, elf),
         LocalSimConfig {
@@ -262,7 +259,7 @@ async fn a_steady_program_is_loaded_once_and_then_left_alone() {
 #[tokio::test]
 async fn a_redeploy_is_detected_exactly_once() {
     let program: Pubkey = DEMO_ID.parse().unwrap();
-    let elf = std::fs::read(DEMO_SO).expect("demo_book.so; run scripts/build-programs.sh");
+    let elf = relay_test_fixtures::elf(DEMO_BOOK_SO);
     let chain = FakeChain::new(program, elf.clone());
     let source = LocalSimSource::new(
         chain,
@@ -306,7 +303,7 @@ async fn a_redeploy_is_detected_exactly_once() {
 #[tokio::test]
 async fn losing_the_programdata_read_does_not_churn_the_cache() {
     let program: Pubkey = DEMO_ID.parse().unwrap();
-    let elf = std::fs::read(DEMO_SO).expect("demo_book.so; run scripts/build-programs.sh");
+    let elf = relay_test_fixtures::elf(DEMO_BOOK_SO);
     let source = LocalSimSource::new(
         FakeChain::new(program, elf),
         LocalSimConfig {
@@ -345,7 +342,7 @@ async fn losing_the_programdata_read_does_not_churn_the_cache() {
 #[tokio::test]
 async fn an_unhostable_loader_fails_the_simulation_rather_than_pretending() {
     let program: Pubkey = DEMO_ID.parse().unwrap();
-    let elf = std::fs::read(DEMO_SO).expect("demo_book.so; run scripts/build-programs.sh");
+    let elf = relay_test_fixtures::elf(DEMO_BOOK_SO);
     let chain = FakeChain::new(program, elf);
     // Re-own the program account by loader v4, which litesvm has no support
     // for. The ELF layout differs too (header, then bytes, inside the program

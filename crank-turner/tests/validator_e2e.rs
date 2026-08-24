@@ -83,10 +83,12 @@ fn disc(name: &str) -> Vec<u8> {
 }
 
 fn so_path(name: &str) -> String {
-    format!(
-        "{}/../programs/target/deploy/{name}.so",
-        env!("CARGO_MANIFEST_DIR")
-    )
+    match name {
+        "relay" => relay_test_fixtures::RELAY_SO,
+        "demo_book" => relay_test_fixtures::DEMO_BOOK_SO,
+        other => panic!("no fixture for {other}"),
+    }
+    .to_owned()
 }
 
 /// The validator, killed on drop so a failing assertion never leaks one.
