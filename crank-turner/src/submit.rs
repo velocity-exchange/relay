@@ -12,9 +12,11 @@
 //!   watch channel, instead of a `getLatestBlockhash` per transaction.
 //! - **Track unconfirmed signatures** and poll `getSignatureStatuses` in
 //!   batches rather than awaiting each send.
-//! - **Resend while the blockhash is still valid**; re-sign once it
-//!   expires, up to a limit, then give up with a distinct outcome so the
-//!   caller retries immediately rather than counting it as a real failure.
+//! - **Resend while the blockhash is still valid**, then give up with a
+//!   distinct outcome so the caller retries immediately rather than
+//!   counting it as a real failure. Re-signing is deliberately not done
+//!   here: the keypair lives with the turner, and an `Expired` outcome puts
+//!   the condition straight back in front of it.
 //! - **Classify failures.** "The blockhash expired" and "the executor
 //!   underpaid" deserve different reactions.
 
@@ -61,7 +63,10 @@ pub struct SubmitterConfig {
     pub blockhash_refresh: Duration,
     /// How often to poll for confirmations.
     pub confirm_interval: Duration,
-    /// Resend attempts before declaring a transaction expired.
+    /// How many times to rebroadcast a transaction that is unconfirmed but
+    /// whose blockhash can still land. Expiry is decided by block height,
+    /// not by this — a transaction that runs out of rebroadcasts is still
+    /// tracked until it confirms or its blockhash dies.
     pub max_resends: u32,
     /// Rolling window length for per-program profitability.
     pub profit_window: usize,
@@ -292,7 +297,15 @@ async fn sweep<S: ChainSource + ?Sized>(
             return;
         }
     };
-    let block_height = source.block_height().await.unwrap_or(0);
+    let block_height = match source.block_height().await {
+        Ok(height) => Some(height),
+        Err(err) => {
+            // Without a height nothing can be declared expired; rebroadcast
+            // anyway, which is the harmless half.
+            warn!(error = %format!("{err:#}"), "block height poll failed");
+            None
+        }
+    };
 
     let settled: Vec<(Signature, TxResult)> = signatures
         .iter()
@@ -313,33 +326,47 @@ async fn sweep<S: ChainSource + ?Sized>(
         }
     });
 
-    // Anything still unconfirmed: resend while the blockhash lives, then
-    // surface a distinct expiry so the caller retries rather than treating
-    // it as the condition's fault.
-    let stale: Vec<Signature> = tracked
-        .iter()
-        .filter(|(_, entry)| entry.pending.last_valid_block_height < block_height)
-        .map(|(signature, _)| *signature)
-        .collect();
-    for signature in stale {
-        let Some(entry) = tracked.get_mut(&signature) else {
+    // Past its last valid block height a transaction can never land, and no
+    // amount of resending changes that. Retire it under a distinct outcome
+    // so the caller retries promptly rather than treating it as the
+    // condition's fault.
+    let dead: Vec<Signature> = block_height
+        .map(|height| {
+            tracked
+                .iter()
+                .filter(|(_, entry)| entry.pending.last_valid_block_height < height)
+                .map(|(signature, _)| *signature)
+                .collect()
+        })
+        .unwrap_or_default();
+    for signature in dead {
+        let Some(entry) = tracked.remove(&signature) else {
             continue;
         };
+        metrics::CONFIRM_SECONDS
+            .with_label_values(&["expired"])
+            .observe(entry.submitted.elapsed().as_secs_f64());
+        record(
+            &entry.pending,
+            &TxResult::Expired,
+            history,
+            profit,
+            lag,
+            config,
+        );
+    }
+
+    // What is left is unconfirmed but still landable — the only state a
+    // resend can help. Rebroadcasting the same signed bytes is idempotent
+    // (identical signature, deduped by the cluster); the bound is there so
+    // a transaction nobody will ever include is not shouted about for the
+    // whole life of its blockhash.
+    for (signature, entry) in tracked
+        .iter_mut()
+        .filter(|(_, entry)| entry.resends < config.max_resends)
+    {
         entry.resends += 1;
-        if entry.resends > config.max_resends {
-            let entry = tracked.remove(&signature).expect("just looked up");
-            metrics::CONFIRM_SECONDS
-                .with_label_values(&["expired"])
-                .observe(entry.submitted.elapsed().as_secs_f64());
-            record(
-                &entry.pending,
-                &TxResult::Expired,
-                history,
-                profit,
-                lag,
-                config,
-            );
-        } else if let Err(err) = source.send_transaction(&entry.pending.transaction).await {
+        if let Err(err) = source.send_transaction(&entry.pending.transaction).await {
             warn!(%signature, error = %format!("{err:#}"), "resend failed");
         }
     }
@@ -455,6 +482,139 @@ mod tests {
 
     fn failed() -> TxResult {
         TxResult::Failed("custom program error: 0x1771".into())
+    }
+
+    /// A source that confirms nothing, counts rebroadcasts, and reports
+    /// whatever block height the test sets.
+    struct Recorder {
+        height: std::sync::Mutex<u64>,
+        sends: std::sync::Mutex<Vec<Signature>>,
+    }
+
+    impl Recorder {
+        fn new(height: u64) -> Self {
+            Self {
+                height: std::sync::Mutex::new(height),
+                sends: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn sends(&self) -> usize {
+            self.sends.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChainSource for Recorder {
+        async fn get_multiple_accounts(
+            &self,
+            _pubkeys: &[Pubkey],
+        ) -> anyhow::Result<Vec<Option<solana_sdk::account::Account>>> {
+            unreachable!()
+        }
+        async fn get_program_accounts(
+            &self,
+            _program: &Pubkey,
+            _filter_sets: &[Vec<relay_chain_source::AccountFilter>],
+        ) -> anyhow::Result<Vec<(Pubkey, solana_sdk::account::Account)>> {
+            unreachable!()
+        }
+        async fn clock(&self) -> anyhow::Result<relay_chain_source::ClockSnapshot> {
+            unreachable!()
+        }
+        async fn latest_blockhash(&self) -> anyhow::Result<BlockhashInfo> {
+            unreachable!()
+        }
+        async fn block_height(&self) -> anyhow::Result<u64> {
+            Ok(*self.height.lock().unwrap())
+        }
+        async fn signature_statuses(
+            &self,
+            signatures: &[Signature],
+        ) -> anyhow::Result<Vec<Option<SignatureOutcome>>> {
+            Ok(signatures.iter().map(|_| None).collect())
+        }
+        async fn recent_priority_fee(&self, _accounts: &[Pubkey]) -> anyhow::Result<u64> {
+            unreachable!()
+        }
+        async fn simulate_transaction(
+            &self,
+            _tx: &Transaction,
+            _return_accounts: &[Pubkey],
+        ) -> anyhow::Result<relay_chain_source::SimOutcome> {
+            unreachable!()
+        }
+        async fn send_transaction(&self, tx: &Transaction) -> anyhow::Result<Signature> {
+            let signature = tx.signatures[0];
+            self.sends.lock().unwrap().push(signature);
+            Ok(signature)
+        }
+    }
+
+    fn tracked_one(last_valid_block_height: u64) -> HashMap<Signature, Tracked> {
+        let signature = Signature::new_unique();
+        let pending = PendingTx {
+            transaction: Transaction {
+                signatures: vec![signature],
+                ..Default::default()
+            },
+            signature,
+            program: Pubkey::new_unique(),
+            expected_payment: 5_000,
+            last_valid_block_height,
+        };
+        [(
+            signature,
+            Tracked {
+                pending,
+                resends: 0,
+                submitted: std::time::Instant::now(),
+            },
+        )]
+        .into_iter()
+        .collect()
+    }
+
+    /// The state a resend is actually for: unconfirmed, blockhash still
+    /// good. Rebroadcast — bounded by `max_resends` — and keep tracking,
+    /// because it can still land.
+    #[tokio::test]
+    async fn a_live_transaction_is_rebroadcast_and_kept() {
+        let source = Recorder::new(100);
+        let config = SubmitterConfig {
+            max_resends: 2,
+            ..SubmitterConfig::default()
+        };
+        let mut tracked = tracked_one(200);
+        let mut history = HashMap::new();
+        let (profit, _p) = watch::channel(ProfitSnapshot::new());
+        let (lag, _l) = watch::channel(LagSnapshot::new());
+
+        for _ in 0..4 {
+            sweep(&source, &config, &mut tracked, &mut history, &profit, &lag).await;
+        }
+        assert_eq!(source.sends(), 2, "rebroadcasts are bounded by max_resends");
+        assert_eq!(tracked.len(), 1, "a landable transaction stays tracked");
+    }
+
+    /// Past its last valid block height there is nothing left to try:
+    /// retire it as `Expired` on the first pass rather than rebroadcasting
+    /// a transaction the cluster can no longer accept.
+    #[tokio::test]
+    async fn a_dead_blockhash_expires_immediately_without_resending() {
+        let source = Recorder::new(300);
+        let config = SubmitterConfig::default();
+        let mut tracked = tracked_one(200);
+        let program = tracked.values().next().unwrap().pending.program;
+        let mut history = HashMap::new();
+        let (profit, _p) = watch::channel(ProfitSnapshot::new());
+        let (lag, mut lag_rx) = watch::channel(LagSnapshot::new());
+
+        sweep(&source, &config, &mut tracked, &mut history, &profit, &lag).await;
+        assert_eq!(source.sends(), 0, "an expired blockhash cannot land");
+        assert!(tracked.is_empty(), "expired transactions are retired");
+        // Expiry is congestion, not a lost race: it must not ramp the delay.
+        assert_eq!(lag_rx.borrow_and_update().get(&program).copied(), Some(0));
     }
 
     /// Each revert pushes the delay out by one step, up to the ceiling —
