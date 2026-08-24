@@ -87,7 +87,7 @@ impl Validator {
                 &FAUCET_PORT.to_string(),
                 "--bpf-program",
                 &relay_id().to_string(),
-                &so,
+                so,
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
