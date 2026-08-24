@@ -186,18 +186,17 @@ impl<Inner: ChainSource> LocalSimSource<Inner> {
     async fn simulate_locally(
         &self,
         tx: &Transaction,
+        keys: &[Pubkey],
+        accounts: &[Option<Account>],
         return_accounts: &[Pubkey],
         programdata: &HashMap<Pubkey, Account>,
     ) -> Result<SimOutcome> {
-        let keys: Vec<Pubkey> = tx.message.account_keys.clone();
-        // Cache-first; only genuinely cold accounts reach the network.
-        let accounts = self.inner.get_multiple_accounts(&keys).await?;
         let clock = self.inner.clock().await?;
 
         let mut instance = self.take().await;
         let chain = Snapshot {
-            keys: &keys,
-            accounts: &accounts,
+            keys,
+            accounts,
             clock: &clock,
             programdata,
         };
@@ -226,7 +225,27 @@ impl<Inner: ChainSource> LocalSimSource<Inner> {
             ..Default::default()
         });
 
-        // A fee payer with no account cannot pay, and litesvm rejects the
+        for (key, account) in keys.iter().zip(accounts.iter()) {
+            let Some(account) = account else {
+                // The chain says there is no such account. A pooled bank
+                // may still be holding one from an earlier simulation —
+                // banks are reused precisely so programs stay loaded — and
+                // leaving that copy in place simulates a world where a
+                // closed account is still open.
+                forget_account(instance, key);
+                continue;
+            };
+            if account.executable {
+                self.load_program(instance, key, account, programdata);
+                continue;
+            }
+            if let Err(err) = instance.svm.set_account(*key, account.clone()) {
+                warn!(account = %key, error = ?err, "local sim could not seed account");
+            }
+        }
+
+        // After the seeding pass, which would otherwise clear it: a fee
+        // payer with no account cannot pay, and litesvm rejects the
         // transaction before any instruction runs.
         if let Some(lamports) = self.config.synthetic_fee_payer_lamports {
             let payer_missing = accounts.first().is_none_or(Option::is_none);
@@ -238,17 +257,6 @@ impl<Inner: ChainSource> LocalSimSource<Inner> {
                 if let Err(err) = instance.svm.set_account(*payer, synthetic) {
                     warn!(account = %payer, error = ?err, "could not seed a synthetic fee payer");
                 }
-            }
-        }
-
-        for (key, account) in keys.iter().zip(accounts.iter()) {
-            let Some(account) = account else { continue };
-            if account.executable {
-                self.load_program(instance, key, account, programdata);
-                continue;
-            }
-            if let Err(err) = instance.svm.set_account(*key, account.clone()) {
-                warn!(account = %key, error = ?err, "local sim could not seed account");
             }
         }
 
@@ -447,8 +455,14 @@ impl<Inner: ChainSource> LocalSimSource<Inner> {
     /// [`Self::load_program`] can find their ELFs. Upgradeable programs
     /// name their programdata in account data, and that account is not part
     /// of the transaction, so it has to be fetched separately.
-    async fn seed_programdata(&self, keys: &[Pubkey]) -> Result<HashMap<Pubkey, Account>> {
-        let accounts = self.inner.get_multiple_accounts(keys).await?;
+    ///
+    /// Takes the transaction's already-read accounts rather than reading
+    /// them again: seeding and bank population want the same set, and
+    /// fetching it twice doubled the cold-account round trips.
+    async fn seed_programdata(
+        &self,
+        accounts: &[Option<Account>],
+    ) -> Result<HashMap<Pubkey, Account>> {
         let programdata: Vec<Pubkey> = accounts
             .iter()
             .flatten()
@@ -481,6 +495,32 @@ impl<Inner: ChainSource> LocalSimSource<Inner> {
         // Handed back as well as seeded: the bank's copy gets overwritten by
         // program loading, so version comparisons read this one instead.
         Ok(found)
+    }
+}
+
+/// Drop a pooled bank's copy of an account the chain no longer has.
+///
+/// Overwriting with a zeroed system-owned account is how a bank spells
+/// "absent": there is no remove, and the state a transaction sees for a
+/// zero-lamport, zero-data account is the state it sees for one that never
+/// existed.
+fn forget_account(instance: &mut Instance, key: &Pubkey) {
+    let held = instance.svm.get_account(key).is_some_and(|account| {
+        // Never programs. A bank comes with its builtins installed and
+        // keeps loaded ELFs on purpose, and none of them are in the
+        // account map a source answers from — clearing those would empty
+        // the bank of the very things pooling exists to retain.
+        !account.executable
+            && account.owner != *NATIVE_LOADER
+            && account.owner != *BPF_LOADER
+            && account.owner != *BPF_LOADER_UPGRADEABLE
+            && (account.lamports > 0 || !account.data.is_empty())
+    });
+    if !held {
+        return;
+    }
+    if let Err(err) = instance.svm.set_account(*key, Account::default()) {
+        warn!(account = %key, error = ?err, "local sim could not clear a closed account");
     }
 }
 
@@ -538,11 +578,15 @@ impl<Inner: ChainSource> ChainSource for LocalSimSource<Inner> {
         tx: &Transaction,
         return_accounts: &[Pubkey],
     ) -> Result<SimOutcome> {
+        // One read of everything the transaction touches. Cache-first, so
+        // only genuinely cold accounts reach the network.
+        let keys: Vec<Pubkey> = tx.message.account_keys.clone();
+        let accounts = self.inner.get_multiple_accounts(&keys).await?;
         // Programs the transaction can reach may need their programdata
         // seeded before their ELF can be recovered. That is every
         // executable account in the key list, not just top-level program
         // ids — a CPI target rides along as a plain account meta.
-        let programdata = match self.seed_programdata(&tx.message.account_keys).await {
+        let programdata = match self.seed_programdata(&accounts).await {
             Ok(found) => found,
             Err(err) => {
                 warn!(error = %format!("{err:#}"), "programdata seed failed; simulating anyway");
@@ -550,7 +594,7 @@ impl<Inner: ChainSource> ChainSource for LocalSimSource<Inner> {
             }
         };
         let outcome = self
-            .simulate_locally(tx, return_accounts, &programdata)
+            .simulate_locally(tx, &keys, &accounts, return_accounts, &programdata)
             .await;
         metrics::SIMULATIONS
             .with_label_values(&[if outcome.is_ok() { "local" } else { "error" }])
@@ -576,13 +620,25 @@ mod tests {
         AccountFilter, BlockhashInfo, ClockSnapshot, SignatureOutcome, SimOutcome,
     };
 
-    /// A fixed account map; everything else is unreachable in these tests.
-    struct MapSource(HashMap<Pubkey, Account>);
+    /// An account map the test can change between simulations; everything
+    /// else is unreachable in these tests.
+    struct MapSource(std::sync::Mutex<HashMap<Pubkey, Account>>);
+
+    impl MapSource {
+        fn new(accounts: HashMap<Pubkey, Account>) -> Self {
+            Self(std::sync::Mutex::new(accounts))
+        }
+
+        fn close(&self, pubkey: &Pubkey) {
+            self.0.lock().unwrap().remove(pubkey);
+        }
+    }
 
     #[async_trait]
     impl ChainSource for MapSource {
         async fn get_multiple_accounts(&self, pubkeys: &[Pubkey]) -> Result<Vec<Option<Account>>> {
-            Ok(pubkeys.iter().map(|pk| self.0.get(pk).cloned()).collect())
+            let accounts = self.0.lock().unwrap();
+            Ok(pubkeys.iter().map(|pk| accounts.get(pk).cloned()).collect())
         }
         async fn get_program_accounts(
             &self,
@@ -671,7 +727,7 @@ mod tests {
         );
         accounts.insert(cpi_target, program);
         accounts.insert(programdata_key, programdata);
-        let local = LocalSimSource::new(MapSource(accounts), LocalSimConfig::default());
+        let local = LocalSimSource::new(MapSource::new(accounts), LocalSimConfig::default());
 
         // The target rides along as a plain meta, the way an executor's
         // account list carries the program it will CPI. The instruction
@@ -699,5 +755,70 @@ mod tests {
             instance.programs.contains(&cpi_target),
             "CPI-target ELF was not loaded into the local sim"
         );
+    }
+
+    /// Banks are pooled and reused, so what one simulation seeds is still
+    /// there for the next one. An account that has since been closed on
+    /// chain must not survive that reuse: the next simulation would decide
+    /// against a world where it is still open, which is exactly the class
+    /// of wrong answer local simulation is supposed to avoid.
+    #[tokio::test]
+    async fn a_closed_account_does_not_survive_in_a_pooled_bank() {
+        let payer = Keypair::new();
+        let closing = Pubkey::new_unique();
+        let mut accounts = HashMap::new();
+        accounts.insert(
+            payer.pubkey(),
+            Account {
+                lamports: 1_000_000_000,
+                ..Default::default()
+            },
+        );
+        accounts.insert(
+            closing,
+            Account {
+                lamports: 5_000_000,
+                data: vec![7u8; 32],
+                ..Default::default()
+            },
+        );
+        let source = MapSource::new(accounts);
+        let local = LocalSimSource::new(
+            source,
+            LocalSimConfig {
+                pool_size: 1,
+                ..LocalSimConfig::default()
+            },
+        );
+
+        let tx = |payer: &Keypair| {
+            Transaction::new_signed_with_payer(
+                &[Instruction {
+                    program_id: "ComputeBudget111111111111111111111111111111"
+                        .parse()
+                        .unwrap(),
+                    accounts: vec![AccountMeta::new_readonly(closing, false)],
+                    // SetComputeUnitLimit(1_000_000)
+                    data: vec![2, 0x40, 0x42, 0x0F, 0x00],
+                }],
+                Some(&payer.pubkey()),
+                &[payer],
+                Hash::default(),
+            )
+        };
+
+        local.simulate_transaction(&tx(&payer), &[]).await.unwrap();
+        {
+            let pool = local.pool.lock().await;
+            let seeded = pool[0].svm.get_account(&closing).expect("seeded");
+            assert_eq!(seeded.lamports, 5_000_000);
+        }
+
+        local.inner().close(&closing);
+        local.simulate_transaction(&tx(&payer), &[]).await.unwrap();
+        let pool = local.pool.lock().await;
+        let after = pool[0].svm.get_account(&closing).unwrap_or_default();
+        assert_eq!(after.lamports, 0, "closed account survived in the bank");
+        assert!(after.data.is_empty(), "closed account kept its data");
     }
 }
