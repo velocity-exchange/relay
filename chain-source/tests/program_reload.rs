@@ -13,9 +13,8 @@
 //! where litesvm installs its own copy — the collision is the whole bug.
 //! And the reload counter must be read as a delta from its own test binary:
 //! it is a process-global static, so a separate binary is what keeps other
-//! suites from perturbing it.
-//!
-//! Requires the SBF build: `./scripts/build-programs.sh`.
+//! suites from perturbing it. Within this binary the tests take
+//! [`RELOADS_OBSERVED`] for the same reason.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -190,6 +189,18 @@ impl ChainSource for FakeChain {
     }
 }
 
+/// Held for the whole of every test that reads [`reloads`].
+///
+/// The counter is process-global and keyed by program id, and every test here
+/// drives the *same* program: an anchor program checks its own address, so it
+/// only dispatches when loaded at the one it declares, and the tests cannot
+/// each take a program of their own. Cargo runs them in parallel, so without
+/// this a reload one test triggers lands inside another's before/after window
+/// and is counted against it — the redeploy test's single legitimate reload
+/// failing the two that assert no reload happened. Under load that is most of
+/// the time; on an idle machine it passes, which is the worst version of it.
+static RELOADS_OBSERVED: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn reloads() -> u64 {
     relay_chain_source::metrics::PROGRAM_RELOADS
         .with_label_values(&[&relay_chain_source::metrics::program_label(
@@ -219,6 +230,7 @@ async fn simulate(source: &LocalSimSource<FakeChain>, program: Pubkey) -> SimOut
 
 #[tokio::test]
 async fn a_steady_program_is_loaded_once_and_then_left_alone() {
+    let _counter = RELOADS_OBSERVED.lock().await;
     let program: Pubkey = DEMO_ID.parse().unwrap();
     let elf = relay_test_fixtures::elf(DEMO_BOOK_SO);
     let source = LocalSimSource::new(
@@ -258,6 +270,7 @@ async fn a_steady_program_is_loaded_once_and_then_left_alone() {
 
 #[tokio::test]
 async fn a_redeploy_is_detected_exactly_once() {
+    let _counter = RELOADS_OBSERVED.lock().await;
     let program: Pubkey = DEMO_ID.parse().unwrap();
     let elf = relay_test_fixtures::elf(DEMO_BOOK_SO);
     let chain = FakeChain::new(program, elf.clone());
@@ -302,6 +315,7 @@ async fn a_redeploy_is_detected_exactly_once() {
 /// program load per simulation. Unknown has to mean "change nothing".
 #[tokio::test]
 async fn losing_the_programdata_read_does_not_churn_the_cache() {
+    let _counter = RELOADS_OBSERVED.lock().await;
     let program: Pubkey = DEMO_ID.parse().unwrap();
     let elf = relay_test_fixtures::elf(DEMO_BOOK_SO);
     let source = LocalSimSource::new(
@@ -341,6 +355,7 @@ async fn losing_the_programdata_read_does_not_churn_the_cache() {
 /// simulation error with no hint about the cause.
 #[tokio::test]
 async fn an_unhostable_loader_fails_the_simulation_rather_than_pretending() {
+    let _counter = RELOADS_OBSERVED.lock().await;
     let program: Pubkey = DEMO_ID.parse().unwrap();
     let elf = relay_test_fixtures::elf(DEMO_BOOK_SO);
     let chain = FakeChain::new(program, elf);
