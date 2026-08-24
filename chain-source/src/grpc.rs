@@ -211,6 +211,10 @@ async fn run(config: GrpcFeedConfig, subscriptions: Vec<ProgramSubscription>, fe
         });
         debug!("grpc subscribed");
 
+        // Breaking out of this loop falls through to the delay at the
+        // bottom before reconnecting, which is deliberate: a provider that
+        // accepts connections and then immediately errors the stream would
+        // otherwise be reconnected to as fast as the loop can turn.
         loop {
             tokio::select! {
                 message = stream.next() => match message {
@@ -288,17 +292,20 @@ async fn run(config: GrpcFeedConfig, subscriptions: Vec<ProgramSubscription>, fe
                             break;
                         }
                         // Newly interested accounts are covered from here.
+                        // Only an unfiltered subscription covers every
+                        // account a program owns; a filtered one says
+                        // nothing about what it excludes.
                         feed.set_coverage(Coverage {
                             accounts: interest.borrow().iter().copied().collect(),
-                            // Only an unfiltered subscription covers every account a
-            // program owns; a filtered one says nothing about what it
-            // excludes.
-            programs: unfiltered_programs(&subscriptions),
+                            programs: unfiltered_programs(&subscriptions),
                         });
                     }
                     Err(_) => return, // interest sender dropped: shut down
                 },
             }
         }
+
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(30));
     }
 }
