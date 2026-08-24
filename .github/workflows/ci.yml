@@ -63,7 +63,11 @@ jobs:
         run: |
           cargo test --manifest-path relay-anchor/Cargo.toml
           cargo test --manifest-path relay-anchor/Cargo.toml --features idl-build
+      # All three workspaces, tests included, warnings fatal. The programs
+      # workspace was missing entirely, and without `-D warnings` the step
+      # only ever failed on something that already broke the build.
       - name: Clippy
         run: |
-          cargo clippy --workspace
-          cargo clippy --manifest-path relay-anchor/Cargo.toml --all-features
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy --manifest-path programs/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path relay-anchor/Cargo.toml --all-targets --all-features -- -D warnings
