@@ -106,6 +106,16 @@ struct Args {
     /// write lock.
     #[arg(long, env = "RELAY_GUARD_NONCE", default_value_t = 0)]
     guard_nonce: u8,
+    /// Ceiling on the account data a crank transaction may load, in bytes.
+    /// Billed on the figure asked for, so asking for nothing takes the 64 MiB
+    /// default and pays for all of it. Must clear the largest program this
+    /// turner cranks plus its program data, with room to grow.
+    #[arg(
+        long,
+        env = "RELAY_LOADED_ACCOUNTS_DATA_SIZE",
+        default_value_t = 12 * 1024 * 1024
+    )]
+    loaded_accounts_data_size: u32,
     /// How many conditions to resolve and submit at once.
     #[arg(long, env = "RELAY_CONCURRENCY", default_value_t = 8)]
     concurrency: usize,
@@ -203,6 +213,7 @@ async fn main() -> Result<()> {
         trusted_programs: args.trusted_program.iter().copied().collect(),
         guard_payments: !args.no_guard,
         guard_nonce: args.guard_nonce,
+        loaded_accounts_data_size: args.loaded_accounts_data_size,
         concurrency: args.concurrency,
         min_program_profit: args.min_program_profit.unwrap_or(i64::MIN),
         max_cranks_per_tx: args.max_cranks_per_tx.max(1),

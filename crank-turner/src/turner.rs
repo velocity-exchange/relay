@@ -166,6 +166,18 @@ pub struct TurnerConfig {
     /// concurrently should vary this per in-flight transaction so they
     /// don't serialize on one write lock.
     pub guard_nonce: u8,
+    /// Ceiling on the account data a crank transaction may load, in bytes.
+    ///
+    /// Billed like the compute limit: on the figure the transaction asks for,
+    /// not on what it loads. Asking for nothing takes the 64 MiB default and
+    /// pays for all of it, which for a crank that loads a program and a
+    /// handful of accounts is most of the transaction's cost.
+    ///
+    /// The target program and its program data count, because a crank names
+    /// the program — so this has to clear the largest program this turner
+    /// cranks, with room for it to grow. Too low and the transaction is
+    /// refused before it runs.
+    pub loaded_accounts_data_size: u32,
     /// Which watches this turner is willing to track at all. Default is
     /// unrestricted; scope it to your own programs when other protocols
     /// share the registry.
@@ -243,6 +255,7 @@ impl Default for TurnerConfig {
             trusted_programs: HashSet::new(),
             guard_payments: true,
             guard_nonce: 0,
+            loaded_accounts_data_size: 12 * 1024 * 1024,
             filter: WatchFilter::default(),
             concurrency: 8,
             min_program_profit: i64::MIN,
@@ -1396,6 +1409,13 @@ impl<S: ChainSource> Turner<S> {
     /// are billed on the *requested* limit, so the default 200k×ixs is
     /// both wasteful and, for a multi-crank transaction, too small) and a
     /// priority fee.
+    ///
+    /// The loaded-accounts data size limit goes at the *end*. It is billed on
+    /// the requested figure for the same reason as the unit limit, and its
+    /// default is 64 MiB — but the runtime finds compute-budget instructions
+    /// by program id wherever they sit, while an instruction added at the
+    /// front shifts every index behind it. A guard triple is addressed by
+    /// position within the pack, so the tail is the safe end to grow.
     fn with_compute_budget(
         &self,
         ixs: Vec<Instruction>,
@@ -1408,6 +1428,11 @@ impl<S: ChainSource> Turner<S> {
         ]
         .into_iter()
         .chain(ixs)
+        .chain(std::iter::once(
+            ComputeBudgetInstruction::set_loaded_accounts_data_size_limit(
+                self.config.loaded_accounts_data_size,
+            ),
+        ))
         .collect()
     }
 
