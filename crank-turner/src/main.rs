@@ -9,7 +9,7 @@ use relay_crank_turner::{
     SubmitterConfig, Turner, TurnerConfig, WatchFilter,
 };
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::Keypair;
+use solana_sdk::signature::{Keypair, Signer};
 use solana_sdk::signer::EncodableKey;
 use tracing::{debug, info, trace, warn};
 
@@ -193,6 +193,20 @@ async fn main() -> Result<()> {
         max_target_bytes: args.max_target_bytes,
         max_watches: args.max_watches,
     };
+    // The payout must not be the fee payer. Signer status is
+    // transaction-global, so a payout that signs is a payout an untrusted
+    // executor holds a signature for — and the turner would refuse every
+    // untrusted crank at signing time anyway, silently, one skip at a
+    // time. Fail here instead, where it reads as the misconfiguration it
+    // is.
+    if args.payout_address == Some(keeper.pubkey()) {
+        anyhow::bail!(
+            "--payout-address is the keeper's own key ({}), which is this turner's fee payer. \
+             Signer status is transaction-global, so an untrusted executor handed that account \
+             could drain it; use a separate account that never signs.",
+            keeper.pubkey()
+        );
+    }
     if args.payout_address.is_none() && !args.trusted_program.is_empty() {
         warn!(
             "no --payout-address: trusted programs will be paid to the fee payer, and untrusted \

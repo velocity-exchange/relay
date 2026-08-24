@@ -357,7 +357,8 @@ impl<S: ChainSource> Turner<S> {
             .find(|w| w.target == target && w.offset == offset)
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "no watch registered for {target} at offset {offset}                      (or it was filtered out by this turner's config)"
+                    "no watch registered for {target} at offset {offset} \
+                     (or it was filtered out by this turner's config)"
                 )
             })?;
         let clock = self.source.clock().await?;
@@ -909,7 +910,10 @@ impl<S: ChainSource> Turner<S> {
                 let base = self.config.failure_backoff_slots;
                 let state = self.state.entry(key).or_default();
                 state.failures += 1;
-                state.suppress_until = clock.slot + (base << state.failures.min(6));
+                // Saturating throughout: the base is operator-configured and
+                // the shift is what makes a large one overflow.
+                let backoff = base.saturating_mul(1u64 << state.failures.min(6));
+                state.suppress_until = clock.slot.saturating_add(backoff);
                 state.deferred_since = None;
             }
             StateUpdate::Deferred => {
@@ -1223,8 +1227,14 @@ impl<S: ChainSource> Turner<S> {
         outcomes: &mut Vec<Outcome>,
         updates: &mut Vec<(CondKey, StateUpdate)>,
     ) {
+        // One program per pack, by construction in `pack`, so the outcome
+        // is booked against the program that actually earned or lost it.
         let program = pack[0].program;
-        let payment: u64 = pack.iter().map(|p| p.min_payment).sum();
+        // Saturating: `min_payment` is a number a target program chose, and
+        // an absurd one must not panic the turner on the way past.
+        let payment: u64 = pack
+            .iter()
+            .fold(0u64, |sum, p| sum.saturating_add(p.min_payment));
         match self.submit(tx, program, payment, expiry).await {
             Ok(signature) => {
                 metrics::PACKS
@@ -1256,25 +1266,35 @@ impl<S: ChainSource> Turner<S> {
     /// Split verified cranks into transaction-sized groups: bounded by
     /// `max_cranks_per_tx` and by the packet limit, measured by actually
     /// serializing rather than estimating.
+    ///
+    /// Cranks are grouped by target program first, and a pack never mixes
+    /// two. A transaction has one outcome, and the submitter books that
+    /// outcome — the payment earned, the fee burned, the contention delay it
+    /// ramps — against a single program: mixing them credits one protocol's
+    /// earnings and reverts to whichever member happened to be first out of
+    /// the concurrent phase, which is what both the profitability floor and
+    /// the adaptive delay steer on.
     async fn pack(&self, prepared: Vec<Prepared>) -> Vec<Vec<Prepared>> {
         let max = self.config.max_cranks_per_tx.max(1);
         let mut packs: Vec<Vec<Prepared>> = Vec::new();
-        let mut current: Vec<Prepared> = Vec::new();
-        for crank in prepared {
-            if current.len() >= max {
-                packs.push(std::mem::take(&mut current));
+        for group in group_by_program(prepared) {
+            let mut current: Vec<Prepared> = Vec::new();
+            for crank in group {
+                if current.len() >= max {
+                    packs.push(std::mem::take(&mut current));
+                }
+                current.push(crank);
+                if current.len() > 1 && !self.fits(&current).await {
+                    // Over the limit with the newest member: close the pack
+                    // without it and start the next one with it.
+                    let overflow = current.pop().expect("just pushed");
+                    packs.push(std::mem::take(&mut current));
+                    current.push(overflow);
+                }
             }
-            current.push(crank);
-            if current.len() > 1 && !self.fits(&current).await {
-                // Over the limit with the newest member: close the pack
-                // without it and start the next one with it.
-                let overflow = current.pop().expect("just pushed");
-                packs.push(std::mem::take(&mut current));
-                current.push(overflow);
+            if !current.is_empty() {
+                packs.push(current);
             }
-        }
-        if !current.is_empty() {
-            packs.push(current);
         }
         packs
     }
@@ -1493,9 +1513,7 @@ impl<S: ChainSource> Turner<S> {
         let signers = &message.account_keys[..message.header.num_required_signatures as usize];
         ixs.iter()
             .filter(|ix| {
-                // Our own instructions legitimately take the fee payer:
-                // begin_guard needs it to fund the guard account.
-                ix.program_id != self.config.relay_program
+                !is_own_guard(ix, &self.config.relay_program)
                     && ix.program_id != *COMPUTE_BUDGET_PROGRAM_ID
                     && !self.trusts(&ix.program_id)
             })
@@ -1558,6 +1576,40 @@ impl<S: ChainSource> Turner<S> {
             .filter_map(|(pk, acc)| acc.map(|a| (*pk, a)))
             .collect())
     }
+}
+
+/// Split cranks into one group per target program, keeping the order they
+/// arrived in within each group. See [`Turner::pack`] for why a transaction
+/// must not mix two.
+fn group_by_program(prepared: Vec<Prepared>) -> Vec<Vec<Prepared>> {
+    prepared.into_iter().fold(Vec::new(), |mut groups, crank| {
+        match groups
+            .iter_mut()
+            .find(|group: &&mut Vec<Prepared>| group[0].program == crank.program)
+        {
+            Some(group) => group.push(crank),
+            None => groups.push(vec![crank]),
+        }
+        groups
+    })
+}
+
+/// Is this one of the turner's own payment guards?
+///
+/// The guards are the one place the fee payer legitimately appears in an
+/// instruction the turner did not write itself — `begin_guard_v0` funds the
+/// guard account out of it — so they are exempt from the signer check. The
+/// exemption is by *instruction*, keyed on the discriminator, not by
+/// program: an executor's identity comes from a resolver, which is free to
+/// name the relay program like any other, and a blanket
+/// `program_id == relay_program` exemption would wave that straight through
+/// to signing with the fee payer in its account list.
+fn is_own_guard(ix: &Instruction, relay_program: &Pubkey) -> bool {
+    ix.program_id == *relay_program
+        && ix.data.first_chunk::<8>().is_some_and(|disc| {
+            *disc == spec::BEGIN_GUARD_V0_DISCRIMINATOR
+                || *disc == spec::ASSERT_PAID_V0_DISCRIMINATOR
+        })
 }
 
 /// Does this instruction name any account from `signers`?
@@ -1760,4 +1812,75 @@ fn read_staged(
     }
     spec::ResolvedCrankV0::read(&account.data[start..end])
         .map_err(|e| anyhow::anyhow!("unparseable staged payload: {e:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn prepared(program: Pubkey, index: u8) -> Prepared {
+        Prepared {
+            key: (Pubkey::new_unique(), 0, index),
+            program,
+            min_payment: 1,
+            units: 1,
+            ixs: Vec::new(),
+        }
+    }
+
+    /// A transaction has one outcome and the submitter books it against one
+    /// program, so cranks from two programs must never share one — however
+    /// they interleave coming out of the concurrent phase.
+    #[test]
+    fn cranks_are_grouped_by_program_before_packing() {
+        let (a, b) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let interleaved = vec![
+            prepared(a, 0),
+            prepared(b, 1),
+            prepared(a, 2),
+            prepared(b, 3),
+            prepared(a, 4),
+        ];
+        let groups = group_by_program(interleaved);
+        assert_eq!(groups.len(), 2);
+        assert!(groups
+            .iter()
+            .all(|group| group.iter().all(|p| p.program == group[0].program)));
+        // Order within a program is the order they finished in.
+        assert_eq!(
+            groups[0].iter().map(|p| p.key.2).collect::<Vec<_>>(),
+            vec![0, 2, 4]
+        );
+        assert_eq!(
+            groups[1].iter().map(|p| p.key.2).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+    }
+
+    /// The guard exemption in `signer_leak` is keyed on the instruction, not
+    /// the program: a resolver may name relay as an executor like anything
+    /// else, and `begin_guard_v0` spends the fee payer's lamports.
+    #[test]
+    fn only_the_guard_instructions_are_exempt() {
+        let relay = Pubkey::new_unique();
+        let guard = |data: Vec<u8>| Instruction {
+            program_id: relay,
+            accounts: Vec::new(),
+            data,
+        };
+        assert!(is_own_guard(
+            &guard(spec::encode_begin_guard_v0_data(3).to_vec()),
+            &relay
+        ));
+        assert!(is_own_guard(
+            &guard(spec::encode_assert_paid_v0_data(5, 3).to_vec()),
+            &relay
+        ));
+        assert!(!is_own_guard(&guard(vec![9; 8]), &relay));
+        assert!(!is_own_guard(&guard(Vec::new()), &relay));
+        assert!(!is_own_guard(
+            &guard(spec::encode_begin_guard_v0_data(3).to_vec()),
+            &Pubkey::new_unique()
+        ));
+    }
 }

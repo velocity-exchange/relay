@@ -217,6 +217,19 @@ impl ChainSource for LiteSvmSource {
 struct NoRemoteSimSource {
     inner: LiteSvmSource,
     fetches: Arc<Mutex<usize>>,
+    /// Program-account reads, counted separately: those are registry
+    /// scans, not the per-account path the freshness tests measure.
+    scans: Arc<Mutex<usize>>,
+}
+
+impl NoRemoteSimSource {
+    fn new(svm: &Arc<Mutex<LiteSVM>>, watch_keys: &Arc<Mutex<Vec<Pubkey>>>) -> Self {
+        Self {
+            inner: LiteSvmSource::new(svm, watch_keys),
+            fetches: Arc::new(Mutex::new(0)),
+            scans: Arc::new(Mutex::new(0)),
+        }
+    }
 }
 
 #[async_trait]
@@ -230,6 +243,7 @@ impl ChainSource for NoRemoteSimSource {
         program: &Pubkey,
         filter_sets: &[Vec<AccountFilter>],
     ) -> Result<Vec<(Pubkey, Account)>> {
+        *self.scans.lock().unwrap() += 1;
         self.inner.get_program_accounts(program, filter_sets).await
     }
     async fn clock(&self) -> Result<ClockSnapshot> {
@@ -1480,10 +1494,7 @@ async fn all_simulation_happens_locally() {
     let t0 = h.t0;
     h.add_entry(t0 + 100);
 
-    let guarded = NoRemoteSimSource {
-        inner: LiteSvmSource::new(&h.svm, &h.watch_keys),
-        fetches: Arc::new(Mutex::new(0)),
-    };
+    let guarded = NoRemoteSimSource::new(&h.svm, &h.watch_keys);
     let local = relay_crank_turner::LocalSimSource::new(
         guarded,
         relay_crank_turner::LocalSimConfig {
@@ -1520,10 +1531,7 @@ async fn no_work_resolves_cost_nothing_remote() {
     h.add_entry(t0 + 100);
     h.cancel_entry(1); // stale-early hint: resolver will report no work
 
-    let guarded = NoRemoteSimSource {
-        inner: LiteSvmSource::new(&h.svm, &h.watch_keys),
-        fetches: Arc::new(Mutex::new(0)),
-    };
+    let guarded = NoRemoteSimSource::new(&h.svm, &h.watch_keys);
     let local = relay_crank_turner::LocalSimSource::new(guarded, Default::default());
     let mut turner = Turner::new(local, Keypair::new(), trusting(TurnerConfig::default()));
     {
@@ -1548,10 +1556,7 @@ async fn no_work_resolves_cost_nothing_remote() {
 #[tokio::test]
 async fn watched_program_accounts_are_never_refetched() {
     let h = setup(PAYMENT, 100, TurnerConfig::default());
-    let counted = NoRemoteSimSource {
-        inner: LiteSvmSource::new(&h.svm, &h.watch_keys),
-        fetches: Arc::new(Mutex::new(0)),
-    };
+    let counted = NoRemoteSimSource::new(&h.svm, &h.watch_keys);
     let fetches = Arc::clone(&counted.fetches);
     let (sender, receiver) = feed_channel();
     let cached = CachedSource::new(
@@ -1716,8 +1721,8 @@ fn freshness_cache(
     CachedSource<NoRemoteSimSource>,
 ) {
     let counted = NoRemoteSimSource {
-        inner: LiteSvmSource::new(&h.svm, &h.watch_keys),
         fetches: Arc::clone(fetches),
+        ..NoRemoteSimSource::new(&h.svm, &h.watch_keys)
     };
     let (sender, receiver) = feed_channel();
     (sender, CachedSource::new(counted, receiver, config))
@@ -1813,6 +1818,52 @@ async fn silent_feed_stops_trusting_coverage() {
     let encoded = relay_crank_turner::metrics::encode();
     assert!(encoded.contains("chain_feed_healthy"));
     assert!(encoded.contains("chain_cache_reads_total"));
+}
+
+/// The registry query obeys the same freshness rule as any other read.
+///
+/// Membership of a program's account set goes stale exactly like an
+/// account's contents: a watch registered after the warm start arrives
+/// through the subscription and nowhere else. A cache that answered from a
+/// one-time warm start forever would keep reporting the registry as it
+/// stood when the feed died — the turner would refresh its watches on
+/// schedule, log a healthy count, and never see a new one.
+#[tokio::test]
+async fn the_registry_scan_is_revalidated_when_nothing_covers_it() {
+    let h = setup(PAYMENT, 100, TurnerConfig::default());
+    let (sender, cached) = freshness_cache(&h, &Arc::new(Mutex::new(0)), freshness_config(vec![]));
+    let scans = Arc::clone(&cached.inner().scans);
+    heartbeat(&sender);
+
+    for _ in 0..3 {
+        cached
+            .get_program_accounts(&relay_id(), &watch_filter_sets(&[]))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        *scans.lock().unwrap(),
+        3,
+        "nothing is subscribed to the registry, so every scan must go to the provider"
+    );
+
+    // With the registry actually streaming, the warm start stands.
+    sender.set_coverage(relay_crank_turner::Coverage {
+        accounts: Default::default(),
+        programs: [relay_id()].into_iter().collect(),
+    });
+    heartbeat(&sender);
+    for _ in 0..3 {
+        cached
+            .get_program_accounts(&relay_id(), &watch_filter_sets(&[]))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        *scans.lock().unwrap(),
+        3,
+        "a covered registry is served from the cache, not rescanned"
+    );
 }
 
 /// Dropping a subscription revokes coverage immediately, without waiting
@@ -2082,7 +2133,20 @@ async fn signer_leak_gate_refuses_only_what_it_should() {
 
     // Allowed: relay's own guards legitimately take the fee payer, since
     // begin_guard funds the guard account from it.
-    assert_eq!(h.turner.signer_leak(&[naming_fee_payer(relay_id())]), None);
+    let begin_guard = Instruction {
+        program_id: relay_id(),
+        accounts: vec![AccountMeta::new(fee_payer, true)],
+        data: spec::encode_begin_guard_v0_data(0).to_vec(),
+    };
+    assert_eq!(h.turner.signer_leak(&[begin_guard]), None);
+    // Refused: the exemption is for those two instructions, not for the
+    // relay program. An executor's identity comes from a resolver, which
+    // can name relay as freely as anything else — and relay's own
+    // `begin_guard_v0` spends the fee payer's lamports on rent.
+    assert_eq!(
+        h.turner.signer_leak(&[naming_fee_payer(relay_id())]),
+        Some(relay_id())
+    );
     // Allowed: a program the operator declared trusted.
     assert_eq!(h.turner.signer_leak(&[naming_fee_payer(demo_id())]), None);
     // Allowed: the executor names the payout, which is how it gets paid.

@@ -277,14 +277,15 @@ fn reject_advice(reason: &RejectReason) -> &'static str {
             "the target account does not exist — it was closed after the watch was registered"
         }
         RejectReason::OwnerDrift => {
-            "the target's owner no longer matches the program recorded at registration;              re-register the watch"
+            "the target's owner no longer matches the program recorded at registration; \
+             re-register the watch"
         }
         RejectReason::Unparseable => {
-            "the bytes at the watch offset are not a readable condition block: the offset              is wrong, the target's layout changed without re-registering, or a wake kind              is one this build does not know"
+            "the bytes at the watch offset are not a readable condition block: the offset \
+             is wrong, the target's layout changed without re-registering, or a wake kind \
+             is one this build does not know"
         }
-        RejectReason::PaysTooLittle => {
-            "no active condition in the block pays --min-crank-payment"
-        }
+        RejectReason::PaysTooLittle => "no active condition in the block pays --min-crank-payment",
         RejectReason::OverCapacity => "--max-watches was reached before this one",
     }
 }
@@ -811,13 +812,18 @@ async fn guard(common: &Common, payout: Pubkey, nonce: u8) -> Result<()> {
         println!("guard {address} does not exist yet (created on first guarded crank)");
         return Ok(());
     };
-    // GuardV0: 8 disc + payout(32) + snapshot(8) + armed(1) + bump(1) + nonce(1)
-    let snapshot = u64::from_le_bytes(
-        account.data[40..48]
-            .try_into()
-            .map_err(|_| anyhow!("guard account is truncated"))?,
-    );
-    let armed = account.data[48] != 0;
+    // GuardV0: 8 disc + payout(32) + snapshot(8) + armed(1) + bump(1) + nonce(1).
+    // Sliced rather than indexed: the address is a PDA, but what lives
+    // there is whatever the chain says, and a debugging tool must report
+    // that rather than panic on it.
+    let fields = account.data.get(40..49).ok_or_else(|| {
+        anyhow!(
+            "{address} is only {} bytes: not a guard",
+            account.data.len()
+        )
+    })?;
+    let snapshot = u64::from_le_bytes(fields[..8].try_into().expect("eight bytes"));
+    let armed = fields[8] != 0;
     if common.json {
         println!(
             "{}",
