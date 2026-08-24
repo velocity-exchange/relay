@@ -390,16 +390,20 @@ impl<S: ChainSource> Turner<S> {
                 len,
                 ..
             }) => {
+                // Sliced where the bytes already are. A watched account is
+                // whole-account sized — a book's is hundreds of kilobytes —
+                // and this runs per condition per tick, so copying one to
+                // read a few bytes out of it is the difference between a
+                // watch costing its region and costing its target.
                 let watched = Pubkey::from(address);
-                let data = if watched == target {
-                    Some(account.data.clone())
+                Some(if watched == target {
+                    slice_or_empty(&account.data, offset, len)
                 } else {
                     self.load_map(&[watched])
                         .await?
-                        .remove(&watched)
-                        .map(|acc| acc.data)
-                };
-                Some(data.map_or_else(Vec::new, |data| slice_or_empty(&data, offset, len)))
+                        .get(&watched)
+                        .map_or_else(Vec::new, |acc| slice_or_empty(&acc.data, offset, len))
+                })
             }
             _ => None,
         };
@@ -622,20 +626,14 @@ impl<S: ChainSource> Turner<S> {
             .collect();
 
         // Change wakes may watch accounts other than the target; fetch
-        // those too (deduped, skipping ones already loaded).
-        let watched_extras: Vec<Pubkey> = parsed
-            .iter()
-            .filter_map(|(_, conditions)| *conditions)
-            .flat_map(|conditions| conditions.iter())
-            .filter_map(|c| match c.wake() {
-                Ok(spec::WakeView::OnAccountChange { address, .. })
-                | Ok(spec::WakeView::OnValueCross { address, .. }) => {
-                    let pk = Pubkey::from(address);
-                    (!target_accounts.contains_key(&pk)).then_some(pk)
-                }
-                _ => None,
-            })
-            .collect();
+        // those too.
+        let watched_extras = watched_accounts(
+            parsed
+                .iter()
+                .filter_map(|(_, conditions)| *conditions)
+                .flat_map(|conditions| conditions.iter()),
+            &target_accounts,
+        );
         let extra_accounts = self.load_map(&watched_extras).await?;
         let account_of = |pk: &Pubkey| -> Option<&Account> {
             target_accounts.get(pk).or_else(|| extra_accounts.get(pk))
@@ -1578,6 +1576,35 @@ impl<S: ChainSource> Turner<S> {
     }
 }
 
+/// The distinct accounts these conditions watch, minus the ones already
+/// loaded.
+///
+/// Deduped, and that is the point rather than a nicety: two conditions
+/// watching one account is the ordinary case — a book watched for its order
+/// counts and again for its best prices — and a watched account is
+/// whole-account sized, so a duplicate is a second copy of the whole book
+/// every tick.
+///
+/// Ordered, so the account list a tick asks for is the same list twice over
+/// and a log or a trace reads the same way each time.
+fn watched_accounts<'a>(
+    conditions: impl Iterator<Item = &'a spec::ConditionV0>,
+    loaded: &HashMap<Pubkey, Account>,
+) -> Vec<Pubkey> {
+    conditions
+        .filter_map(|c| match c.wake() {
+            Ok(spec::WakeView::OnAccountChange { address, .. })
+            | Ok(spec::WakeView::OnValueCross { address, .. }) => {
+                let pk = Pubkey::from(address);
+                (!loaded.contains_key(&pk)).then_some(pk)
+            }
+            _ => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 /// Split cranks into one group per target program, keeping the order they
 /// arrived in within each group. See [`Turner::pack`] for why a transaction
 /// must not mix two.
@@ -1826,6 +1853,45 @@ mod tests {
             units: 1,
             ixs: Vec::new(),
         }
+    }
+
+    /// One account watched by several conditions is fetched once.
+    ///
+    /// This is the ordinary shape, not a corner: a book is watched for its
+    /// order counts and again for its best prices. A watched account is
+    /// whole-account sized, so a duplicate in the list is a second copy of
+    /// the whole book on every tick.
+    #[test]
+    fn an_account_watched_twice_is_fetched_once() {
+        let book = Pubkey::new_unique();
+        let elsewhere = Pubkey::new_unique();
+        let watch = |address: Pubkey, offset: u32| {
+            spec::ConditionV0::on_account_change(
+                address.to_bytes(),
+                offset,
+                8,
+                spec::CrankSpecV0 {
+                    resolver_program: Pubkey::new_unique().to_bytes(),
+                    resolver_disc: [0; 8],
+                    min_payment: 0,
+                },
+                spec::ResolverListV0::new(0, 0),
+            )
+        };
+        // Two watches on the book at different offsets, plus one elsewhere.
+        let conditions = [watch(book, 0), watch(book, 64), watch(elsewhere, 0)];
+
+        let fetched = watched_accounts(conditions.iter(), &HashMap::new());
+        assert_eq!(fetched.len(), 2, "the book was listed twice: {fetched:?}");
+        assert!(fetched.contains(&book));
+        assert!(fetched.contains(&elsewhere));
+
+        // An account the tick already holds is not fetched again at all.
+        let loaded = HashMap::from([(book, Account::default())]);
+        assert_eq!(
+            watched_accounts(conditions.iter(), &loaded),
+            vec![elsewhere]
+        );
     }
 
     /// A transaction has one outcome and the submitter books it against one
