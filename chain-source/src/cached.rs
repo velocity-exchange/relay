@@ -116,7 +116,10 @@ struct CacheState {
     /// the backend's owner subscription).
     indexed_keys: HashSet<Pubkey>,
     interested: HashSet<Pubkey>,
-    warm: bool,
+    /// When each program's account set was last read through the inner
+    /// source. Per program, not a single flag: a warm start for one says
+    /// nothing about another's accounts being resident.
+    warmed: HashMap<Pubkey, Instant>,
     /// Last update of any kind — the feed's heartbeat.
     last_feed_update: Option<Instant>,
     /// Highest slot seen processing. A processed slot at or below this, or
@@ -142,7 +145,7 @@ impl<Inner: ChainSource> CachedSource<Inner> {
                 accounts: HashMap::new(),
                 indexed_keys: HashSet::new(),
                 interested: HashSet::new(),
-                warm: false,
+                warmed: HashMap::new(),
                 last_feed_update: None,
                 fork_tip: 0,
                 root: 0,
@@ -373,28 +376,81 @@ impl<Inner: ChainSource> ChainSource for CachedSource<Inner> {
         }))
     }
 
+    /// Answered from the cache only while a live subscription is actually
+    /// carrying the program's accounts.
+    ///
+    /// The membership of a program's account set is a read like any other,
+    /// and it goes stale the same way: an account registered after the warm
+    /// start reaches the cache through the subscription and nowhere else, so
+    /// a query served from a cache the feed is no longer filling would keep
+    /// answering with the set as it stood when the feed died. The same
+    /// coverage rule the per-account path uses therefore decides how long a
+    /// warm start is good for.
     async fn get_program_accounts(
         &self,
         program: &Pubkey,
         filter_sets: &[Vec<AccountFilter>],
     ) -> Result<Vec<(Pubkey, Account)>> {
-        let warm = self.with_state(|state, _| state.warm);
-        if !warm {
+        let now = Instant::now();
+        let rewarm = self.with_state(|state, config| {
+            let covered = Self::feed_healthy(state, config, now)
+                && state.feed.coverage.borrow().programs.contains(program);
+            let max_age = if covered {
+                config.max_age_covered
+            } else {
+                config.max_age_uncovered
+            };
+            state
+                .warmed
+                .get(program)
+                .is_none_or(|warmed| now.duration_since(*warmed) >= max_age)
+        });
+        if rewarm {
             let accounts = self
                 .inner
                 .get_program_accounts(program, filter_sets)
                 .await?;
             let fetched_at = Instant::now();
             self.with_state(|state, _| {
+                let seen: HashSet<Pubkey> = accounts.iter().map(|(pk, _)| *pk).collect();
                 accounts.into_iter().for_each(|(pk, account)| {
                     state.indexed_keys.insert(pk);
-                    state.accounts.entry(pk).or_insert_with(|| CachedAccount {
+                    let entry = state.accounts.entry(pk).or_insert(CachedAccount {
                         slot: 0,
-                        account: Some(account),
+                        account: None,
                         observed: fetched_at,
                     });
+                    entry.account = Some(account);
+                    entry.observed = fetched_at;
                 });
-                state.warm = true;
+                // An account the cache still holds but the provider did not
+                // return, though it matches this very query, is gone —
+                // closed, or reassigned. Leaving it indexed would keep it in
+                // every later answer, which is the failure a re-warm exists
+                // to correct.
+                let vanished: Vec<Pubkey> = state
+                    .indexed_keys
+                    .iter()
+                    .filter(|pk| !seen.contains(*pk))
+                    .filter(|pk| {
+                        state.accounts.get(pk).is_some_and(|entry| {
+                            // Not one the feed delivered while the scan was
+                            // in flight: the provider's answer predates it,
+                            // and dropping it would lose a brand new account
+                            // until something wrote to it again.
+                            entry.observed <= now
+                                && entry.account.as_ref().is_some_and(|account| {
+                                    account.owner == *program
+                                        && matches_filters(account, filter_sets)
+                                })
+                        })
+                    })
+                    .copied()
+                    .collect();
+                vanished.iter().for_each(|pk| {
+                    state.indexed_keys.remove(pk);
+                });
+                state.warmed.insert(*program, fetched_at);
             });
         }
         // The backend's subscription may be broader than this query, so the
@@ -490,6 +546,182 @@ fn matches_any(account: &Account, subscriptions: &[ProgramSubscription]) -> bool
 mod tests {
     use super::*;
     use crate::feed::{feed_channel, AccountUpdate};
+    use crate::{BlockhashInfo, SignatureOutcome, SimOutcome};
+    use solana_sdk::{signature::Signature, transaction::Transaction};
+
+    /// A program-account provider the test drives: it counts the queries it
+    /// answers and its answer can change between them, which is the whole
+    /// point — a cache that never re-reads cannot notice either.
+    struct ProgramSource {
+        accounts: std::sync::Mutex<Vec<(Pubkey, Account)>>,
+        queries: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ProgramSource {
+        fn new(accounts: Vec<(Pubkey, Account)>) -> Self {
+            Self {
+                accounts: std::sync::Mutex::new(accounts),
+                queries: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn queries(&self) -> usize {
+            self.queries.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn serve(&self, accounts: Vec<(Pubkey, Account)>) {
+            *self.accounts.lock().unwrap() = accounts;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChainSource for ProgramSource {
+        async fn get_multiple_accounts(&self, pubkeys: &[Pubkey]) -> Result<Vec<Option<Account>>> {
+            let accounts = self.accounts.lock().unwrap();
+            Ok(pubkeys
+                .iter()
+                .map(|pk| {
+                    accounts
+                        .iter()
+                        .find(|(key, _)| key == pk)
+                        .map(|(_, account)| account.clone())
+                })
+                .collect())
+        }
+        async fn get_program_accounts(
+            &self,
+            _program: &Pubkey,
+            _filter_sets: &[Vec<AccountFilter>],
+        ) -> Result<Vec<(Pubkey, Account)>> {
+            self.queries
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.accounts.lock().unwrap().clone())
+        }
+        async fn clock(&self) -> Result<ClockSnapshot> {
+            Ok(ClockSnapshot {
+                slot: 1,
+                unix_timestamp: 1,
+            })
+        }
+        async fn latest_blockhash(&self) -> Result<BlockhashInfo> {
+            unreachable!()
+        }
+        async fn block_height(&self) -> Result<u64> {
+            unreachable!()
+        }
+        async fn signature_statuses(
+            &self,
+            _signatures: &[Signature],
+        ) -> Result<Vec<Option<SignatureOutcome>>> {
+            unreachable!()
+        }
+        async fn simulate_transaction(
+            &self,
+            _tx: &Transaction,
+            _return_accounts: &[Pubkey],
+        ) -> Result<SimOutcome> {
+            unreachable!()
+        }
+        async fn send_transaction(&self, _tx: &Transaction) -> Result<Signature> {
+            unreachable!()
+        }
+        async fn recent_priority_fee(&self, _accounts: &[Pubkey]) -> Result<u64> {
+            unreachable!()
+        }
+    }
+
+    fn owned_by(program: Pubkey) -> Account {
+        Account {
+            lamports: 1,
+            data: Vec::new(),
+            owner: program,
+            executable: false,
+            rent_epoch: 0,
+        }
+    }
+
+    /// A warm start is a read like any other and goes stale like any other.
+    ///
+    /// The membership of a program's account set only changes through the
+    /// subscription, so while one is live and delivering the cache may answer
+    /// from itself; once it is not, the set the cache holds is a snapshot of
+    /// whenever the feed died and has to be re-read.
+    #[tokio::test]
+    async fn a_warm_start_expires_on_the_same_coverage_rule_as_an_account() {
+        let program = Pubkey::new_unique();
+        let (sender, receiver) = feed_channel();
+        let inner = ProgramSource::new(vec![(Pubkey::new_unique(), owned_by(program))]);
+        let source = CachedSource::new(
+            inner,
+            receiver,
+            CachedSourceConfig {
+                max_age_covered: Duration::from_secs(3600),
+                max_age_uncovered: Duration::ZERO,
+                ..Default::default()
+            },
+        );
+
+        // Covered by a live subscription: the first query warms, the second
+        // is answered from the cache.
+        sender.set_coverage(crate::feed::Coverage {
+            accounts: HashSet::new(),
+            programs: HashSet::from([program]),
+        });
+        source.with_state(|state, _| state.last_feed_update = Some(Instant::now()));
+        source.get_program_accounts(&program, &[]).await.unwrap();
+        source.get_program_accounts(&program, &[]).await.unwrap();
+        assert_eq!(
+            source.inner().queries(),
+            1,
+            "a covered program was re-read while its subscription was live"
+        );
+
+        // Coverage withdrawn: the cache no longer knows what it is missing,
+        // so every query re-reads.
+        sender.set_coverage(crate::feed::Coverage::default());
+        source.get_program_accounts(&program, &[]).await.unwrap();
+        assert_eq!(
+            source.inner().queries(),
+            2,
+            "an uncovered program was served from a cache nothing is filling"
+        );
+    }
+
+    /// An account the provider stops returning is gone — closed, or
+    /// reassigned to another owner. Re-reading is what notices; dropping it
+    /// from the index is what makes the notice count, because the answer is
+    /// assembled from the index rather than from the provider's reply.
+    #[tokio::test]
+    async fn a_re_read_forgets_an_account_that_is_no_longer_there() {
+        let program = Pubkey::new_unique();
+        let staying = Pubkey::new_unique();
+        let closing = Pubkey::new_unique();
+        let (_sender, receiver) = feed_channel();
+        let inner = ProgramSource::new(vec![
+            (staying, owned_by(program)),
+            (closing, owned_by(program)),
+        ]);
+        // No coverage and no feed, so every query re-reads.
+        let source = CachedSource::new(
+            inner,
+            receiver,
+            CachedSourceConfig {
+                max_age_uncovered: Duration::ZERO,
+                ..Default::default()
+            },
+        );
+
+        let first = source.get_program_accounts(&program, &[]).await.unwrap();
+        assert_eq!(first.len(), 2);
+
+        source.inner().serve(vec![(staying, owned_by(program))]);
+        let second = source.get_program_accounts(&program, &[]).await.unwrap();
+        assert_eq!(
+            second.iter().map(|(pk, _)| *pk).collect::<Vec<_>>(),
+            vec![staying],
+            "a closed account survived the re-read that should have forgotten it"
+        );
+    }
 
     /// The fork state machine, driven directly. There is no way to make a
     /// single-node test validator fork, so this is where the behaviour is
@@ -510,7 +742,7 @@ mod tests {
                     accounts: HashMap::new(),
                     indexed_keys: HashSet::new(),
                     interested: HashSet::new(),
-                    warm: false,
+                    warmed: HashMap::new(),
                     last_feed_update: None,
                     fork_tip: 0,
                     root: 0,
