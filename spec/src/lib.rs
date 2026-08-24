@@ -1048,10 +1048,19 @@ impl<const C: usize, const R: usize> RelayBlockV0<C, R> {
         if self.account_offset() == 0 {
             return Err(SpecError::Truncated);
         }
-        for (slot, r) in self.resolvers.iter_mut().zip(refs) {
-            slot[..32].copy_from_slice(&r.address);
-            slot[32] = r.writable;
-        }
+        // The whole region is rewritten, not just the prefix: a condition
+        // still pointing at this list with an older, larger count would
+        // otherwise read the tail of the previous write as live refs.
+        self.resolvers
+            .iter_mut()
+            .enumerate()
+            .for_each(|(i, slot)| match refs.get(i) {
+                Some(r) => {
+                    slot[..32].copy_from_slice(&r.address);
+                    slot[32] = r.writable;
+                }
+                None => slot.fill(0),
+            });
         self.resolver_count = refs.len() as u8;
         let region = BLOCK_HEADER_LEN + C * CONDITION_LEN;
         Ok(ResolverListV0::new(
@@ -1855,6 +1864,40 @@ mod tests {
         // Reserved space stays zero so a future field can claim it — the
         // executor identity used to occupy 40 of these bytes.
         assert_eq!(c._reserved, [0u8; 79]);
+    }
+
+    /// Rewriting the built-in list with a shorter one leaves nothing of the
+    /// longer one behind. A condition written against the old list still
+    /// carries the old count, and would otherwise read whatever the
+    /// previous write left in those slots as live account refs.
+    #[test]
+    fn a_shorter_resolver_list_erases_the_one_before_it() {
+        let mut block = RelayBlockV0::<1, 8>::zeroed();
+        block.init(8).unwrap();
+        let long = [
+            AccountRefV0::writable([1; 32]),
+            AccountRefV0::readonly([2; 32]),
+            AccountRefV0::readonly([3; 32]),
+        ];
+        let list = block.write_resolvers(&long).unwrap();
+        assert_eq!(list.count, 3);
+
+        let short = [AccountRefV0::writable([9; 32])];
+        let list = block.write_resolvers(&short).unwrap();
+        assert_eq!(list.count, 1);
+        assert_eq!(block.resolver_refs(), &short[..]);
+
+        // Read the region the way a turner does — by offset and count,
+        // from the raw bytes — with the count a stale condition would use.
+        let region = &bytemuck::bytes_of(&block)[BLOCK_HEADER_LEN + CONDITION_LEN..];
+        let stale: Vec<AccountRefV0> = region[..3 * ACCOUNT_REF_LEN]
+            .chunks_exact(ACCOUNT_REF_LEN)
+            .map(bytemuck::pod_read_unaligned)
+            .collect();
+        assert_eq!(
+            stale,
+            vec![short[0], AccountRefV0::zeroed(), AccountRefV0::zeroed()]
+        );
     }
 
     #[test]
