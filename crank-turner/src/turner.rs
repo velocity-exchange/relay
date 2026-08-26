@@ -63,6 +63,10 @@ pub enum SkipReason {
     ParseFailed,
     /// The target program's recent cranks have cost more than they paid.
     Unprofitable,
+    /// This crank's payment does not cover the fee this turner would pay to
+    /// land it. Distinct from `Unprofitable`, which is a judgement about a
+    /// program's history rather than about the crank in hand.
+    PaymentBelowCost,
     /// Held back deliberately: this program's cranks keep losing races, so
     /// the turner is arriving late on purpose to let a rival's transaction
     /// land and be caught by simulation instead of by a burned fee.
@@ -107,6 +111,9 @@ pub struct TurnerConfig {
     /// Skip conditions advertising less than this (the original tuktuk
     /// `min_crank_fee` pattern — a fleet of turners self-selects by fee).
     pub min_crank_payment: u64,
+    /// On top of the fee, what a crank must clear for this turner to land it.
+    /// Zero accepts break-even work.
+    pub crank_margin_lamports: u64,
     /// Suppress re-evaluating a condition for this many slots after a
     /// no-work resolve, so stale-early hints don't re-simulate every tick.
     pub no_work_backoff_slots: u64,
@@ -247,6 +254,7 @@ impl Default for TurnerConfig {
         Self {
             relay_program: RELAY_PROGRAM_ID.parse().unwrap(),
             min_crank_payment: 0,
+            crank_margin_lamports: 0,
             no_work_backoff_slots: 8,
             failure_backoff_slots: 16,
             sent_backoff_slots: 2,
@@ -1093,7 +1101,12 @@ impl<S: ChainSource> Turner<S> {
                 StateUpdate::Failed,
             ));
         }
-        let ixs = self.guarded(executor_ix, payout, &program, condition.min_payment());
+        let ixs = self.guarded(
+            executor_ix.clone(),
+            payout,
+            &program,
+            condition.min_payment(),
+        );
 
         // Simulate with a generous budget to learn the real cost, then let
         // the packing phase re-sign with a tight limit — the fee is charged
@@ -1120,10 +1133,44 @@ impl<S: ChainSource> Turner<S> {
             ));
         }
         let _ = clock;
+
+        // The probe priced the guard at what the program advertised, which is
+        // what it promises rather than what landing it costs us. Now that the
+        // units are measured, re-guard at our own cost and simulate once
+        // more: a crank that cannot cover the fee we are about to pay fails
+        // here, for the price of a local simulation, instead of on chain for
+        // the price of the fee itself.
+        //
+        // Floored at the advertised figure, so a program is still held to its
+        // own word even when that word is worth more than our cost.
+        let units = sim.units_consumed as u32;
+        let required = condition.min_payment().max(self.required_payment(units));
+        let ixs = if required > condition.min_payment() {
+            let repriced = self.guarded(executor_ix, payout, &program, required);
+            let priced = self.with_compute_budget(repriced.clone(), MAX_COMPUTE_UNITS, 0);
+            let (priced_tx, _) = self.signed_tx(&priced).await?;
+            let recheck = self.source.simulate_transaction(&priced_tx, &[]).await?;
+            if recheck.err.is_some() {
+                metrics::SKIPS
+                    .with_label_values(&[
+                        skip_label(&SkipReason::PaymentBelowCost),
+                        &executor_label,
+                    ])
+                    .inc();
+                return Ok(CrankResult::Done(
+                    Outcome::Skipped(key, SkipReason::PaymentBelowCost),
+                    StateUpdate::Failed,
+                ));
+            }
+            repriced
+        } else {
+            ixs
+        };
+
         Ok(CrankResult::Ready(Box::new(Prepared {
             key,
             program: due.program,
-            min_payment: condition.min_payment(),
+            min_payment: required,
             units: sim.units_consumed,
             ixs,
         })))
@@ -1479,6 +1526,24 @@ impl<S: ChainSource> Turner<S> {
         }
     }
 
+    /// The least this turner will accept for landing a crank of `units`:
+    /// what the transaction costs it, plus whatever margin the operator set.
+    ///
+    /// The guard exists to stop a target program paying less than it said it
+    /// would. Held to the program's own advertised figure it never protected
+    /// the turner at all — a crank could advertise a lamport, land, and leave
+    /// the fee unpaid. Held to this, an underpaying crank fails in simulation
+    /// and is skipped before it costs anything.
+    ///
+    /// The base fee is per signature and a crank carries one: the turner's.
+    fn required_payment(&self, units: u32) -> u64 {
+        required_payment(
+            self.priority_fee(),
+            units,
+            self.config.crank_margin_lamports,
+        )
+    }
+
     /// Priority fee the submitter observed, clamped to the configured
     /// ceiling. Zero when no submitter is attached.
     fn priority_fee(&self) -> u64 {
@@ -1761,6 +1826,23 @@ fn materialize_resolver_accounts(
 
 /// Stable metric label for a skip reason. Spelled out rather than derived
 /// so a rename in the enum cannot silently rename a dashboard series.
+/// Lamports a crank of `units` must pay for a turner bidding `price_per_unit`
+/// micro-lamports to be whole, plus `margin`.
+///
+/// Free of the turner so it can be reasoned about — and tested — on its own.
+/// Rounded up: a payment short by a lamport buys nothing.
+fn required_payment(price_per_unit: u64, units: u32, margin: u64) -> u64 {
+    /// Lamports the runtime charges per signature; a crank carries one, the
+    /// turner's own fee payer.
+    const BASE_FEE_LAMPORTS: u64 = 5_000;
+    let priority = (price_per_unit as u128)
+        .saturating_mul(u128::from(units))
+        .div_ceil(1_000_000);
+    BASE_FEE_LAMPORTS
+        .saturating_add(u64::try_from(priority).unwrap_or(u64::MAX))
+        .saturating_add(margin)
+}
+
 fn skip_label(reason: &SkipReason) -> &'static str {
     match reason {
         SkipReason::NotDue => "not_due",
@@ -1769,6 +1851,7 @@ fn skip_label(reason: &SkipReason) -> &'static str {
         SkipReason::BelowMinPayment => "below_min_payment",
         SkipReason::ParseFailed => "parse_failed",
         SkipReason::Unprofitable => "unprofitable",
+        SkipReason::PaymentBelowCost => "payment_below_cost",
         SkipReason::ContentionDelay => "contention_delay",
         SkipReason::NoSafePayout => "no_safe_payout",
         SkipReason::ExecutorNamedSigner => "executor_named_signer",
@@ -1844,6 +1927,23 @@ fn read_staged(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a turner needs is the fee it is about to pay, not the number the
+    /// target program wrote down. Bidding nothing still costs the signature.
+    #[test]
+    fn required_payment_tracks_the_fee_being_bid() {
+        // No priority bid: the base fee alone.
+        assert_eq!(required_payment(0, 200_000, 0), 5_000);
+        // A bid is priced per compute unit, in micro-lamports.
+        assert_eq!(required_payment(50_000, 200_000, 0), 5_000 + 10_000);
+        // Rounded up, so a fraction of a lamport is never eaten by the turner.
+        assert_eq!(required_payment(1, 1, 0), 5_001);
+        // Margin rides on top.
+        assert_eq!(required_payment(0, 200_000, 2_500), 7_500);
+        // An absurd bid saturates rather than wrapping into a small number,
+        // which would silently accept work that pays nothing.
+        assert_eq!(required_payment(u64::MAX, u32::MAX, u64::MAX), u64::MAX);
+    }
 
     fn prepared(program: Pubkey, index: u8) -> Prepared {
         Prepared {

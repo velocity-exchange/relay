@@ -696,6 +696,13 @@ fn skip_advice(reason: &relay_crank_turner::SkipReason) -> &'static str {
             "The target program cleared the condition's active flag. Nothing on the \
              relay side will crank it until the program sets it again."
         }
+        R::PaymentBelowCost => {
+            "The crank pays less than this turner would spend landing it — the \
+             base fee plus the priority fee it is bidding, plus any configured \
+             margin. It is skipped in simulation rather than landed at a loss. \
+             Either the fee market has moved above what the target program \
+             offers, or --crank-margin is set higher than the work is worth."
+        }
         R::BelowMinPayment => {
             "This turner is configured to ignore work this cheap. Lower \
              --min-crank-payment, or have the target program advertise more."

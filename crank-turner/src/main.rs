@@ -61,6 +61,12 @@ struct Args {
     /// entirely, so its target stops being fetched and subscribed.
     #[arg(long, env = "RELAY_MIN_CRANK_PAYMENT", default_value_t = 0)]
     min_crank_payment: u64,
+    /// Lamports a crank must clear *above* the fee this turner pays to land
+    /// it. The payment guard is set to fee + this, so a crank that cannot
+    /// cover it fails in simulation and is skipped rather than landing at a
+    /// loss. Zero accepts break-even work.
+    #[arg(long, env = "RELAY_CRANK_MARGIN", default_value_t = 0)]
+    crank_margin_lamports: u64,
     /// Only crank watches whose target is owned by one of these programs.
     /// Pushed down to the RPC/geyser provider, so other protocols' watches
     /// are never transmitted. Repeatable / comma-separated. Default: all.
@@ -222,6 +228,7 @@ async fn main() -> Result<()> {
     let config = TurnerConfig {
         relay_program: args.program_id,
         min_crank_payment: args.min_crank_payment,
+        crank_margin_lamports: args.crank_margin_lamports,
         payout: args.payout_address,
         sync_native_payout: args.sync_native_payout,
         trusted_programs: args.trusted_program.iter().copied().collect(),

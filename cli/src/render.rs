@@ -138,6 +138,7 @@ pub fn skip_reason(reason: &SkipReason) -> &'static str {
         SkipReason::BelowMinPayment => "below min payment",
         SkipReason::ParseFailed => "parse failed",
         SkipReason::Unprofitable => "unprofitable",
+        SkipReason::PaymentBelowCost => "payment below cost",
         SkipReason::ContentionDelay => "contention delay",
         SkipReason::NoSafePayout => "no safe payout",
         SkipReason::ExecutorNamedSigner => "executor named a signer",
