@@ -50,6 +50,9 @@
 
 extern crate alloc;
 
+#[cfg(feature = "idl-build-v2")]
+extern crate anchor_lang_v2 as anchor_lang;
+
 use alloc::vec::Vec;
 
 use bytemuck::{Pod, Zeroable};

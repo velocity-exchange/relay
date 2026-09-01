@@ -15,7 +15,7 @@ bytemuck = { version = "1", features = ["derive", "min_const_generics"] }
 # The velocity anchor fork, only for the CLOB's IDL build: it needs the fork's
 # `IdlType` on the condition-block types the CLOB account embeds. Optional and
 # gated, so the on-chain zero-copy build never compiles it.
-anchor-lang-v2 = { git = "https://github.com/velocity-exchange/anchor.git", rev = "2bc4d3c23edc2b63707301ae6d4037b9202ef0cc", optional = true }
+anchor-lang-v2 = { package = "anchor-lang", git = "https://github.com/velocity-exchange/anchor.git", rev = "444c6205fd3aa54006cf9d0c232d43471b74b071", optional = true }
 
 [features]
 default = []

@@ -166,9 +166,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
-name = "anchor-derive-accounts-v2"
-version = "2.0.0"
-source = "git+https://github.com/velocity-exchange/anchor.git?rev=2bc4d3c23edc2b63707301ae6d4037b9202ef0cc#2bc4d3c23edc2b63707301ae6d4037b9202ef0cc"
+name = "anchor-derive-accounts"
+version = "2.0.0-rc.1"
+source = "git+https://github.com/velocity-exchange/anchor.git?rev=444c6205fd3aa54006cf9d0c232d43471b74b071#444c6205fd3aa54006cf9d0c232d43471b74b071"
 dependencies = [
  "anchor-lang-idl",
  "bs58",
@@ -177,13 +177,35 @@ dependencies = [
  "quote",
  "serde_json",
  "sha2 0.10.9",
+ "solana-address 2.7.0",
  "syn 2.0.119",
 ]
 
 [[package]]
+name = "anchor-lang"
+version = "2.0.0-rc.1"
+source = "git+https://github.com/velocity-exchange/anchor.git?rev=444c6205fd3aa54006cf9d0c232d43471b74b071#444c6205fd3aa54006cf9d0c232d43471b74b071"
+dependencies = [
+ "anchor-derive-accounts",
+ "bytemuck",
+ "pinocchio",
+ "pinocchio-system",
+ "sha2 0.10.9",
+ "solana-address 2.7.0",
+ "solana-instruction",
+ "solana-msg",
+ "solana-program-error",
+ "solana-program-memory",
+ "solana-sha256-hasher",
+ "solana-system-interface 2.0.0",
+ "solana-sysvar",
+ "wincode",
+]
+
+[[package]]
 name = "anchor-lang-idl"
-version = "0.1.2"
-source = "git+https://github.com/velocity-exchange/anchor.git?rev=2bc4d3c23edc2b63707301ae6d4037b9202ef0cc#2bc4d3c23edc2b63707301ae6d4037b9202ef0cc"
+version = "0.2.0"
+source = "git+https://github.com/velocity-exchange/anchor.git?rev=444c6205fd3aa54006cf9d0c232d43471b74b071#444c6205fd3aa54006cf9d0c232d43471b74b071"
 dependencies = [
  "anchor-lang-idl-spec",
  "anyhow",
@@ -196,32 +218,10 @@ dependencies = [
 [[package]]
 name = "anchor-lang-idl-spec"
 version = "0.1.0"
-source = "git+https://github.com/velocity-exchange/anchor.git?rev=2bc4d3c23edc2b63707301ae6d4037b9202ef0cc#2bc4d3c23edc2b63707301ae6d4037b9202ef0cc"
+source = "git+https://github.com/velocity-exchange/anchor.git?rev=444c6205fd3aa54006cf9d0c232d43471b74b071#444c6205fd3aa54006cf9d0c232d43471b74b071"
 dependencies = [
  "anyhow",
  "serde",
-]
-
-[[package]]
-name = "anchor-lang-v2"
-version = "2.0.0"
-source = "git+https://github.com/velocity-exchange/anchor.git?rev=2bc4d3c23edc2b63707301ae6d4037b9202ef0cc#2bc4d3c23edc2b63707301ae6d4037b9202ef0cc"
-dependencies = [
- "anchor-derive-accounts-v2",
- "bytemuck",
- "pinocchio",
- "pinocchio-system",
- "sha2 0.10.9",
- "solana-address 2.7.0",
- "solana-define-syscall 5.2.0",
- "solana-instruction",
- "solana-msg",
- "solana-program-error",
- "solana-program-memory",
- "solana-sha256-hasher",
- "solana-system-interface 2.0.0",
- "solana-sysvar",
- "wincode 0.5.5",
 ]
 
 [[package]]
@@ -3687,7 +3687,7 @@ dependencies = [
 name = "relay-spec"
 version = "0.1.0"
 dependencies = [
- "anchor-lang-v2",
+ "anchor-lang",
  "bytemuck",
 ]
 
@@ -4333,7 +4333,7 @@ dependencies = [
  "solana-program-error",
  "solana-sanitize",
  "solana-sha256-hasher",
- "wincode 0.6.0",
+ "wincode",
 ]
 
 [[package]]
@@ -5863,7 +5863,7 @@ dependencies = [
  "serde_derive",
  "solana-ed25519",
  "solana-sanitize",
- "wincode 0.6.0",
+ "wincode",
 ]
 
 [[package]]
@@ -7569,19 +7569,6 @@ checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "wincode"
-version = "0.5.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66d967db7705dc29120bb6e8ce5b5a2e27734ed5976d1c904e95bd238d1c3c5a"
-dependencies = [
- "pastey",
- "proc-macro2",
- "quote",
- "thiserror 2.0.19",
- "wincode-derive 0.4.6",
-]
-
-[[package]]
-name = "wincode"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b5d39d1a984eb7ae37afa348f058216d62a6d5f71640f4113a8114386c2a812a"
@@ -7590,19 +7577,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "thiserror 2.0.19",
- "wincode-derive 0.5.0",
-]
-
-[[package]]
-name = "wincode-derive"
-version = "0.4.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15ab90b719560d0fda79c74550ad1c948d17b118765942838055ebaf34d67071"
-dependencies = [
- "darling",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
+ "wincode-derive",
 ]
 
 [[package]]
