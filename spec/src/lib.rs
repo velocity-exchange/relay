@@ -75,6 +75,7 @@ pub const KEEPER_PLACEHOLDER: [u8; 32] = *b"relay/keeper/placeholder\0\0\0\0\0\0
 /// quoter's registered `quote_v0` surface under simulation) costs those
 /// bytes once instead of once per condition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "idl-build-v2", derive(anchor_lang_v2::IdlType))]
 pub struct ResolverListV0 {
     pub offset: u32,
     pub count: u8,
@@ -230,6 +231,7 @@ pub enum SpecError {
 /// contiguous, at an 8-aligned offset.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
+#[cfg_attr(feature = "idl-build-v2", derive(anchor_lang_v2::IdlType))]
 pub struct ConditionBlockHeaderV0 {
     pub magic: [u8; 8],
     pub version: u8,
@@ -267,6 +269,7 @@ impl ConditionBlockHeaderV0 {
 /// so fixed arrays of it pack without padding.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
+#[cfg_attr(feature = "idl-build-v2", derive(anchor_lang_v2::IdlType))]
 pub struct AccountRefV0 {
     pub address: [u8; 32],
     /// 0 = readonly, nonzero = writable.
@@ -298,6 +301,7 @@ impl AccountRefV0 {
 
 /// Wake kinds (the `wake_kind` byte on [`ConditionV0`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "idl-build-v2", derive(anchor_lang_v2::IdlType))]
 pub enum WakeKind {
     /// Due once the chain clock reaches `wake_ts`. The program updates the
     /// field in place (e.g. a min-over-inserts next-expiry; the executor
@@ -336,6 +340,7 @@ pub enum WakeKind {
 
 /// Copied, alloc-free view of a condition's wake for evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "idl-build-v2", derive(anchor_lang_v2::IdlType))]
 pub enum WakeView {
     AtTimestamp {
         unix_ts: i64,
@@ -367,6 +372,7 @@ pub enum WakeView {
 /// inverts every comparison — so the threshold carries which domain it
 /// lives in, and the watched bytes are always read in that same domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "idl-build-v2", derive(anchor_lang_v2::IdlType))]
 pub enum WatchValue {
     Signed(i64),
     Unsigned(u64),
@@ -437,6 +443,7 @@ pub fn value_crossed(value: WatchValue, threshold: WatchValue, cmp: u8) -> bool 
 /// already trust what it returns, and one resolver can then serve a family
 /// of like-instructions from one condition slot.
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "idl-build-v2", derive(anchor_lang_v2::IdlType))]
 pub struct CrankSpecV0 {
     pub resolver_program: [u8; 32],
     pub resolver_disc: [u8; 8],
@@ -457,6 +464,7 @@ pub struct CrankSpecV0 {
 /// condition.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
+#[cfg_attr(feature = "idl-build-v2", derive(anchor_lang_v2::IdlType))]
 pub struct ConditionV0 {
     /// Lamports the executor must pay the keeper. Turners use it to decide
     /// whether a crank is worth the fee, and pass it to `assert_paid_v0`.
@@ -1065,6 +1073,26 @@ pub struct RelayBlockV0<const CONDITIONS: usize, const RESOLVER_CAPACITY: usize>
     _reserved: [u8; 11],
 }
 
+/// The CLOB account embeds this block, so the CLOB's IDL build must be able to
+/// name it. It is const-generic, which the `IdlType` derive cannot express, and
+/// its bytes are an opaque relay layout no IDL consumer decodes through this
+/// type. So it is emitted as an empty struct: a valid type the reference
+/// resolves against, carrying no fields to get wrong.
+#[cfg(feature = "idl-build")]
+impl<const C: usize, const R: usize> anchor_lang_v2::IdlAccountType for RelayBlockV0<C, R> {
+    const __IDL_TYPE_DEF: Option<&'static str> =
+        Some(r#"{"name":"RelayBlockV0","type":{"kind":"struct","fields":[]}}"#);
+    fn __register_idl_deps(
+        _accounts: &mut anchor_lang_v2::__alloc::vec::Vec<&'static str>,
+        types: &mut anchor_lang_v2::__alloc::vec::Vec<&'static str>,
+    ) {
+        if let Some(t) = <Self as anchor_lang_v2::IdlAccountType>::__IDL_TYPE_DEF {
+            types.push(t);
+        }
+    }
+}
+
+
 // Sound for any parameters: every field is a byte array, so the struct is
 // alignment-1 and can contain no padding.
 unsafe impl<const C: usize, const R: usize> Zeroable for RelayBlockV0<C, R> {}
@@ -1274,6 +1302,7 @@ impl<const C: usize, const R: usize> ConditionBlock for RelayBlockV0<C, R> {
 /// A no-work result needs no staging write at all.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
+#[cfg_attr(feature = "idl-build-v2", derive(anchor_lang_v2::IdlType))]
 pub struct ResponsePointerV0 {
     /// 0 = nothing to do right now.
     pub work: u8,
@@ -1351,6 +1380,7 @@ impl ResponsePointerV0 {
 /// resolver picked out is willing to run *which* instruction it picked. The
 /// guards are what bound the damage either way.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "idl-build-v2", derive(anchor_lang_v2::IdlType))]
 pub struct ResolvedCrankV0 {
     /// Program owning the instruction to submit.
     pub executor_program: [u8; 32],
@@ -1470,6 +1500,7 @@ impl ResolvedCrankV0 {
 /// costs a simulation.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
+#[cfg_attr(feature = "idl-build-v2", derive(anchor_lang_v2::IdlType))]
 pub struct FiredConditionV0 {
     /// Account holding the condition block.
     pub target: [u8; 32],
@@ -1532,6 +1563,7 @@ pub fn encode_resolver_data(
 
 /// A parsed relay `WatchV0` registry account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "idl-build-v2", derive(anchor_lang_v2::IdlType))]
 pub struct WatchV0 {
     /// Owner program of `target`, recorded by the relay program from the
     /// account itself at registration — a creator cannot forge it.
