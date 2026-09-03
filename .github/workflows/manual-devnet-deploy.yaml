@@ -43,14 +43,14 @@ jobs:
           program-id: ${{ env.RELAY_DEVNET_PROGRAM_ID }}
           rpc-url: ${{ secrets.DEVNET_RPC_ENDPOINT }}
           keypair: ${{ secrets.DEVNET_DEPLOYER_KEYPAIR }}
-          buffer-authority: ${{ secrets.DEVNET_MULTISIG_VAULT }}
+          buffer-authority: ${{ vars.DEVNET_MULTISIG_VAULT }}
 
       - name: Propose Squads upgrade
         uses: solana-foundation/squads-program-action@839c079c881344c2da0365ad6a6bb07892e08e2f # v0.4.3
         with:
           rpc: ${{ secrets.DEVNET_RPC_ENDPOINT }}
           program: ${{ env.RELAY_DEVNET_PROGRAM_ID }}
-          multisig: ${{ secrets.DEVNET_MULTISIG }}
+          multisig: ${{ vars.DEVNET_MULTISIG }}
           vault-index: "0"
           buffer: ${{ steps.buffer-deploy.outputs.buffer }}
           keypair: ${{ secrets.DEVNET_DEPLOYER_KEYPAIR }}
