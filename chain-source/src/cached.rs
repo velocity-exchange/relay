@@ -30,7 +30,7 @@
 //!   silence means nothing, so the value may be served for at most
 //!   `max_age_uncovered` before it must be revalidated.
 //!
-//! That is why backends publish [`Coverage`] rather than the cache
+//! That is why backends publish [`crate::feed::Coverage`] rather than the cache
 //! inferring it from traffic. Two backstops sit under it:
 //!
 //! - **Heartbeat.** The clock sysvar is always in the interest set and
@@ -314,6 +314,85 @@ impl<Inner: ChainSource> CachedSource<Inner> {
     }
 }
 
+impl<Inner: ChainSource> CachedSource<Inner> {
+    /// Has the warm start for this program's account set gone stale?
+    ///
+    /// Membership goes stale exactly like an account's contents: a watch
+    /// registered after the scan arrives over the subscription and nowhere
+    /// else. So the same coverage rule the per-account path uses decides how
+    /// long a warm start is good for.
+    fn warm_start_expired(&self, program: &Pubkey, now: Instant) -> bool {
+        self.with_state(|state, config| {
+            let covered = Self::feed_healthy(state, config, now)
+                && state.feed.coverage.borrow().programs.contains(program);
+            let max_age = if covered {
+                config.max_age_covered
+            } else {
+                config.max_age_uncovered
+            };
+            state
+                .warmed
+                .get(program)
+                .is_none_or(|warmed| now.duration_since(*warmed) >= max_age)
+        })
+    }
+
+    /// Fold a fresh provider scan into the cache, and drop what the scan
+    /// proves is gone.
+    ///
+    /// `started` is when the scan was issued, which is what separates an
+    /// account the provider omitted from one the feed delivered while the
+    /// scan was in flight.
+    fn absorb_scan(
+        &self,
+        program: &Pubkey,
+        filter_sets: &[Vec<AccountFilter>],
+        accounts: Vec<(Pubkey, Account)>,
+        started: Instant,
+    ) {
+        let fetched_at = Instant::now();
+        self.with_state(|state, _| {
+            let seen: HashSet<Pubkey> = accounts.iter().map(|(pk, _)| *pk).collect();
+            accounts.into_iter().for_each(|(pk, account)| {
+                state.indexed_keys.insert(pk);
+                let entry = state.accounts.entry(pk).or_insert(CachedAccount {
+                    slot: 0,
+                    account: None,
+                    observed: fetched_at,
+                });
+                entry.account = Some(account);
+                entry.observed = fetched_at;
+            });
+            // An account the cache still holds but the provider did not
+            // return, though it matches this very query, is gone — closed,
+            // or reassigned. Leaving it indexed would keep it in every later
+            // answer, which is the failure a re-warm exists to correct.
+            let vanished: Vec<Pubkey> = state
+                .indexed_keys
+                .iter()
+                .filter(|pk| !seen.contains(*pk))
+                .filter(|pk| {
+                    state.accounts.get(pk).is_some_and(|entry| {
+                        // Not one the feed delivered while the scan was in
+                        // flight: the provider's answer predates it, and
+                        // dropping it would lose a brand new account until
+                        // something wrote to it again.
+                        entry.observed <= started
+                            && entry.account.as_ref().is_some_and(|account| {
+                                account.owner == *program && matches_filters(account, filter_sets)
+                            })
+                    })
+                })
+                .copied()
+                .collect();
+            vanished.iter().for_each(|pk| {
+                state.indexed_keys.remove(pk);
+            });
+            state.warmed.insert(*program, fetched_at);
+        });
+    }
+}
+
 #[async_trait]
 impl<Inner: ChainSource> ChainSource for CachedSource<Inner> {
     async fn get_multiple_accounts(&self, pubkeys: &[Pubkey]) -> Result<Vec<Option<Account>>> {
@@ -392,66 +471,12 @@ impl<Inner: ChainSource> ChainSource for CachedSource<Inner> {
         filter_sets: &[Vec<AccountFilter>],
     ) -> Result<Vec<(Pubkey, Account)>> {
         let now = Instant::now();
-        let rewarm = self.with_state(|state, config| {
-            let covered = Self::feed_healthy(state, config, now)
-                && state.feed.coverage.borrow().programs.contains(program);
-            let max_age = if covered {
-                config.max_age_covered
-            } else {
-                config.max_age_uncovered
-            };
-            state
-                .warmed
-                .get(program)
-                .is_none_or(|warmed| now.duration_since(*warmed) >= max_age)
-        });
-        if rewarm {
+        if self.warm_start_expired(program, now) {
             let accounts = self
                 .inner
                 .get_program_accounts(program, filter_sets)
                 .await?;
-            let fetched_at = Instant::now();
-            self.with_state(|state, _| {
-                let seen: HashSet<Pubkey> = accounts.iter().map(|(pk, _)| *pk).collect();
-                accounts.into_iter().for_each(|(pk, account)| {
-                    state.indexed_keys.insert(pk);
-                    let entry = state.accounts.entry(pk).or_insert(CachedAccount {
-                        slot: 0,
-                        account: None,
-                        observed: fetched_at,
-                    });
-                    entry.account = Some(account);
-                    entry.observed = fetched_at;
-                });
-                // An account the cache still holds but the provider did not
-                // return, though it matches this very query, is gone —
-                // closed, or reassigned. Leaving it indexed would keep it in
-                // every later answer, which is the failure a re-warm exists
-                // to correct.
-                let vanished: Vec<Pubkey> = state
-                    .indexed_keys
-                    .iter()
-                    .filter(|pk| !seen.contains(*pk))
-                    .filter(|pk| {
-                        state.accounts.get(pk).is_some_and(|entry| {
-                            // Not one the feed delivered while the scan was
-                            // in flight: the provider's answer predates it,
-                            // and dropping it would lose a brand new account
-                            // until something wrote to it again.
-                            entry.observed <= now
-                                && entry.account.as_ref().is_some_and(|account| {
-                                    account.owner == *program
-                                        && matches_filters(account, filter_sets)
-                                })
-                        })
-                    })
-                    .copied()
-                    .collect();
-                vanished.iter().for_each(|pk| {
-                    state.indexed_keys.remove(pk);
-                });
-                state.warmed.insert(*program, fetched_at);
-            });
+            self.absorb_scan(program, filter_sets, accounts, now);
         }
         // The backend's subscription may be broader than this query, so the
         // caller's own filters are re-applied locally.
@@ -772,7 +797,7 @@ mod tests {
         }
 
         fn drain(&mut self) {
-            CachedSource::<crate::source::RpcSource>::drain(&mut self.state, &self.config);
+            CachedSource::<crate::rpc::RpcSource>::drain(&mut self.state, &self.config);
         }
 
         fn cached(&self, pubkey: &Pubkey) -> Option<u64> {

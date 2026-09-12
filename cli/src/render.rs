@@ -48,49 +48,14 @@ pub fn wake_detail(
             address,
             offset,
             len,
-        }) => WakeDetail {
-            kind: "on-account-change",
-            waiting_for: format!(
-                "{}[{offset}..{}]",
-                Pubkey::from(address),
-                offset as u64 + len as u64
-            ),
-            chain_reads: watched_now.map_or_else(
-                || "unreadable".to_string(),
-                |bytes| format!("0x{}", hex(bytes)),
-            ),
-            remaining: None,
-        },
+        }) => changed_detail(address, offset, len, watched_now),
         Ok(relay_spec::WakeView::OnValueCross {
             address,
             offset,
             len,
             threshold,
             cmp,
-        }) => {
-            let value = watched_now
-                .and_then(|bytes| relay_spec::read_watched_value(bytes, threshold.is_unsigned()));
-            WakeDetail {
-                kind: "on-value-cross",
-                waiting_for: format!(
-                    "{}[{offset}..{}] {} {threshold}",
-                    Pubkey::from(address),
-                    offset as u64 + len as u64,
-                    if cmp == 0 { ">=" } else { "<=" },
-                ),
-                chain_reads: value.map_or_else(
-                    || "unreadable".to_string(),
-                    |value| format!("value {value}"),
-                ),
-                remaining: value.map(|value| {
-                    if cmp == 0 {
-                        threshold.widened() - value.widened()
-                    } else {
-                        value.widened() - threshold.widened()
-                    }
-                }),
-            }
-        }
+        }) => crossed_detail(address, offset, len, threshold, cmp, watched_now),
         Err(_) => WakeDetail {
             kind: "unknown",
             waiting_for: format!("wake kind {:?}", condition.wake()),
@@ -98,6 +63,71 @@ pub fn wake_detail(
             remaining: None,
         },
     }
+}
+
+/// A change wake compares bytes, so there is no distance to report — only
+/// the range it watches and what that range reads right now.
+fn changed_detail(
+    address: [u8; 32],
+    offset: u32,
+    len: u32,
+    watched_now: Option<&[u8]>,
+) -> WakeDetail {
+    WakeDetail {
+        kind: "on-account-change",
+        waiting_for: watched_range(address, offset, len),
+        chain_reads: watched_now.map_or_else(
+            || "unreadable".to_string(),
+            |bytes| format!("0x{}", hex(bytes)),
+        ),
+        remaining: None,
+    }
+}
+
+/// A value-cross wake compares numbers, so the distance to the threshold is
+/// the useful figure — and it is signed by the comparator, so "to go" counts
+/// down in the direction the condition actually fires.
+///
+/// Six arguments because a wake variant's fields are what they are; bundling
+/// them would only rename the same five values.
+fn crossed_detail(
+    address: [u8; 32],
+    offset: u32,
+    len: u32,
+    threshold: relay_spec::WatchValue,
+    cmp: u8,
+    watched_now: Option<&[u8]>,
+) -> WakeDetail {
+    let value = watched_now
+        .and_then(|bytes| relay_spec::read_watched_value(bytes, threshold.is_unsigned()));
+    WakeDetail {
+        kind: "on-value-cross",
+        waiting_for: format!(
+            "{} {} {threshold}",
+            watched_range(address, offset, len),
+            if cmp == 0 { ">=" } else { "<=" },
+        ),
+        chain_reads: value.map_or_else(
+            || "unreadable".to_string(),
+            |value| format!("value {value}"),
+        ),
+        remaining: value.map(|value| {
+            if cmp == 0 {
+                threshold.widened() - value.widened()
+            } else {
+                value.widened() - threshold.widened()
+            }
+        }),
+    }
+}
+
+/// The account and byte range a wake watches, as `pubkey[start..end]`.
+fn watched_range(address: [u8; 32], offset: u32, len: u32) -> String {
+    format!(
+        "{}[{offset}..{}]",
+        Pubkey::from(address),
+        offset as u64 + len as u64
+    )
 }
 
 pub fn hex(bytes: &[u8]) -> String {

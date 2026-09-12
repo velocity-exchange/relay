@@ -11,6 +11,7 @@
 //! `CachedSource`.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -26,7 +27,8 @@ use yellowstone_grpc_proto::prelude::{
     subscribe_request_filter_accounts_filter_memcmp::Data as AccountsFilterMemcmpOneof,
     subscribe_update::UpdateOneof, SubscribeRequest, SubscribeRequestFilterAccounts,
     SubscribeRequestFilterAccountsFilter, SubscribeRequestFilterAccountsFilterMemcmp,
-    SubscribeRequestFilterSlots, SubscribeRequestPing,
+    SubscribeRequestFilterSlots, SubscribeRequestPing, SubscribeUpdate, SubscribeUpdateAccount,
+    SubscribeUpdateSlot,
 };
 
 use crate::feed::{AccountUpdate, Coverage, FeedSender, SlotUpdate};
@@ -165,29 +167,20 @@ fn build_request(
     }
 }
 
+/// Why a live subscription ended.
+enum SessionEnd {
+    /// The stream is gone or unusable; reconnect after a delay.
+    Reconnect,
+    /// The feed or the interest channel was dropped; the backend shuts down.
+    ShutDown,
+}
+
 async fn run(config: GrpcFeedConfig, subscriptions: Vec<ProgramSubscription>, feed: FeedSender) {
     let mut backoff = Duration::from_secs(1);
     let mut interest = feed.interest.clone();
     loop {
-        let client = GeyserGrpcClient::build_from_shared(config.endpoint.clone())
-            .and_then(|builder| builder.x_token(config.x_token.clone()))
-            .and_then(|builder| builder.tls_config(ClientTlsConfig::new().with_native_roots()));
-        let mut client = match client {
-            Ok(builder) => match builder.connect().await {
-                Ok(client) => client,
-                Err(err) => {
-                    warn!(error = %err, "grpc connect failed; retrying in {backoff:?}");
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(30));
-                    continue;
-                }
-            },
-            Err(err) => {
-                warn!(error = %err, "grpc builder failed; retrying in {backoff:?}");
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(30));
-                continue;
-            }
+        let Some(mut client) = connect(&config, &mut backoff).await else {
+            continue;
         };
 
         let request = build_request(&subscriptions, &interest.borrow_and_update());
@@ -202,110 +195,165 @@ async fn run(config: GrpcFeedConfig, subscriptions: Vec<ProgramSubscription>, fe
         };
         backoff = Duration::from_secs(1);
         // Subscribed: silence about these accounts now means "unchanged".
-        feed.set_coverage(Coverage {
-            accounts: interest.borrow().iter().copied().collect(),
-            // Only an unfiltered subscription covers every account a
-            // program owns; a filtered one says nothing about what it
-            // excludes.
-            programs: unfiltered_programs(&subscriptions),
-        });
+        publish_coverage(&feed, &interest, &subscriptions);
         debug!("grpc subscribed");
 
-        // Breaking out of this loop falls through to the delay at the
-        // bottom before reconnecting, which is deliberate: a provider that
-        // accepts connections and then immediately errors the stream would
-        // otherwise be reconnected to as fast as the loop can turn.
-        loop {
-            tokio::select! {
-                message = stream.next() => match message {
-                    Some(Ok(msg)) => match msg.update_oneof {
-                        Some(UpdateOneof::Account(update)) => {
-                            let Some(info) = update.account else { continue };
-                            let Ok(pubkey) = Pubkey::try_from(info.pubkey.as_slice()) else {
-                                continue;
-                            };
-                            let Ok(owner) = Pubkey::try_from(info.owner.as_slice()) else {
-                                continue;
-                            };
-                            let account = AccountUpdate {
-                                pubkey,
-                                account: Some(Account {
-                                    lamports: info.lamports,
-                                    data: info.data,
-                                    owner,
-                                    executable: info.executable,
-                                    rent_epoch: info.rent_epoch,
-                                }),
-                                slot: update.slot,
-                            };
-                            if feed.updates.send(account).is_err() {
-                                return; // receiver dropped: shut down
-                            }
-                        }
-                        Some(UpdateOneof::Slot(update)) => {
-                            // One event per status per slot, so only the
-                            // processed one may move the fork tip —
-                            // confirmed and finalized repeat a slot we have
-                            // already passed and would read as a switch.
-                            let event = match CommitmentLevel::try_from(update.status) {
-                                Ok(CommitmentLevel::Processed) => SlotUpdate::Processed {
-                                    slot: update.slot,
-                                    parent: update.parent,
-                                },
-                                Ok(CommitmentLevel::Finalized) => {
-                                    SlotUpdate::Rooted { slot: update.slot }
-                                }
-                                _ => continue,
-                            };
-                            feed.set_slot(event);
-                        }
-                        Some(UpdateOneof::Ping(_)) => {
-                            // Keeps ping-expecting load balancers happy.
-                            let _ = sink
-                                .send(SubscribeRequest {
-                                    ping: Some(SubscribeRequestPing { id: 1 }),
-                                    ..Default::default()
-                                })
-                                .await;
-                        }
-                        _ => {}
-                    },
-                    Some(Err(err)) => {
-                        warn!(error = %err, "grpc stream error; reconnecting");
-                        feed.set_coverage(Coverage::default());
-                        break;
-                    }
-                    None => {
-                        warn!("grpc stream ended; reconnecting");
-                        feed.set_coverage(Coverage::default());
-                        break;
-                    }
-                },
-                changed = interest.changed() => match changed {
-                    Ok(()) => {
-                        // Filter update on the live stream — no reconnect.
-                        let request =
-                            build_request(&subscriptions, &interest.borrow_and_update());
-                        if let Err(err) = sink.send(request).await {
-                            warn!(error = %err, "grpc filter update failed; reconnecting");
-                            feed.set_coverage(Coverage::default());
-                            break;
-                        }
-                        // Newly interested accounts are covered from here.
-                        // Only an unfiltered subscription covers every
-                        // account a program owns; a filtered one says
-                        // nothing about what it excludes.
-                        feed.set_coverage(Coverage {
-                            accounts: interest.borrow().iter().copied().collect(),
-                            programs: unfiltered_programs(&subscriptions),
-                        });
-                    }
-                    Err(_) => return, // interest sender dropped: shut down
-                },
-            }
+        if let SessionEnd::ShutDown =
+            pump(&mut stream, &mut sink, &feed, &mut interest, &subscriptions).await
+        {
+            return;
         }
 
+        // The delay before reconnecting is deliberate: a provider that
+        // accepts connections and then immediately errors the stream would
+        // otherwise be reconnected to as fast as the loop can turn.
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(30));
     }
+}
+
+/// One connection attempt. `None` means it failed and the delay has already
+/// been served, so the caller retries.
+async fn connect(config: &GrpcFeedConfig, backoff: &mut Duration) -> Option<GeyserGrpcClient> {
+    let built = GeyserGrpcClient::build_from_shared(config.endpoint.clone())
+        .and_then(|builder| builder.x_token(config.x_token.clone()))
+        .and_then(|builder| builder.tls_config(ClientTlsConfig::new().with_native_roots()));
+    let attempt = match built {
+        Ok(builder) => builder.connect().await.map_err(|err| format!("{err}")),
+        Err(err) => Err(format!("{err}")),
+    };
+    match attempt {
+        Ok(client) => Some(client),
+        Err(error) => {
+            warn!(%error, "grpc connect failed; retrying in {backoff:?}");
+            tokio::time::sleep(*backoff).await;
+            *backoff = (*backoff * 2).min(Duration::from_secs(30));
+            None
+        }
+    }
+}
+
+/// Vouch for what this subscription now covers.
+///
+/// Only an unfiltered subscription covers every account a program owns; a
+/// filtered one says nothing about what it excludes.
+fn publish_coverage(
+    feed: &FeedSender,
+    interest: &tokio::sync::watch::Receiver<HashSet<Pubkey>>,
+    subscriptions: &[ProgramSubscription],
+) {
+    feed.set_coverage(Coverage {
+        accounts: interest.borrow().iter().copied().collect(),
+        programs: unfiltered_programs(subscriptions),
+    });
+}
+
+/// Pump one live subscription until it dies or the interest set moves.
+async fn pump<St, Si, E>(
+    stream: &mut St,
+    sink: &mut Si,
+    feed: &FeedSender,
+    interest: &mut tokio::sync::watch::Receiver<HashSet<Pubkey>>,
+    subscriptions: &[ProgramSubscription],
+) -> SessionEnd
+where
+    St: futures_util::Stream<Item = Result<SubscribeUpdate, E>> + Unpin,
+    Si: futures_util::Sink<SubscribeRequest> + Unpin,
+    E: std::fmt::Display,
+{
+    loop {
+        tokio::select! {
+            message = stream.next() => match message {
+                Some(Ok(msg)) => match msg.update_oneof {
+                    Some(UpdateOneof::Account(update)) => match feed_account(feed, update) {
+                        ControlFlow::Continue(()) => {}
+                        ControlFlow::Break(end) => return end,
+                    },
+                    Some(UpdateOneof::Slot(update)) => feed_slot(feed, update),
+                    Some(UpdateOneof::Ping(_)) => {
+                        // Keeps ping-expecting load balancers happy.
+                        let _ = sink
+                            .send(SubscribeRequest {
+                                ping: Some(SubscribeRequestPing { id: 1 }),
+                                ..Default::default()
+                            })
+                            .await;
+                    }
+                    _ => {}
+                },
+                Some(Err(err)) => {
+                    warn!(error = %err, "grpc stream error; reconnecting");
+                    feed.set_coverage(Coverage::default());
+                    return SessionEnd::Reconnect;
+                }
+                None => {
+                    warn!("grpc stream ended; reconnecting");
+                    feed.set_coverage(Coverage::default());
+                    return SessionEnd::Reconnect;
+                }
+            },
+            changed = interest.changed() => match changed {
+                Ok(()) => {
+                    // Filter update on the live stream — no reconnect.
+                    let request = build_request(subscriptions, &interest.borrow_and_update());
+                    if sink.send(request).await.is_err() {
+                        warn!("grpc filter update failed; reconnecting");
+                        feed.set_coverage(Coverage::default());
+                        return SessionEnd::Reconnect;
+                    }
+                    // Newly interested accounts are covered from here.
+                    publish_coverage(feed, interest, subscriptions);
+                }
+                Err(_) => return SessionEnd::ShutDown, // interest sender dropped
+            },
+        }
+    }
+}
+
+/// Forward one account update, and say whether the session can continue.
+/// It cannot once the feed receiver is gone: there is nothing left to serve.
+///
+/// An update that cannot be decoded is dropped rather than reported: the
+/// stream is still good, and the next update may well be readable.
+fn feed_account(feed: &FeedSender, update: SubscribeUpdateAccount) -> ControlFlow<SessionEnd> {
+    let Some(info) = update.account else {
+        return ControlFlow::Continue(());
+    };
+    let (Ok(pubkey), Ok(owner)) = (
+        Pubkey::try_from(info.pubkey.as_slice()),
+        Pubkey::try_from(info.owner.as_slice()),
+    ) else {
+        return ControlFlow::Continue(());
+    };
+    match feed.updates.send(AccountUpdate {
+        pubkey,
+        account: Some(Account {
+            lamports: info.lamports,
+            data: info.data,
+            owner,
+            executable: info.executable,
+            rent_epoch: info.rent_epoch,
+        }),
+        slot: update.slot,
+    }) {
+        Ok(()) => ControlFlow::Continue(()),
+        Err(_) => ControlFlow::Break(SessionEnd::ShutDown),
+    }
+}
+
+/// Forward one slot event.
+///
+/// One event arrives per status per slot, so only the processed one may move
+/// the fork tip — confirmed and finalized repeat a slot already passed and
+/// would read as a switch every slot.
+fn feed_slot(feed: &FeedSender, update: SubscribeUpdateSlot) {
+    let event = match CommitmentLevel::try_from(update.status) {
+        Ok(CommitmentLevel::Processed) => SlotUpdate::Processed {
+            slot: update.slot,
+            parent: update.parent,
+        },
+        Ok(CommitmentLevel::Finalized) => SlotUpdate::Rooted { slot: update.slot },
+        _ => return,
+    };
+    feed.set_slot(event);
 }
