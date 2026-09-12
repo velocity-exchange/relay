@@ -37,6 +37,9 @@
 //!
 //! Subscriptions only replace *reads*; simulation and submission always go
 //! to RPC. Tests drive the full loop against litesvm.
+//!
+//! The decision loop itself is split by subject across [`turner`]; the
+//! submitter that owns send, confirm and resend is [`submit`].
 
 pub mod filter;
 pub mod metrics;

@@ -19,7 +19,7 @@
 use anchor_lang_v2::prelude::*;
 use relay_spec::{
     AccountRefV0, ConditionBlock, ConditionV0, CrankSpecV0, RelayBlockV0, ResolvedCrankV0,
-    KEEPER_PLACEHOLDER, RESPONSE_POINTER_LEN,
+    WatchedRegion, KEEPER_PLACEHOLDER, RESPONSE_POINTER_LEN,
 };
 use static_assertions::const_assert_eq;
 
@@ -258,12 +258,20 @@ impl BookV0 {
         );
         let _ = self.relay.write_condition(
             EVICT_CONDITION as usize,
-            &ConditionV0::on_account_change(book, ENTRY_COUNT_OFFSET as u32, 4, spec, resolvers),
+            &ConditionV0::on_account_change(
+                WatchedRegion::new(book, ENTRY_COUNT_OFFSET as u32, 4),
+                spec,
+                resolvers,
+            ),
         );
         // Cross: any change to the book at all.
         let _ = self.relay.write_condition(
             CROSS_CONDITION as usize,
-            &ConditionV0::on_account_change(book, VERSION_OFFSET as u32, 8, spec, resolvers),
+            &ConditionV0::on_account_change(
+                WatchedRegion::new(book, VERSION_OFFSET as u32, 8),
+                spec,
+                resolvers,
+            ),
         );
     }
 }

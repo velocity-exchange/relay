@@ -240,8 +240,7 @@ async fn run<S: ChainSource + ?Sized>(
     profit: watch::Sender<ProfitSnapshot>,
     lag: watch::Sender<LagSnapshot>,
 ) {
-    let mut tracked: HashMap<Signature, Tracked> = HashMap::new();
-    let mut history: HashMap<Pubkey, Vec<i64>> = HashMap::new();
+    let mut in_flight = InFlight::new(&config, profit, lag);
     let mut confirm = tokio::time::interval(config.confirm_interval);
     confirm.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -254,121 +253,156 @@ async fn run<S: ChainSource + ?Sized>(
                         // still have reached the cluster, so keep tracking.
                         warn!(signature = %pending.signature, error = %format!("{err:#}"), "send failed");
                     }
-                    metrics::IN_FLIGHT.with_label_values(&["transactions"]).inc();
-                    tracked.insert(
-                        pending.signature,
-                        Tracked {
-                            pending,
-                            resends: 0,
-                            submitted: std::time::Instant::now(),
-                        },
-                    );
+                    in_flight.track(pending);
                 }
                 None => {
                     debug!("submitter outbox closed");
                     return;
                 }
             },
-            _ = confirm.tick() => {
-                sweep(&source, &config, &mut tracked, &mut history, &profit, &lag).await;
-            }
+            _ = confirm.tick() => in_flight.sweep(source.as_ref()).await,
         }
     }
 }
 
-/// One confirmation pass: settle what landed, resend what is still valid,
-/// expire what is not.
-async fn sweep<S: ChainSource + ?Sized>(
-    source: &S,
-    config: &SubmitterConfig,
-    tracked: &mut HashMap<Signature, Tracked>,
-    history: &mut HashMap<Pubkey, Vec<i64>>,
-    profit: &watch::Sender<ProfitSnapshot>,
-    lag: &watch::Sender<LagSnapshot>,
-) {
-    if tracked.is_empty() {
-        return;
-    }
-    let signatures: Vec<Signature> = tracked.keys().copied().collect();
-    let statuses = match source.signature_statuses(&signatures).await {
-        Ok(statuses) => statuses,
-        Err(err) => {
-            warn!(error = %format!("{err:#}"), "signature status poll failed");
-            return;
-        }
-    };
-    let block_height = match source.block_height().await {
-        Ok(height) => Some(height),
-        Err(err) => {
-            // Without a height nothing can be declared expired; rebroadcast
-            // anyway, which is the harmless half.
-            warn!(error = %format!("{err:#}"), "block height poll failed");
-            None
-        }
-    };
+/// The transactions this submitter is waiting on, and the accounting their
+/// outcomes feed.
+///
+/// Every step of a confirmation pass needs the same five pieces — the
+/// config, the tracked set, the per-program history, and the two snapshot
+/// channels — so they are one context with the steps as methods.
+struct InFlight<'a> {
+    config: &'a SubmitterConfig,
+    tracked: HashMap<Signature, Tracked>,
+    /// Recent per-transaction lamport deltas, newest last, per program.
+    history: HashMap<Pubkey, Vec<i64>>,
+    profit: watch::Sender<ProfitSnapshot>,
+    lag: watch::Sender<LagSnapshot>,
+}
 
-    let settled: Vec<(Signature, TxResult)> = signatures
-        .iter()
-        .zip(statuses)
-        .filter_map(|(signature, status)| match status {
-            Some(SignatureOutcome::Landed) => Some((*signature, TxResult::Landed)),
-            Some(SignatureOutcome::Failed(err)) => Some((*signature, TxResult::Failed(err))),
-            None => None,
-        })
-        .collect();
-
-    settled.iter().for_each(|(signature, result)| {
-        if let Some(entry) = tracked.remove(signature) {
-            metrics::CONFIRM_SECONDS
-                .with_label_values(&[result_label(result)])
-                .observe(entry.submitted.elapsed().as_secs_f64());
-            record(&entry.pending, result, history, profit, lag, config);
-        }
-    });
-
-    // Past its last valid block height a transaction can never land, and no
-    // amount of resending changes that. Retire it under a distinct outcome
-    // so the caller retries promptly rather than treating it as the
-    // condition's fault.
-    let dead: Vec<Signature> = block_height
-        .map(|height| {
-            tracked
-                .iter()
-                .filter(|(_, entry)| entry.pending.last_valid_block_height < height)
-                .map(|(signature, _)| *signature)
-                .collect()
-        })
-        .unwrap_or_default();
-    for signature in dead {
-        let Some(entry) = tracked.remove(&signature) else {
-            continue;
-        };
-        metrics::CONFIRM_SECONDS
-            .with_label_values(&["expired"])
-            .observe(entry.submitted.elapsed().as_secs_f64());
-        record(
-            &entry.pending,
-            &TxResult::Expired,
-            history,
+impl<'a> InFlight<'a> {
+    fn new(
+        config: &'a SubmitterConfig,
+        profit: watch::Sender<ProfitSnapshot>,
+        lag: watch::Sender<LagSnapshot>,
+    ) -> Self {
+        Self {
+            config,
+            tracked: HashMap::new(),
+            history: HashMap::new(),
             profit,
             lag,
-            config,
+        }
+    }
+
+    /// Start waiting on a transaction that has been handed to the cluster.
+    fn track(&mut self, pending: PendingTx) {
+        metrics::IN_FLIGHT
+            .with_label_values(&["transactions"])
+            .inc();
+        self.tracked.insert(
+            pending.signature,
+            Tracked {
+                pending,
+                resends: 0,
+                submitted: std::time::Instant::now(),
+            },
         );
     }
 
-    // What is left is unconfirmed but still landable — the only state a
-    // resend can help. Rebroadcasting the same signed bytes is idempotent
-    // (identical signature, deduped by the cluster); the bound is there so
-    // a transaction nobody will ever include is not shouted about for the
-    // whole life of its blockhash.
-    for (signature, entry) in tracked
-        .iter_mut()
-        .filter(|(_, entry)| entry.resends < config.max_resends)
-    {
-        entry.resends += 1;
-        if let Err(err) = source.send_transaction(&entry.pending.transaction).await {
-            warn!(%signature, error = %format!("{err:#}"), "resend failed");
+    /// One confirmation pass: settle what landed, retire what can no longer
+    /// land, resend what still can.
+    async fn sweep<S: ChainSource + ?Sized>(&mut self, source: &S) {
+        if self.tracked.is_empty() {
+            return;
         }
+        let signatures: Vec<Signature> = self.tracked.keys().copied().collect();
+        let statuses = match source.signature_statuses(&signatures).await {
+            Ok(statuses) => statuses,
+            Err(err) => {
+                warn!(error = %format!("{err:#}"), "signature status poll failed");
+                return;
+            }
+        };
+        let block_height = match source.block_height().await {
+            Ok(height) => Some(height),
+            Err(err) => {
+                // Without a height nothing can be declared expired;
+                // rebroadcast anyway, which is the harmless half.
+                warn!(error = %format!("{err:#}"), "block height poll failed");
+                None
+            }
+        };
+
+        self.settle(&signatures, statuses);
+        if let Some(height) = block_height {
+            self.expire(height);
+        }
+        self.resend(source).await;
+    }
+
+    /// Retire everything the cluster has an outcome for.
+    fn settle(&mut self, signatures: &[Signature], statuses: Vec<Option<SignatureOutcome>>) {
+        let settled: Vec<(Signature, TxResult)> = signatures
+            .iter()
+            .zip(statuses)
+            .filter_map(|(signature, status)| match status {
+                Some(SignatureOutcome::Landed) => Some((*signature, TxResult::Landed)),
+                Some(SignatureOutcome::Failed(err)) => Some((*signature, TxResult::Failed(err))),
+                None => None,
+            })
+            .collect();
+        settled.into_iter().for_each(|(signature, result)| {
+            self.retire(&signature, &result, result_label(&result))
+        });
+    }
+
+    /// Retire everything whose blockhash is dead.
+    ///
+    /// Past its last valid block height a transaction can never land, and no
+    /// amount of resending changes that. Retiring it under a distinct outcome
+    /// is what makes the caller retry promptly rather than treat it as the
+    /// condition's fault.
+    fn expire(&mut self, block_height: u64) {
+        let dead: Vec<Signature> = self
+            .tracked
+            .iter()
+            .filter(|(_, entry)| entry.pending.last_valid_block_height < block_height)
+            .map(|(signature, _)| *signature)
+            .collect();
+        dead.iter()
+            .for_each(|signature| self.retire(signature, &TxResult::Expired, "expired"));
+    }
+
+    /// Rebroadcast what is unconfirmed but still landable — the only state a
+    /// resend can help.
+    ///
+    /// Rebroadcasting the same signed bytes is idempotent: the signature is
+    /// identical, so the cluster dedups it. The bound is there so a
+    /// transaction nobody will ever include is not shouted about for the
+    /// whole life of its blockhash.
+    async fn resend<S: ChainSource + ?Sized>(&mut self, source: &S) {
+        for (signature, entry) in self
+            .tracked
+            .iter_mut()
+            .filter(|(_, entry)| entry.resends < self.config.max_resends)
+        {
+            entry.resends += 1;
+            if let Err(err) = source.send_transaction(&entry.pending.transaction).await {
+                warn!(%signature, error = %format!("{err:#}"), "resend failed");
+            }
+        }
+    }
+
+    /// Drop one tracked transaction and book its outcome.
+    fn retire(&mut self, signature: &Signature, result: &TxResult, latency: &str) {
+        let Some(entry) = self.tracked.remove(signature) else {
+            return;
+        };
+        metrics::CONFIRM_SECONDS
+            .with_label_values(&[latency])
+            .observe(entry.submitted.elapsed().as_secs_f64());
+        self.record(&entry.pending, result);
     }
 }
 
@@ -405,75 +439,72 @@ fn next_delay(current: u64, result: &TxResult, step: u64, max: u64) -> u64 {
     }
 }
 
-fn record(
-    pending: &PendingTx,
-    result: &TxResult,
-    history: &mut HashMap<Pubkey, Vec<i64>>,
-    profit: &watch::Sender<ProfitSnapshot>,
-    lag: &watch::Sender<LagSnapshot>,
-    config: &SubmitterConfig,
-) {
-    metrics::IN_FLIGHT
-        .with_label_values(&["transactions"])
-        .dec();
-    let program = metrics::program_label(&pending.program);
-    metrics::TRANSACTIONS
-        .with_label_values(&[result_label(result)])
-        .inc();
-    if let TxResult::Failed(err) = result {
-        info!(signature = %pending.signature, error = %err, "transaction failed on chain");
-    }
+impl InFlight<'_> {
+    /// Book one outcome: the metrics, the rolling profit, and the adaptive
+    /// contention delay all come off the same result.
+    fn record(&mut self, pending: &PendingTx, result: &TxResult) {
+        metrics::IN_FLIGHT
+            .with_label_values(&["transactions"])
+            .dec();
+        let program = metrics::program_label(&pending.program);
+        metrics::TRANSACTIONS
+            .with_label_values(&[result_label(result)])
+            .inc();
+        if let TxResult::Failed(err) = result {
+            info!(signature = %pending.signature, error = %err, "transaction failed on chain");
+        }
 
-    // Profit accounting: a landed crank earns its payment, anything else
-    // just burned a fee. Both are approximations good enough to steer with.
-    let delta = match result {
-        TxResult::Landed => {
-            metrics::LAMPORTS
-                .with_label_values(&["earned", &program])
-                .inc_by(pending.expected_payment);
-            pending.expected_payment as i64
-        }
-        _ => {
-            metrics::LAMPORTS
-                .with_label_values(&["spent", &program])
-                .inc_by(5000);
-            -5000
-        }
-    };
-    // Adaptive contention delay, from the same outcome.
-    if config.contention_step_slots > 0 {
-        lag.send_modify(|snapshot| {
-            let slots = snapshot.entry(pending.program).or_insert(0);
-            let next = next_delay(
-                *slots,
-                result,
-                config.contention_step_slots,
-                config.max_contention_slots,
-            );
-            if next != *slots {
-                debug!(
-                    program = %pending.program,
-                    from = *slots,
-                    to = next,
-                    "contention delay adjusted"
-                );
+        // Profit accounting: a landed crank earns its payment, anything else
+        // just burned a fee. Both are approximations good enough to steer with.
+        let delta = match result {
+            TxResult::Landed => {
+                metrics::LAMPORTS
+                    .with_label_values(&["earned", &program])
+                    .inc_by(pending.expected_payment);
+                pending.expected_payment as i64
             }
-            *slots = next;
-            metrics::CONTENTION_DELAY
-                .with_label_values(&[&program])
-                .set(next as i64);
+            _ => {
+                metrics::LAMPORTS
+                    .with_label_values(&["spent", &program])
+                    .inc_by(5000);
+                -5000
+            }
+        };
+        // Adaptive contention delay, from the same outcome.
+        if self.config.contention_step_slots > 0 {
+            self.lag.send_modify(|snapshot| {
+                let slots = snapshot.entry(pending.program).or_insert(0);
+                let next = next_delay(
+                    *slots,
+                    result,
+                    self.config.contention_step_slots,
+                    self.config.max_contention_slots,
+                );
+                if next != *slots {
+                    debug!(
+                        program = %pending.program,
+                        from = *slots,
+                        to = next,
+                        "contention delay adjusted"
+                    );
+                }
+                *slots = next;
+                metrics::CONTENTION_DELAY
+                    .with_label_values(&[&program])
+                    .set(next as i64);
+            });
+        }
+
+        let entries = self.history.entry(pending.program).or_default();
+        entries.push(delta);
+        if entries.len() > self.config.profit_window {
+            entries.remove(0);
+        }
+        let net: i64 = entries.iter().sum();
+        self.profit.send_modify(|snapshot| {
+            snapshot.insert(pending.program, net);
         });
     }
-
-    let entries = history.entry(pending.program).or_default();
-    entries.push(delta);
-    if entries.len() > config.profit_window {
-        entries.remove(0);
-    }
-    let net: i64 = entries.iter().sum();
-    profit.send_modify(|snapshot| {
-        snapshot.insert(pending.program, net);
-    });
 }
 
 #[cfg(test)]
@@ -551,6 +582,18 @@ mod tests {
         }
     }
 
+    /// One in-flight transaction, waiting on a confirmation that never comes.
+    fn tracking_one<'a>(
+        config: &'a SubmitterConfig,
+        last_valid_block_height: u64,
+    ) -> (InFlight<'a>, watch::Receiver<LagSnapshot>) {
+        let (profit, _) = watch::channel(ProfitSnapshot::new());
+        let (lag, lag_rx) = watch::channel(LagSnapshot::new());
+        let mut in_flight = InFlight::new(config, profit, lag);
+        in_flight.tracked = tracked_one(last_valid_block_height);
+        (in_flight, lag_rx)
+    }
+
     fn tracked_one(last_valid_block_height: u64) -> HashMap<Signature, Tracked> {
         let signature = Signature::new_unique();
         let pending = PendingTx {
@@ -585,16 +628,17 @@ mod tests {
             max_resends: 2,
             ..SubmitterConfig::default()
         };
-        let mut tracked = tracked_one(200);
-        let mut history = HashMap::new();
-        let (profit, _p) = watch::channel(ProfitSnapshot::new());
-        let (lag, _l) = watch::channel(LagSnapshot::new());
+        let (mut in_flight, _lag) = tracking_one(&config, 200);
 
         for _ in 0..4 {
-            sweep(&source, &config, &mut tracked, &mut history, &profit, &lag).await;
+            in_flight.sweep(&source).await;
         }
         assert_eq!(source.sends(), 2, "rebroadcasts are bounded by max_resends");
-        assert_eq!(tracked.len(), 1, "a landable transaction stays tracked");
+        assert_eq!(
+            in_flight.tracked.len(),
+            1,
+            "a landable transaction stays tracked"
+        );
     }
 
     /// Past its last valid block height there is nothing left to try:
@@ -604,15 +648,15 @@ mod tests {
     async fn a_dead_blockhash_expires_immediately_without_resending() {
         let source = Recorder::new(300);
         let config = SubmitterConfig::default();
-        let mut tracked = tracked_one(200);
-        let program = tracked.values().next().unwrap().pending.program;
-        let mut history = HashMap::new();
-        let (profit, _p) = watch::channel(ProfitSnapshot::new());
-        let (lag, mut lag_rx) = watch::channel(LagSnapshot::new());
+        let (mut in_flight, mut lag_rx) = tracking_one(&config, 200);
+        let program = in_flight.tracked.values().next().unwrap().pending.program;
 
-        sweep(&source, &config, &mut tracked, &mut history, &profit, &lag).await;
+        in_flight.sweep(&source).await;
         assert_eq!(source.sends(), 0, "an expired blockhash cannot land");
-        assert!(tracked.is_empty(), "expired transactions are retired");
+        assert!(
+            in_flight.tracked.is_empty(),
+            "expired transactions are retired"
+        );
         // Expiry is congestion, not a lost race: it must not ramp the delay.
         assert_eq!(lag_rx.borrow_and_update().get(&program).copied(), Some(0));
     }
