@@ -32,7 +32,7 @@ use solana_sdk::account::Account;
 use solana_sdk::clock::Clock;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
-use solana_sdk::transaction::Transaction;
+use solana_sdk::transaction::VersionedTransaction;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -185,7 +185,7 @@ impl<Inner: ChainSource> LocalSimSource<Inner> {
     /// Populate `instance` with everything `tx` touches, then run it.
     async fn simulate_locally(
         &self,
-        tx: &Transaction,
+        tx: &VersionedTransaction,
         keys: &[Pubkey],
         accounts: &[Option<Account>],
         return_accounts: &[Pubkey],
@@ -208,7 +208,7 @@ impl<Inner: ChainSource> LocalSimSource<Inner> {
     fn load_and_run(
         &self,
         instance: &mut Instance,
-        tx: &Transaction,
+        tx: &VersionedTransaction,
         chain: &Snapshot<'_>,
         return_accounts: &[Pubkey],
     ) -> Result<SimOutcome> {
@@ -575,12 +575,14 @@ impl<Inner: ChainSource> ChainSource for LocalSimSource<Inner> {
     /// The whole point: simulate in-process, never over RPC.
     async fn simulate_transaction(
         &self,
-        tx: &Transaction,
+        tx: &VersionedTransaction,
         return_accounts: &[Pubkey],
     ) -> Result<SimOutcome> {
         // One read of everything the transaction touches. Cache-first, so
-        // only genuinely cold accounts reach the network.
-        let keys: Vec<Pubkey> = tx.message.account_keys.clone();
+        // only genuinely cold accounts reach the network. A v1 message
+        // carries every address inline, so the static keys are the whole
+        // set.
+        let keys: Vec<Pubkey> = tx.message.static_account_keys().to_vec();
         let accounts = self.inner.get_multiple_accounts(&keys).await?;
         // Programs the transaction can reach may need their programdata
         // seeded before their ELF can be recovered. That is every
@@ -602,7 +604,7 @@ impl<Inner: ChainSource> ChainSource for LocalSimSource<Inner> {
         outcome
     }
 
-    async fn send_transaction(&self, tx: &Transaction) -> Result<Signature> {
+    async fn send_transaction(&self, tx: &VersionedTransaction) -> Result<Signature> {
         self.inner.send_transaction(tx).await
     }
 }
@@ -614,6 +616,7 @@ mod tests {
     use solana_sdk::hash::Hash;
     use solana_sdk::instruction::{AccountMeta, Instruction};
     use solana_sdk::signature::{Keypair, Signer};
+    use solana_sdk::transaction::Transaction;
 
     use super::*;
     use crate::source::{
@@ -667,12 +670,12 @@ mod tests {
         }
         async fn simulate_transaction(
             &self,
-            _tx: &Transaction,
+            _tx: &VersionedTransaction,
             _return_accounts: &[Pubkey],
         ) -> Result<SimOutcome> {
             unreachable!("local sim must never fall through to the provider")
         }
-        async fn send_transaction(&self, _tx: &Transaction) -> Result<Signature> {
+        async fn send_transaction(&self, _tx: &VersionedTransaction) -> Result<Signature> {
             unreachable!()
         }
         async fn recent_priority_fee(&self, _accounts: &[Pubkey]) -> Result<u64> {
@@ -748,7 +751,10 @@ mod tests {
             Hash::default(),
         );
 
-        let outcome = local.simulate_transaction(&tx, &[]).await.unwrap();
+        let outcome = local
+            .simulate_transaction(&VersionedTransaction::from(tx), &[])
+            .await
+            .unwrap();
         assert_eq!(outcome.err, None, "logs: {:?}", outcome.logs);
         let instance = local.pool.lock().await.pop().expect("instance pooled");
         assert!(
@@ -807,7 +813,10 @@ mod tests {
             )
         };
 
-        local.simulate_transaction(&tx(&payer), &[]).await.unwrap();
+        local
+            .simulate_transaction(&VersionedTransaction::from(tx(&payer)), &[])
+            .await
+            .unwrap();
         {
             let pool = local.pool.lock().await;
             let seeded = pool[0].svm.get_account(&closing).expect("seeded");
@@ -815,7 +824,10 @@ mod tests {
         }
 
         local.inner().close(&closing);
-        local.simulate_transaction(&tx(&payer), &[]).await.unwrap();
+        local
+            .simulate_transaction(&VersionedTransaction::from(tx(&payer)), &[])
+            .await
+            .unwrap();
         let pool = local.pool.lock().await;
         let after = pool[0].svm.get_account(&closing).unwrap_or_default();
         assert_eq!(after.lamports, 0, "closed account survived in the bank");

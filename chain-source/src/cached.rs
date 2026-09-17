@@ -52,7 +52,7 @@ use solana_sdk::clock::Clock;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use solana_sdk::sysvar;
-use solana_sdk::transaction::Transaction;
+use solana_sdk::transaction::VersionedTransaction;
 
 use tracing::warn;
 
@@ -515,13 +515,13 @@ impl<Inner: ChainSource> ChainSource for CachedSource<Inner> {
 
     async fn simulate_transaction(
         &self,
-        tx: &Transaction,
+        tx: &VersionedTransaction,
         return_accounts: &[Pubkey],
     ) -> Result<SimOutcome> {
         self.inner.simulate_transaction(tx, return_accounts).await
     }
 
-    async fn send_transaction(&self, tx: &Transaction) -> Result<Signature> {
+    async fn send_transaction(&self, tx: &VersionedTransaction) -> Result<Signature> {
         self.inner.send_transaction(tx).await
     }
 }
@@ -547,7 +547,7 @@ mod tests {
     use super::*;
     use crate::feed::{feed_channel, AccountUpdate};
     use crate::{BlockhashInfo, SignatureOutcome, SimOutcome};
-    use solana_sdk::{signature::Signature, transaction::Transaction};
+    use solana_sdk::signature::Signature;
 
     /// A program-account provider the test drives: it counts the queries it
     /// answers and its answer can change between them, which is the whole
@@ -617,12 +617,12 @@ mod tests {
         }
         async fn simulate_transaction(
             &self,
-            _tx: &Transaction,
+            _tx: &VersionedTransaction,
             _return_accounts: &[Pubkey],
         ) -> Result<SimOutcome> {
             unreachable!()
         }
-        async fn send_transaction(&self, _tx: &Transaction) -> Result<Signature> {
+        async fn send_transaction(&self, _tx: &VersionedTransaction) -> Result<Signature> {
             unreachable!()
         }
         async fn recent_priority_fee(&self, _accounts: &[Pubkey]) -> Result<u64> {

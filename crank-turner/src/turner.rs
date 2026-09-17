@@ -18,14 +18,15 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use relay_spec as spec;
-use solana_compute_budget_interface::ComputeBudgetInstruction;
+use solana_message::v1;
 use solana_sdk::account::Account;
+use solana_sdk::hash::Hash;
 use solana_sdk::instruction::{AccountMeta, Instruction};
-use solana_sdk::message::Message;
+use solana_sdk::message::VersionedMessage;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature};
 use solana_sdk::signer::Signer;
-use solana_sdk::transaction::Transaction;
+use solana_sdk::transaction::VersionedTransaction;
 
 use tracing::warn;
 
@@ -210,9 +211,6 @@ pub struct TurnerConfig {
 /// never the thing that fails.
 const MAX_COMPUTE_UNITS: u32 = 1_400_000;
 
-/// Solana's packet limit.
-const MAX_TRANSACTION_BYTES: usize = 1232;
-
 /// The condition an outcome belongs to.
 fn outcome_key(outcome: &Outcome) -> CondKey {
     match outcome {
@@ -234,13 +232,6 @@ static TOKEN_PROGRAM_ID: std::sync::LazyLock<Pubkey> = std::sync::LazyLock::new(
         .expect("valid program id")
 });
 const SYNC_NATIVE_TAG: u8 = 17;
-
-/// `ComputeBudget111111111111111111111111111111`.
-static COMPUTE_BUDGET_PROGRAM_ID: std::sync::LazyLock<Pubkey> = std::sync::LazyLock::new(|| {
-    "ComputeBudget111111111111111111111111111111"
-        .parse()
-        .expect("valid program id")
-});
 
 /// System program id (the all-zero address), required by
 /// `begin_guard_v0`'s lazy guard-account creation.
@@ -469,10 +460,20 @@ impl<S: ChainSource> Turner<S> {
     /// debugging tool can show what would be sent and then send exactly
     /// that, rather than re-deriving it.
     pub async fn send_explained(&self, explanation: &Explanation) -> Result<Signature> {
-        let Verdict::WouldSend { instructions, .. } = &explanation.verdict else {
+        let Verdict::WouldSend {
+            instructions,
+            units,
+            ..
+        } = &explanation.verdict
+        else {
             anyhow::bail!("nothing to send: {:?}", explanation.verdict);
         };
-        let (tx, _units) = self.sign_for_submission(instructions).await?;
+        // The explained instructions are the body alone. A v1 message that
+        // names no budget requests zero compute units, so the budget the
+        // daemon would have applied is rebuilt from the units the
+        // explanation already measured.
+        let config = self.tx_config(compute_limit(*units), self.priority_fee());
+        let (tx, _) = self.sign_for_submission(instructions, config).await?;
         self.source.send_transaction(&tx).await
     }
 
@@ -1013,7 +1014,12 @@ impl<S: ChainSource> Turner<S> {
             metrics::program_label(&Pubkey::from(condition.crank_spec().resolver_program));
         let sim = {
             let started = Instant::now();
-            let (tx, _) = self.signed_tx(&[resolver_ix]).await?;
+            // A v1 message grants only the budget it names, so the probe
+            // ceiling is requested here. A resolver that is not given one
+            // runs out of compute instead of reporting its work.
+            let (tx, _) = self
+                .signed_tx(&[resolver_ix], self.tx_config(MAX_COMPUTE_UNITS, 0))
+                .await?;
             let sim = self
                 .source
                 .simulate_transaction(&tx, &resolver_accounts)
@@ -1113,8 +1119,9 @@ impl<S: ChainSource> Turner<S> {
         // on the limit you request, not the units you burn.
         let executor_label = metrics::program_label(&program);
         let started = Instant::now();
-        let probe = self.with_compute_budget(ixs.clone(), MAX_COMPUTE_UNITS, 0);
-        let (probe_tx, _) = self.signed_tx(&probe).await?;
+        let (probe_tx, _) = self
+            .signed_tx(&ixs, self.tx_config(MAX_COMPUTE_UNITS, 0))
+            .await?;
         let sim = self.source.simulate_transaction(&probe_tx, &[]).await?;
         metrics::STAGE_SECONDS
             .with_label_values(&["execute_sim", &executor_label])
@@ -1147,8 +1154,9 @@ impl<S: ChainSource> Turner<S> {
         let required = condition.min_payment().max(self.required_payment(units));
         let ixs = if required > condition.min_payment() {
             let repriced = self.guarded(executor_ix, payout, &program, required);
-            let priced = self.with_compute_budget(repriced.clone(), MAX_COMPUTE_UNITS, 0);
-            let (priced_tx, _) = self.signed_tx(&priced).await?;
+            let (priced_tx, _) = self
+                .signed_tx(&repriced, self.tx_config(MAX_COMPUTE_UNITS, 0))
+                .await?;
             let recheck = self.source.simulate_transaction(&priced_tx, &[]).await?;
             if recheck.err.is_some() {
                 metrics::SKIPS
@@ -1210,8 +1218,8 @@ impl<S: ChainSource> Turner<S> {
                 }
                 continue;
             };
-            let ixs = self.with_compute_budget(body, units, self.priority_fee());
-            match self.sign_for_submission(&ixs).await {
+            let config = self.tx_config(units, self.priority_fee());
+            match self.sign_for_submission(&body, config).await {
                 Ok((tx, expiry)) => self.finish_pack(&pack, tx, expiry, outcomes, updates).await,
                 Err(err) => pack.iter().for_each(|p| {
                     outcomes.push(Outcome::Failed {
@@ -1228,8 +1236,10 @@ impl<S: ChainSource> Turner<S> {
     /// Simulate an instruction body with a generous budget, returning the
     /// compute limit to actually request. `None` means it did not simulate.
     async fn measure(&self, body: &[Instruction]) -> Option<u32> {
-        let probe = self.with_compute_budget(body.to_vec(), MAX_COMPUTE_UNITS, 0);
-        let (tx, _) = self.signed_tx(&probe).await.ok()?;
+        let (tx, _) = self
+            .signed_tx(body, self.tx_config(MAX_COMPUTE_UNITS, 0))
+            .await
+            .ok()?;
         let sim = self.source.simulate_transaction(&tx, &[]).await.ok()?;
         sim.err.is_none().then(|| compute_limit(sim.units_consumed))
     }
@@ -1246,8 +1256,8 @@ impl<S: ChainSource> Turner<S> {
             .measure(&body)
             .await
             .unwrap_or_else(|| compute_limit(single.units));
-        let ixs = self.with_compute_budget(body, units, self.priority_fee());
-        match self.sign_for_submission(&ixs).await {
+        let config = self.tx_config(units, self.priority_fee());
+        match self.sign_for_submission(&body, config).await {
             Ok((tx, expiry)) => {
                 self.finish_pack(std::slice::from_ref(single), tx, expiry, outcomes, updates)
                     .await
@@ -1267,7 +1277,7 @@ impl<S: ChainSource> Turner<S> {
     async fn finish_pack(
         &self,
         pack: &[Prepared],
-        tx: Transaction,
+        tx: VersionedTransaction,
         expiry: u64,
         outcomes: &mut Vec<Outcome>,
         updates: &mut Vec<(CondKey, StateUpdate)>,
@@ -1344,21 +1354,27 @@ impl<S: ChainSource> Turner<S> {
         packs
     }
 
-    /// Exact size check: build and serialize, no estimating. Signed with
-    /// the worst-case compute-budget values so the measurement bounds the
-    /// real transaction.
+    /// Exact size check: build the transaction and measure it, no
+    /// estimating. Signed with the worst-case budget so the measurement
+    /// bounds the real transaction.
+    ///
+    /// v1 caps four things, not just bytes. A pack that fits in 4096 bytes
+    /// can still carry too many addresses or instructions, and each of
+    /// those is a sanitization failure: the transaction never executes, so
+    /// it reports no error to act on.
     async fn fits(&self, pack: &[Prepared]) -> bool {
-        let ixs = self.with_compute_budget(
-            pack.iter().flat_map(|p| p.ixs.iter().cloned()).collect(),
-            MAX_COMPUTE_UNITS,
-            u64::MAX,
-        );
-        match self.signed_tx(&ixs).await {
-            Ok((tx, _)) => bincode::serialize(&tx)
-                .map(|bytes| bytes.len() <= MAX_TRANSACTION_BYTES)
-                .unwrap_or(false),
-            Err(_) => false,
-        }
+        let ixs: Vec<Instruction> = pack.iter().flat_map(|p| p.ixs.iter().cloned()).collect();
+        let config = self.tx_config(MAX_COMPUTE_UNITS, u64::MAX);
+        let Ok((tx, _)) = self.signed_tx(&ixs, config).await else {
+            return false;
+        };
+        let VersionedMessage::V1(message) = &tx.message else {
+            return false;
+        };
+        v1_transaction_size(message, tx.signatures.len()) <= v1::MAX_TRANSACTION_SIZE
+            && message.account_keys.len() <= usize::from(v1::MAX_ADDRESSES)
+            && message.instructions.len() <= usize::from(v1::MAX_INSTRUCTIONS)
+            && message.header.num_required_signatures <= v1::MAX_SIGNATURES
     }
 
     /// Hand a signed transaction to the submitter, or send it inline when
@@ -1366,7 +1382,7 @@ impl<S: ChainSource> Turner<S> {
     /// turner signed it — so nothing here waits on the cluster.
     async fn submit(
         &self,
-        tx: Transaction,
+        tx: VersionedTransaction,
         program: Pubkey,
         expected_payment: u64,
         last_valid_block_height: u64,
@@ -1455,8 +1471,10 @@ impl<S: ChainSource> Turner<S> {
             .measure(std::slice::from_ref(&sync))
             .await
             .unwrap_or(10_000);
-        let ixs = self.with_compute_budget(vec![sync], units, self.priority_fee());
-        let (tx, expiry) = self.sign_for_submission(&ixs).await?;
+        let config = self.tx_config(units, self.priority_fee());
+        let (tx, expiry) = self
+            .sign_for_submission(std::slice::from_ref(&sync), config)
+            .await?;
         let signature = self.submit(tx, *TOKEN_PROGRAM_ID, 0, expiry).await?;
         Ok(Some(signature))
     }
@@ -1470,35 +1488,25 @@ impl<S: ChainSource> Turner<S> {
         .0
     }
 
-    /// Prepend compute-budget instructions: an explicit unit limit (fees
-    /// are billed on the *requested* limit, so the default 200k×ixs is
-    /// both wasteful and, for a multi-crank transaction, too small) and a
-    /// priority fee.
+    /// The compute budget for one transaction.
     ///
-    /// The loaded-accounts data size limit goes at the *end*. It is billed on
-    /// the requested figure for the same reason as the unit limit, and its
-    /// default is 64 MiB — but the runtime finds compute-budget instructions
-    /// by program id wherever they sit, while an instruction added at the
-    /// front shifts every index behind it. A guard triple is addressed by
-    /// position within the pack, so the tail is the safe end to grow.
-    fn with_compute_budget(
-        &self,
-        ixs: Vec<Instruction>,
-        units: u32,
-        price: u64,
-    ) -> Vec<Instruction> {
-        [
-            ComputeBudgetInstruction::set_compute_unit_limit(units),
-            ComputeBudgetInstruction::set_compute_unit_price(price),
-        ]
-        .into_iter()
-        .chain(ixs)
-        .chain(std::iter::once(
-            ComputeBudgetInstruction::set_loaded_accounts_data_size_limit(
-                self.config.loaded_accounts_data_size,
-            ),
-        ))
-        .collect()
+    /// A v1 message carries the budget in its own header, so the budget is
+    /// not an instruction. Nothing is prepended to the instruction list, so
+    /// a guard triple keeps the position it was packed at.
+    ///
+    /// Every field is set on purpose. A v1 field left out is zero rather
+    /// than a default, and a transaction that requests zero compute units
+    /// or zero loaded-accounts data cannot land.
+    ///
+    /// `price_per_unit` is micro-lamports per compute unit, which is what
+    /// the RPC reports and what the turner bids in. v1 states the priority
+    /// fee as a total in lamports, so it is converted here with the same
+    /// arithmetic that prices the crank in `required_payment`.
+    fn tx_config(&self, units: u32, price_per_unit: u64) -> v1::TransactionConfig {
+        v1::TransactionConfig::empty()
+            .with_compute_unit_limit(units)
+            .with_loaded_accounts_data_size_limit(self.config.loaded_accounts_data_size)
+            .with_priority_fee(priority_fee_lamports(price_per_unit, units))
     }
 
     /// Slots to hold a program's cranks back by. Zero without a submitter,
@@ -1572,13 +1580,24 @@ impl<S: ChainSource> Turner<S> {
     pub fn signer_leak(&self, ixs: &[Instruction]) -> Option<Pubkey> {
         // Compile to learn which accounts this transaction will actually
         // present as signers, rather than assuming it is just the payer.
-        let message = Message::new(ixs, Some(&self.keeper.pubkey()));
-        let signers = &message.account_keys[..message.header.num_required_signatures as usize];
+        // Neither the blockhash nor the budget moves a key, so both are
+        // placeholders here. A list that does not compile cannot be signed
+        // either, and the fee payer signs every transaction the turner
+        // builds, so it is the safe answer when the compile fails.
+        let compiled = v1::Message::try_compile_with_config(
+            &self.keeper.pubkey(),
+            ixs,
+            Hash::default(),
+            v1::TransactionConfig::empty(),
+        )
+        .ok();
+        let payer = [self.keeper.pubkey()];
+        let signers = compiled.as_ref().map_or(&payer[..], |message| {
+            &message.account_keys[..message.header.num_required_signatures as usize]
+        });
         ixs.iter()
             .filter(|ix| {
-                !is_own_guard(ix, &self.config.relay_program)
-                    && ix.program_id != *COMPUTE_BUDGET_PROGRAM_ID
-                    && !self.trusts(&ix.program_id)
+                !is_own_guard(ix, &self.config.relay_program) && !self.trusts(&ix.program_id)
             })
             .find(|ix| {
                 // Two ways an executor can end up holding a signature.
@@ -1596,7 +1615,11 @@ impl<S: ChainSource> Turner<S> {
 
     /// Sign a transaction that is about to be submitted, refusing to sign
     /// one that would hand a signing account to an untrusted program.
-    async fn sign_for_submission(&self, ixs: &[Instruction]) -> Result<(Transaction, u64)> {
+    async fn sign_for_submission(
+        &self,
+        ixs: &[Instruction],
+        config: v1::TransactionConfig,
+    ) -> Result<(VersionedTransaction, u64)> {
         if let Some(program) = self.signer_leak(ixs) {
             metrics::FAILURES
                 .with_label_values(&["signer_leak", &metrics::program_label(&program)])
@@ -1606,26 +1629,27 @@ impl<S: ChainSource> Turner<S> {
                  which signs this transaction"
             );
         }
-        self.signed_tx(ixs).await
+        self.signed_tx(ixs, config).await
     }
 
     /// Sign against the shared blockhash the submitter keeps refreshed,
     /// falling back to a direct fetch when running without one. Returns
     /// the block height past which the transaction can no longer land.
-    async fn signed_tx(&self, ixs: &[Instruction]) -> Result<(Transaction, u64)> {
+    async fn signed_tx(
+        &self,
+        ixs: &[Instruction],
+        config: v1::TransactionConfig,
+    ) -> Result<(VersionedTransaction, u64)> {
         let info = match self.submitter.as_ref().and_then(|s| s.cached_blockhash()) {
             Some(info) => info,
             None => self.source.latest_blockhash().await?,
         };
-        Ok((
-            Transaction::new_signed_with_payer(
-                ixs,
-                Some(&self.keeper.pubkey()),
-                &[&self.keeper],
-                info.hash,
-            ),
-            info.last_valid_block_height,
-        ))
+        let message =
+            v1::Message::try_compile_with_config(&self.keeper.pubkey(), ixs, info.hash, config)
+                .context("compile the v1 message")?;
+        let tx = VersionedTransaction::try_new(VersionedMessage::V1(message), &[&self.keeper])
+            .context("sign the transaction")?;
+        Ok((tx, info.last_valid_block_height))
     }
 
     async fn load_map(&self, pubkeys: &[Pubkey]) -> Result<HashMap<Pubkey, Account>> {
@@ -1745,7 +1769,8 @@ struct Prepared {
     min_payment: u64,
     /// Compute units this crank alone consumed in simulation.
     units: u64,
-    /// `[begin_guard, executor, assert_paid]`, without compute budget.
+    /// `[begin_guard, executor, assert_paid]`. The compute budget is not
+    /// here: a v1 message carries it in its own header.
     ixs: Vec<Instruction>,
 }
 
@@ -1835,12 +1860,32 @@ fn required_payment(price_per_unit: u64, units: u32, margin: u64) -> u64 {
     /// Lamports the runtime charges per signature; a crank carries one, the
     /// turner's own fee payer.
     const BASE_FEE_LAMPORTS: u64 = 5_000;
-    let priority = (price_per_unit as u128)
+    BASE_FEE_LAMPORTS
+        .saturating_add(priority_fee_lamports(price_per_unit, units))
+        .saturating_add(margin)
+}
+
+/// The priority fee in lamports for `units` compute units bid at
+/// `price_per_unit` micro-lamports each.
+///
+/// A v1 message states the priority fee as a total in lamports, while the
+/// RPC reports a rate per compute unit. One function does the conversion so
+/// the fee the turner bids and the fee it charges the crank for cannot
+/// drift apart. Rounded up, because the runtime charges whole lamports.
+fn priority_fee_lamports(price_per_unit: u64, units: u32) -> u64 {
+    let fee = (price_per_unit as u128)
         .saturating_mul(u128::from(units))
         .div_ceil(1_000_000);
-    BASE_FEE_LAMPORTS
-        .saturating_add(u64::try_from(priority).unwrap_or(u64::MAX))
-        .saturating_add(margin)
+    u64::try_from(fee).unwrap_or(u64::MAX)
+}
+
+/// Serialized size of a signed v1 transaction, in bytes.
+///
+/// The wire form is the version prefix byte, then the message, then the
+/// signatures as a fixed-length array with no length prefix.
+fn v1_transaction_size(message: &v1::Message, signatures: usize) -> usize {
+    const VERSION_PREFIX_BYTES: usize = 1;
+    VERSION_PREFIX_BYTES + message.size() + signatures * v1::SIGNATURE_SIZE
 }
 
 fn skip_label(reason: &SkipReason) -> &'static str {

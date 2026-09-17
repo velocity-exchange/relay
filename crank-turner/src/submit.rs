@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
-use solana_sdk::transaction::Transaction;
+use solana_sdk::transaction::VersionedTransaction;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
@@ -48,7 +48,7 @@ pub enum TxResult {
 /// A signed transaction plus what the submitter needs to account for it.
 #[derive(Debug, Clone)]
 pub struct PendingTx {
-    pub transaction: Transaction,
+    pub transaction: VersionedTransaction,
     pub signature: Signature,
     /// Target program, for per-program metrics and profitability.
     pub program: Pubkey,
@@ -478,6 +478,8 @@ fn record(
 
 #[cfg(test)]
 mod tests {
+    use solana_sdk::transaction::Transaction;
+
     use super::*;
 
     fn failed() -> TxResult {
@@ -539,12 +541,12 @@ mod tests {
         }
         async fn simulate_transaction(
             &self,
-            _tx: &Transaction,
+            _tx: &VersionedTransaction,
             _return_accounts: &[Pubkey],
         ) -> anyhow::Result<relay_chain_source::SimOutcome> {
             unreachable!()
         }
-        async fn send_transaction(&self, tx: &Transaction) -> anyhow::Result<Signature> {
+        async fn send_transaction(&self, tx: &VersionedTransaction) -> anyhow::Result<Signature> {
             let signature = tx.signatures[0];
             self.sends.lock().unwrap().push(signature);
             Ok(signature)
@@ -554,10 +556,10 @@ mod tests {
     fn tracked_one(last_valid_block_height: u64) -> HashMap<Signature, Tracked> {
         let signature = Signature::new_unique();
         let pending = PendingTx {
-            transaction: Transaction {
+            transaction: VersionedTransaction::from(Transaction {
                 signatures: vec![signature],
                 ..Default::default()
-            },
+            }),
             signature,
             program: Pubkey::new_unique(),
             expected_payment: 5_000,

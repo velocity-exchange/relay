@@ -13,7 +13,7 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use base64::Engine as _;
 use futures_util::StreamExt;
-use solana_account_decoder::{UiAccountData, UiAccountEncoding};
+use solana_account_decoder::UiAccountEncoding;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
 
@@ -29,8 +29,10 @@ use solana_sdk::hash::Hash;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use solana_sdk::sysvar;
-use solana_sdk::transaction::Transaction;
-use solana_transaction_status_client_types::TransactionConfirmationStatus;
+use solana_sdk::transaction::VersionedTransaction;
+use solana_transaction_status_client_types::{
+    TransactionConfirmationStatus, UiTransactionEncoding,
+};
 
 /// Chain time, as the scheduler's single notion of "now" — always the
 /// on-chain clock, never wall time, so wakes can't fire early relative to
@@ -106,11 +108,11 @@ pub trait ChainSource: Send + Sync {
     /// order) alongside logs and return data.
     async fn simulate_transaction(
         &self,
-        tx: &Transaction,
+        tx: &VersionedTransaction,
         return_accounts: &[Pubkey],
     ) -> Result<SimOutcome>;
 
-    async fn send_transaction(&self, tx: &Transaction) -> Result<Signature>;
+    async fn send_transaction(&self, tx: &VersionedTransaction) -> Result<Signature>;
 
     /// A recent prioritization fee (micro-lamports per CU) for
     /// transactions touching `accounts`. Providers differ wildly here, so
@@ -154,12 +156,12 @@ impl<T: ChainSource + ?Sized> ChainSource for std::sync::Arc<T> {
     }
     async fn simulate_transaction(
         &self,
-        tx: &Transaction,
+        tx: &VersionedTransaction,
         return_accounts: &[Pubkey],
     ) -> Result<SimOutcome> {
         (**self).simulate_transaction(tx, return_accounts).await
     }
-    async fn send_transaction(&self, tx: &Transaction) -> Result<Signature> {
+    async fn send_transaction(&self, tx: &VersionedTransaction) -> Result<Signature> {
         (**self).send_transaction(tx).await
     }
     async fn recent_priority_fee(&self, accounts: &[Pubkey]) -> Result<u64> {
@@ -224,15 +226,8 @@ impl AccountFilter {
     }
 }
 
-fn decode_ui_account(ui: solana_account_decoder::UiAccount) -> Option<Account> {
-    let data = match &ui.data {
-        UiAccountData::Binary(blob, UiAccountEncoding::Base64) => {
-            base64::engine::general_purpose::STANDARD
-                .decode(blob)
-                .ok()?
-        }
-        _ => ui.decode::<Account>().map(|a| a.data)?,
-    };
+pub(crate) fn decode_ui_account(ui: solana_account_decoder::UiAccount) -> Option<Account> {
+    let data = ui.data.decode()?;
     Some(Account {
         lamports: ui.lamports,
         data,
@@ -310,12 +305,9 @@ impl ChainSource for RpcSource {
             let mut out = Vec::new();
             for set in queries {
                 let filters: Vec<RpcFilterType> = set.iter().map(AccountFilter::to_rpc).collect();
-                // Deprecated in favor of the ui-accounts variant, but this one
-                // returns `Account` directly, which is what the trait wants.
-                #[allow(deprecated)]
                 let accounts = self
                     .client
-                    .get_program_accounts_with_config(
+                    .get_program_ui_accounts_with_config(
                         program,
                         RpcProgramAccountsConfig {
                             filters: Some(filters),
@@ -328,7 +320,18 @@ impl ChainSource for RpcSource {
                     )
                     .await
                     .context("get_program_accounts")?;
-                out.extend(accounts);
+                // An account the encoding cannot carry is an error, not an
+                // omission: a silently dropped watch reads as "not
+                // registered" and the turner stops cranking it.
+                let decoded = accounts
+                    .into_iter()
+                    .map(|(pubkey, ui)| {
+                        decode_ui_account(ui)
+                            .map(|account| (pubkey, account))
+                            .with_context(|| format!("decode program account {pubkey}"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                out.extend(decoded);
             }
             metrics::RPC_ACCOUNTS
                 .with_label_values(&["get_program_accounts"])
@@ -418,7 +421,7 @@ impl ChainSource for RpcSource {
 
     async fn simulate_transaction(
         &self,
-        tx: &Transaction,
+        tx: &VersionedTransaction,
         return_accounts: &[Pubkey],
     ) -> Result<SimOutcome> {
         let accounts_config =
@@ -435,6 +438,10 @@ impl ChainSource for RpcSource {
                     replace_recent_blockhash: true,
                     commitment: Some(CommitmentConfig::processed()),
                     accounts: accounts_config,
+                    // A v1 transaction reaches 4096 bytes. The base58 body
+                    // is capped at 1232, so the encoding is named here
+                    // instead of left to the client default.
+                    encoding: Some(UiTransactionEncoding::Base64),
                     ..Default::default()
                 },
             )
@@ -484,7 +491,7 @@ impl ChainSource for RpcSource {
         Ok(recent[recent.len() / 2])
     }
 
-    async fn send_transaction(&self, tx: &Transaction) -> Result<Signature> {
+    async fn send_transaction(&self, tx: &VersionedTransaction) -> Result<Signature> {
         // Preflight is redundant with our own simulation and would run at a
         // stricter commitment than the state the decision was made on.
         self.client
@@ -492,6 +499,9 @@ impl ChainSource for RpcSource {
                 tx,
                 RpcSendTransactionConfig {
                     skip_preflight: true,
+                    // A v1 transaction reaches 4096 bytes, past what the
+                    // base58 body accepts.
+                    encoding: Some(UiTransactionEncoding::Base64),
                     ..Default::default()
                 },
             )

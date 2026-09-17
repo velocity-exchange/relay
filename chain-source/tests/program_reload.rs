@@ -30,7 +30,7 @@ use solana_sdk::instruction::Instruction;
 use solana_sdk::message::Message;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature, Signer};
-use solana_sdk::transaction::Transaction;
+use solana_sdk::transaction::{Transaction, VersionedTransaction};
 
 use relay_test_fixtures::DEMO_BOOK_SO;
 /// demo-book's declared id. Using the real one matters: an anchor program
@@ -174,13 +174,13 @@ impl ChainSource for FakeChain {
 
     async fn simulate_transaction(
         &self,
-        _tx: &Transaction,
+        _tx: &VersionedTransaction,
         _return_accounts: &[Pubkey],
     ) -> Result<SimOutcome> {
         unimplemented!("LocalSimSource simulates; it never delegates")
     }
 
-    async fn send_transaction(&self, _tx: &Transaction) -> Result<Signature> {
+    async fn send_transaction(&self, _tx: &VersionedTransaction) -> Result<Signature> {
         unimplemented!("this test never sends")
     }
 
@@ -223,7 +223,7 @@ async fn simulate(source: &LocalSimSource<FakeChain>, program: Pubkey) -> SimOut
     let message = Message::new(&[ix], Some(&payer.pubkey()));
     let tx = Transaction::new_unsigned(message);
     source
-        .simulate_transaction(&tx, &[])
+        .simulate_transaction(&VersionedTransaction::from(tx), &[])
         .await
         .expect("simulation runs")
 }

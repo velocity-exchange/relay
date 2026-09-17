@@ -30,7 +30,7 @@ use solana_sdk::message::Message;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature};
 use solana_sdk::signer::Signer;
-use solana_sdk::transaction::Transaction;
+use solana_sdk::transaction::{Transaction, VersionedTransaction};
 
 use relay_test_fixtures::{DEMO_BOOK_SO as DEMO_SO, RELAY_SO};
 
@@ -154,7 +154,7 @@ impl ChainSource for LiteSvmSource {
 
     async fn simulate_transaction(
         &self,
-        tx: &Transaction,
+        tx: &VersionedTransaction,
         return_accounts: &[Pubkey],
     ) -> Result<SimOutcome> {
         let svm = self.svm.lock().unwrap();
@@ -195,7 +195,7 @@ impl ChainSource for LiteSvmSource {
         })
     }
 
-    async fn send_transaction(&self, tx: &Transaction) -> Result<Signature> {
+    async fn send_transaction(&self, tx: &VersionedTransaction) -> Result<Signature> {
         let signature = {
             let mut svm = self.svm.lock().unwrap();
             svm.send_transaction(tx.clone())
@@ -266,12 +266,12 @@ impl ChainSource for NoRemoteSimSource {
     }
     async fn simulate_transaction(
         &self,
-        _tx: &Transaction,
+        _tx: &VersionedTransaction,
         _return_accounts: &[Pubkey],
     ) -> Result<SimOutcome> {
         panic!("simulation must not reach the provider");
     }
-    async fn send_transaction(&self, tx: &Transaction) -> Result<Signature> {
+    async fn send_transaction(&self, tx: &VersionedTransaction) -> Result<Signature> {
         self.inner.send_transaction(tx).await
     }
 }
@@ -1299,7 +1299,7 @@ impl ChainSource for SlowSource {
     }
     async fn simulate_transaction(
         &self,
-        tx: &Transaction,
+        tx: &VersionedTransaction,
         return_accounts: &[Pubkey],
     ) -> Result<SimOutcome> {
         {
@@ -1312,7 +1312,7 @@ impl ChainSource for SlowSource {
         *self.live.lock().unwrap() -= 1;
         self.inner.simulate_transaction(tx, return_accounts).await
     }
-    async fn send_transaction(&self, tx: &Transaction) -> Result<Signature> {
+    async fn send_transaction(&self, tx: &VersionedTransaction) -> Result<Signature> {
         self.inner.send_transaction(tx).await
     }
     async fn recent_priority_fee(&self, accounts: &[Pubkey]) -> Result<u64> {
@@ -2027,7 +2027,7 @@ fn naming_the_payee_is_fine_naming_a_signer_is_not() {
 }
 
 /// Trusted programs skip the guards: the transaction is the executor
-/// alone, plus compute budget — no begin/assert pair.
+/// alone — no begin/assert pair.
 #[tokio::test]
 async fn trusted_programs_skip_the_guards() {
     let mut h = setup(PAYMENT, 100, trusting(TurnerConfig::default()));

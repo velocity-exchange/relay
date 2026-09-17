@@ -20,7 +20,7 @@ use tracing::{debug, warn};
 
 use crate::feed::{AccountUpdate, Coverage, FeedSender, SlotUpdate};
 use crate::grpc::ProgramSubscription;
-use crate::source::AccountFilter;
+use crate::source::{decode_ui_account, AccountFilter};
 
 /// Subscribe to each [`ProgramSubscription`] (filtered sets become one
 /// `programSubscribe` each, since a memcmp matches one value) plus the
@@ -183,7 +183,7 @@ async fn session(
                     stream
                         .map(move |response| AccountUpdate {
                             pubkey: pk,
-                            account: response.value.decode(),
+                            account: decode_ui_account(response.value),
                             slot: response.context.slot,
                         })
                         .boxed(),
@@ -201,7 +201,7 @@ async fn session(
                     .pubkey
                     .parse()
                     .unwrap_or_else(|_| Pubkey::default()),
-                account: response.value.account.decode(),
+                account: decode_ui_account(response.value.account),
                 slot: response.context.slot,
             })
             .boxed()

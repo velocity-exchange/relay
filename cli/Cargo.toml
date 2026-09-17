@@ -17,13 +17,13 @@ relay-crank-turner = { path = "../crank-turner" }
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 serde_json = "1"
-solana-sdk = "3"
+solana-sdk = "4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
 
 [dev-dependencies]
 # Depending on it is what builds the SBF binaries these tests load.
 relay-test-fixtures = { path = "../test-fixtures" }
 sha2 = "0.10"
-solana-client = "3"
+solana-client = "4"
 solana-commitment-config = "3"
 solana-system-interface = { version = "3", features = ["bincode"] }
