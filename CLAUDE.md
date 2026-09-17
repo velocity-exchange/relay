@@ -105,3 +105,102 @@ Three scenarios are load-bearing enough to be worth naming. `a_losing_turner_del
 ## Git conventions
 
 Never add Claude (or any AI assistant) as a `Co-Authored-By` on commits or PRs. No `🤖 Generated with …` footers.
+
+# Code Style
+
+### Instruction module layout
+
+Preferred layout for instruction code: each instruction domain is a **folder** under `src/instructions/` with **one file per instruction** and a `mod.rs` that holds the domain-level doc comment and re-exports. Within each instruction file, the `#[derive(Accounts)]` context struct goes at the **top**, the handler below it. Use this pattern for new instruction domains and when an existing domain is being substantially reworked anyway.
+
+**Constraints over in-handler validates — when trivial.** Account _identity_ checks belong on the accounts struct, not in the handler: PDA `seeds`/`bump` derivation (including deriving one account's seeds from another's loaded field, e.g. `seeds = [b"spot_market", perp_market.load()?.quote_spot_market_index.to_le_bytes().as_ref()]`), `has_one` for top-level pubkey fields (e.g. `has_one = oracle`), and `address =` locks. Only keep a check in the handler when it is genuinely non-trivial as a constraint: multi-account/stateful logic, math on loaded data, or a _data invariant_ rather than an account identity. Don't contort complex logic into constraint expressions just to move it.
+
+### Function and module shape
+
+**Size limits.** A function body stays around 60 lines or under, and takes six arguments or fewer.
+These are not arbitrary: a body you cannot see at once hides its own control flow, and a long
+argument list is almost always a context struct that has not been written yet. Exceeding either is
+allowed, but say why in a comment at the definition.
+
+**Carry context in a struct; put the validating on it.** When several steps need the same maps,
+market, clock and seats, that is a type. Give it a constructor in the shape of `AccountMaps::new`
+and make each step a method, so a step takes the context and its own few arguments and nothing
+else. Prefer several small contexts over one wide one: a struct that accumulates every lifetime in
+the call graph becomes its own obstacle. 
+
+**Name a layer for what it governs, not for what it does to the data.** A chain that read
+`fill_perp_order` to `fulfill_perp_order` to `route_and_settle_perp_fill` told a reader nothing:
+three synonyms, and each layer had exactly one caller, so the layering carried no reuse either.
+Those layers govern the order, the taker's risk limits, and liquidity, and they say so now. If two
+functions in a chain could swap names without anybody noticing, the names are wrong.
+
+**One subject per file.** A file is the right size when a reader who opens it finds one subject. A
+module root holds the doc, the imports, the `mod` declarations, the re-exports, and only what
+several subjects genuinely share. Re-export every public name the old file exported, so a split
+changes no caller's imports.
+
+
+### Verifying a refactor
+
+A refactor that changes behaviour is a rewrite, and the unit test count is the proof it did not:
+**the count must be identical before and after.**
+
+- **`cargo check` and `cargo clippy` without `--all-targets` build only the lib.** They report clean
+  over a test tree that does not compile. Always pass `--all-targets`.
+- **Run each verification command on its own.** Chaining them has produced output that reported
+  compile errors at line numbers which did not exist in the file, and has hidden a real `fmt`
+  failure that was then reported as clean.
+- **Diff the compiler's warning population against a clean `HEAD` worktree**, bucketed by
+  `(level, file, message)` so line numbers do not matter. This has caught several real regressions
+  that the tests did not, including a settle path reading the raw book instead of the clamped
+  ladder a quoter was allocated against, and a shared maker-seat step using the strict position
+  lookup where one caller needs the creating one.
+- **Measure every function, not the one that improved.** A report that the inner pass reached 155
+  lines was true and useless while its three siblings sat at 571, 196 and 331.
+- **Verify a re-export by compiling it.** Generate a temporary module that imports every public
+  item of the old file by path, compile it under the feature flavors that include the gated names
+  and through the path `lib.rs` actually uses, then delete it. Reading the `pub use` list proves
+  nothing.
+
+### Refactoring against an audit
+
+A split moves code, so it destroys the feature diff. An auditor reading `master..<branch>` for a
+file that was split sees the file deleted and new files appear, with the branch's own changes
+scattered inside them. Weigh that before restructuring a file the branch already changed: the cost
+is not the new code, it is the diff that can no longer be read. Land readability work only on files that are majorly changed or created in the feature. For example, if you only slightly change liquidation, you should not break up the entire file into modules. But if you overhaul orders, you break it into modules.
+
+### Rust style
+
+Prefer declarative iterator chains (`map`/`filter`/`fold`/`try_fold`/`collect`) over imperative `for`/`while` loops wherever the two are performance-equivalent. Explicit loops are fine when they are genuinely better: hot paths where the imperative form saves real work, or indexed mutation across parallel structures that the borrow checker won't allow through closures. Also avoid redundant recomputation in loops — hoist or precompute values that don't change (or change predictably) across iterations.
+
+### Doc comments
+
+All modules have doc comments. When making feature or refactor changes, update any module-level doc comments that would be invalidated by the change.
+
+**No plan codenames in comments.** A comment must never point at a design doc, plan, spec section,
+work phase, or review round as its justification — not `S1`–`S7` / "the S5 rule", not "Phase 2",
+not "the plan settles this", "per the sync log", "as the spec warns", "deferred to a later phase". A
+reader has the code, not the plan; those labels expire the moment the doc is renamed, reorganized, or
+merged, and they encode nothing a reader can act on. Write the reason itself instead:
+
+```rust
+// BAD:  the S5 rule applied to the taker flow
+// GOOD: an unfilled place_and_take remainder rests on the book instead of
+//       cancelling, so the taker keeps queue position at its limit price
+```
+
+Referring to a *named, stable artifact* is fine — a crate (`relay-spec`), a type
+(`relay_spec::ConditionV0`), a module path, a durable doc that explains a whole subsystem
+(`docs/alignment-and-native-offsets.md`) — because those are things the reader can go read and that
+change with the code. `docs/propamm-plan.md` is where S1–S7 are *defined*; that document may use
+them, code may not. Local step labels inside one function ("first pass … second pass") are fine too,
+as long as they describe that function rather than a project timeline.
+
+**Version new event structs.** An `#[event]`'s discriminator is derived from its struct name, so
+adding a field to an existing record silently changes the payload under a discriminator consumers
+already decode. New velocity events therefore end in `V0` (e.g. `ProtocolUserWithdrawRecordV0`), and
+a field addition ships as `…V1` with its own discriminator rather than mutating the `V0` shape. The
+records inherited from upstream Drift keep their unversioned names — don't rename those. Wire every
+new event into the SDK's subscriber surface in the same change: `EventMap`, the `eventTypes` default
+list, and the `VelocityEvent` union in `packages/sdk/src/events/types.ts`, plus the record's type
+mirror in `packages/sdk/src/types.ts`. A type mirror without the `EventMap` entry compiles fine and
+is simply never decoded.
