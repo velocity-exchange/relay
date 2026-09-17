@@ -815,6 +815,15 @@ async fn shipped_daemon_cranks_over_websocket() {
     client.post_quote(&book, now + 2, 101, SIDE_BID).await;
     client.post_quote(&book, far, 90, SIDE_BID).await;
 
+    // `entry_count == 1` would also hold if two of the three quotes had
+    // never rested. What rules that out is the posts above: each confirms on
+    // chain, so a placement that does not land fails at the placement rather
+    // than here.
+    //
+    // That is sufficient because `add_entry_v0` appends and never fills, so
+    // landing and resting are one event. Give demo-book a matching path on
+    // insert and this poll can pass without a sweep, with nothing here
+    // looking wrong.
     let expired_swept = wait_for(Duration::from_secs(90), || async {
         client.entry_count(&book).await == 1
     })
