@@ -1095,7 +1095,6 @@ impl<const C: usize, const R: usize> anchor_lang_v2::IdlAccountType for RelayBlo
     }
 }
 
-
 // Sound for any parameters: every field is a byte array, so the struct is
 // alignment-1 and can contain no padding.
 unsafe impl<const C: usize, const R: usize> Zeroable for RelayBlockV0<C, R> {}
