@@ -25,6 +25,26 @@
 //! Nothing here knows about any particular protocol: program-account queries
 //! and subscriptions take transport-neutral [`AccountFilter`]s that the
 //! caller builds.
+//!
+//! # What this crate costs a consumer's lockfile
+//!
+//! Simulation runs on litesvm, so litesvm's own dependency bounds become the
+//! consumer's. litesvm 0.16 pins several solana crates with a tilde, which
+//! fixes their minor version: `solana-address ~2.6.1`, `solana-hash ~4.5.0`,
+//! `solana-last-restart-slot ~3.1.0` and others. Those bounds mirror the
+//! agave line litesvm is built on.
+//!
+//! A workspace that also names `solana-sdk` or an agave crate directly can
+//! therefore fail to resolve when it takes a new revision of this crate, and
+//! the error names a crate it never asked for. `solana-last-restart-slot`
+//! held at 3.2.0 against litesvm's `~3.1.0` is the case that has happened.
+//! `cargo update -p <crate> --precise <version>` settles it, and the resolve
+//! usually moves a large part of the tree with it.
+//!
+//! Treat a revision bump here as a lockfile event rather than a version
+//! bump, and re-resolve every workspace that shares the tree — including the
+//! ones that reach this crate transitively, whose lockfiles are the ones a
+//! `--locked` build later fails on.
 
 pub mod cached;
 pub mod feed;
