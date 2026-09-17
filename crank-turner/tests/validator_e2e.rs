@@ -53,6 +53,16 @@ const TOKEN_ACCOUNT_LEN: usize = 165;
 /// SPL token account layout: mint(32) owner(32) amount(8) ...
 const TOKEN_AMOUNT_OFFSET: usize = 64;
 
+/// The validator binary to run.
+///
+/// `SOLANA_TEST_VALIDATOR` names it, so a machine whose global
+/// `active_release` is pinned to a release this suite cannot use — the
+/// turner signs transaction v1, which needs agave 4.2 or later — can still
+/// run it without moving that symlink for every other project.
+fn validator_binary() -> String {
+    std::env::var("SOLANA_TEST_VALIDATOR").unwrap_or_else(|_| "solana-test-validator".to_string())
+}
+
 fn token_program() -> Pubkey {
     "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
         .parse()
@@ -115,7 +125,7 @@ impl Validator {
             .join(format!("relay-e2e-{stamp}"))
             .to_string_lossy()
             .into_owned();
-        let child = Command::new("solana-test-validator")
+        let child = Command::new(validator_binary())
             .args([
                 "--reset",
                 "--quiet",

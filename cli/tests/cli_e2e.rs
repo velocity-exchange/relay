@@ -41,6 +41,16 @@ const CONDITIONS_OFFSET: u32 = 912;
 /// `register_watch_v0` records as the target program here.
 const SYSTEM_PROGRAM_ID: Pubkey = Pubkey::new_from_array([0u8; 32]);
 
+/// The validator binary to run.
+///
+/// `SOLANA_TEST_VALIDATOR` names it, so a machine whose global
+/// `active_release` is pinned to a release this suite cannot use — the
+/// turner signs transaction v1, which needs agave 4.2 or later — can still
+/// run it without moving that symlink for every other project.
+fn validator_binary() -> String {
+    std::env::var("SOLANA_TEST_VALIDATOR").unwrap_or_else(|_| "solana-test-validator".to_string())
+}
+
 fn relay_id() -> Pubkey {
     "4D5tPhw9sqkdkR5CpmP427TH6y9p9AMuKUukUEHn3Mpu"
         .parse()
@@ -75,7 +85,7 @@ impl Validator {
             .to_string_lossy()
             .into_owned();
         let so = relay_test_fixtures::RELAY_SO;
-        let child = Command::new("solana-test-validator")
+        let child = Command::new(validator_binary())
             .args([
                 "--reset",
                 "--quiet",

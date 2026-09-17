@@ -3,12 +3,31 @@
 # programs, runs a crank turner, posts orders, and checks that expiry,
 # eviction, and crossing all get cranked.
 #
-# Needs `solana-test-validator` on PATH (ships with the Solana CLI).
+# Needs `solana-test-validator` 4.2 or later on PATH: the turner signs
+# transaction v1, which the `txv1` feature gates.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-if ! command -v solana-test-validator >/dev/null; then
-  echo "solana-test-validator not found on PATH (install the Solana CLI)" >&2
+SOLANA_TEST_VALIDATOR="${SOLANA_TEST_VALIDATOR:-solana-test-validator}"
+
+if ! command -v "$SOLANA_TEST_VALIDATOR" >/dev/null; then
+  echo "$SOLANA_TEST_VALIDATOR not found on PATH (install the Solana CLI)" >&2
+  exit 1
+fi
+
+# A validator without `txv1` cannot parse a v1 transaction. It reports that
+# as a deserialize error on send, three hops from the cause, and only after
+# a simulation that looked fine. Say it here instead.
+validator_version="$("$SOLANA_TEST_VALIDATOR" --version | awk '{print $2}')"
+validator_major="${validator_version%%.*}"
+validator_minor="${validator_version#*.}"
+validator_minor="${validator_minor%%.*}"
+if [ "$validator_major" -lt 4 ] ||
+  { [ "$validator_major" -eq 4 ] && [ "$validator_minor" -lt 2 ]; }; then
+  echo "solana-test-validator $validator_version is too old: the turner signs" >&2
+  echo "transaction v1, which needs agave 4.2 or later. Run:" >&2
+  echo "  agave-install init 4.2.2" >&2
+  echo "or set SOLANA_TEST_VALIDATOR to a 4.2+ binary." >&2
   exit 1
 fi
 
