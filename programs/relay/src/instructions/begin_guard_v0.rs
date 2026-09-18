@@ -2,8 +2,11 @@ use anchor_lang_v2::prelude::*;
 
 use crate::state::GuardV0;
 
+// Underscored because the `Accounts` derive binds this in a body that does
+// not read it. The `seeds` constraint below still names it, so the binding
+// is live where it matters.
 #[derive(Accounts)]
-#[instruction(args: BeginGuardArgsV0)]
+#[instruction(_args: BeginGuardArgsV0)]
 pub struct BeginGuardV0 {
     /// Funds the guard account on first use. This is the turner's fee
     /// payer, and it signs — but it is deliberately NOT the account whose
@@ -22,7 +25,7 @@ pub struct BeginGuardV0 {
     #[account(
         init_if_needed,
         payer = payer,
-        seeds = [crate::state::GUARD_SEED, payout.address().as_ref(), &[args.nonce]],
+        seeds = [crate::state::GUARD_SEED, payout.address().as_ref(), &[_args.nonce]],
         bump,
     )]
     pub guard: Account<GuardV0>,

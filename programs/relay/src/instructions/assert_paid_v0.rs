@@ -3,15 +3,18 @@ use anchor_lang_v2::prelude::*;
 use crate::error::RelayError;
 use crate::state::GuardV0;
 
+// Underscored because the `Accounts` derive binds this in a body that does
+// not read it. The `seeds` constraint below still names it, so the binding
+// is live where it matters.
 #[derive(Accounts)]
-#[instruction(args: AssertPaidArgsV0)]
+#[instruction(_args: AssertPaidArgsV0)]
 pub struct AssertPaidV0 {
     /// The account whose payment is asserted. Never a signer — see
     /// `begin_guard_v0` on why the payout must stay out of the signer set.
     pub payout: UncheckedAccount,
     #[account(
         mut,
-        seeds = [crate::state::GUARD_SEED, payout.address().as_ref(), &[args.nonce]],
+        seeds = [crate::state::GUARD_SEED, payout.address().as_ref(), &[_args.nonce]],
         bump = guard.bump,
         constraint = guard.payout == *payout.address() @ RelayError::GuardPayoutMismatch,
     )]

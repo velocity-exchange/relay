@@ -17,15 +17,15 @@ idl-build = []
 profile = ["anchor-v2-testing/profile"]
 
 [dependencies]
-anchor-lang-v2 = { git = "https://github.com/otter-sec/anchor.git", rev = "4fbe613b2dc739a849355889ce1f27eb6d03a148" }
+anchor-lang-v2 = { package = "anchor-lang", git = "https://github.com/otter-sec/anchor.git", rev = "abacd0e9362d957e7da779fa81b1a10dd9480b28" }
 bytemuck = { version = "1", features = ["derive", "min_const_generics"] }
 static_assertions = "1.1.0"
-wincode = { version = "0.5", features = ["derive"] }
+wincode = { version = "0.6", features = ["derive"] }
 relay-spec = { path = "../../spec" }
 
 [dev-dependencies]
-anchor-v2-testing = { git = "https://github.com/otter-sec/anchor.git", rev = "4fbe613b2dc739a849355889ce1f27eb6d03a148" }
-litesvm = "0.11.0"
+anchor-v2-testing = { git = "https://github.com/otter-sec/anchor.git", rev = "abacd0e9362d957e7da779fa81b1a10dd9480b28" }
+litesvm = "=0.13.1"
 solana-account = "3.2.0"
 solana-clock = "3"
 solana-pubkey = "3.0"

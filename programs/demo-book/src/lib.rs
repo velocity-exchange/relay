@@ -31,6 +31,11 @@
 //! [`WakeV0::AtTimestamp`]: relay_spec::WakeV0::AtTimestamp
 //! [`WakeV0::OnAccountChange`]: relay_spec::WakeV0::OnAccountChange
 
+// The v2 crate is published as `anchor-lang`, and this crate names it
+// `anchor_lang_v2` to keep it distinct from the v1 line. The derives
+// generate `anchor_lang::` paths, so the alias has to exist too.
+extern crate anchor_lang_v2 as anchor_lang;
+
 use anchor_lang_v2::prelude::*;
 
 pub mod error;
