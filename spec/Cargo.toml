@@ -16,16 +16,20 @@ bytemuck = { version = "1", features = ["derive", "min_const_generics"] }
 # condition-block types the CLOB account embeds. Optional and gated, so the
 # on-chain zero-copy build never compiles it.
 #
-# The rev is otter-sec mainline plus one commit, which lowers the
+# The rev is otter-sec anchor-next plus one commit, which lowers the
 # solana-address bound from 2.7.0 to 2.6.1. anchor asks for a version that
 # only agave 4.3 supplies, and litesvm 0.16 holds solana-address below
 # 2.7.0, so the two cannot resolve together. Point this at mainline once
-# that commit is upstream.
+# that commit is upstream (otter-sec/anchor#5056).
+#
+# The rev is held by `pin/relax-solana-address-2d5847f4` on the fork, not by
+# the pull request's own branch. A review round rewrites the pull request's
+# branch, and a rev that only it referenced would stop resolving.
 #
 # This rev must equal the one velocity's CLOB names. Two copies of
 # anchor-lang in one tree stop the `IdlType` derives from satisfying its
 # IDL build.
-anchor-lang-v2 = { package = "anchor-lang", git = "https://github.com/velocity-exchange/anchor.git", rev = "b005890d9351a17a8061811662c44d781a04baf0", optional = true }
+anchor-lang-v2 = { package = "anchor-lang", git = "https://github.com/velocity-exchange/anchor.git", rev = "206fb1f06b286ff1ec68faa90fe69c5b9d72fcd9", optional = true }
 
 [features]
 default = []
